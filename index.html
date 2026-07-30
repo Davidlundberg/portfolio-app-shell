@@ -56,8 +56,31 @@
     </div>
   </div>
 
+  <!-- Needs attention (manual prices, failed refreshes, stale calibrations) -->
+  <div id="attnStrip" style="display:none;"></div>
+
   <!-- Account Tiles -->
   <div class="account-tiles" id="accountTiles" style="display:none;"></div>
+
+  <!-- Update Positions (opens from an account tile) -->
+  <div class="card" id="updCard" style="display:none;">
+    <div class="upd-header">
+      <h2 style="margin:0;">Update positions</h2>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <select id="updAccount" onchange="switchUpdateAccount(this.value)"></select>
+        <button class="btn btn-ghost btn-sm" onclick="closeUpdatePanel()">Close</button>
+      </div>
+    </div>
+    <p style="font-size:13px;color:var(--text-secondary);margin:4px 0 10px;">
+      Type the share counts from your latest statement. Split funds take one
+      total — the US/Intl ratio is kept. Changes are logged as statement
+      true-ups so performance stays honest.
+    </p>
+    <div id="updBody"></div>
+    <div style="display:flex;justify-content:flex-end;margin-top:12px;">
+      <button class="btn btn-primary" onclick="saveUpdatePanel()">Save updates</button>
+    </div>
+  </div>
 
   <!-- Add Holding -->
   <div class="card">

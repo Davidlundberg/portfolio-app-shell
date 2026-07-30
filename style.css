@@ -548,6 +548,62 @@ td select { padding-right: 24px; }
 
 input[type="file"] { display: none; }
 
+/* ── Needs attention strip ── */
+#attnStrip {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin-bottom: 16px;
+}
+.attn-title {
+  font-size: 12px; font-weight: 600; color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: 0.4px;
+}
+.attn-chip {
+  border: 1px solid rgba(217,119,6,0.35);
+  background: rgba(217,119,6,0.08);
+  color: #b45309;
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  min-height: 32px;
+}
+.attn-chip:hover { background: rgba(217,119,6,0.15); }
+[data-theme="dark"] .attn-chip { color: #fbbf24; }
+
+/* ── Update Positions panel ── */
+.upd-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.upd-header select {
+  padding: 8px 10px; border: 1px solid var(--border-default); border-radius: 8px;
+  background: var(--bg-input); color: var(--text-primary); font-size: 14px;
+}
+.upd-line {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.upd-line:last-child { border-bottom: none; }
+.upd-line-info { min-width: 0; }
+.upd-line-name { font-weight: 500; font-size: 14px; }
+.upd-line-sub  { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.upd-split-badge {
+  font-size: 11px; font-weight: 600; color: var(--accent);
+  background: rgba(13,148,136,0.1); border-radius: 6px;
+  padding: 2px 6px; margin-left: 6px; white-space: nowrap;
+}
+.upd-line-inputs { display: flex; gap: 8px; flex-shrink: 0; }
+.upd-line-inputs input {
+  width: 110px; padding: 10px 10px; font-size: 16px; text-align: right;
+  border: 1px solid var(--border-default); border-radius: 8px;
+  background: var(--bg-input); color: var(--text-primary);
+}
+.upd-line-inputs input:focus { outline: none; border-color: var(--accent); }
+.upd-line-inputs .upd-price { width: 90px; }
+
+/* Account tiles are tap targets now */
+.account-tile { cursor: pointer; }
+.account-tile:hover, .account-tile:focus-visible { border-color: var(--border-hover); box-shadow: var(--shadow-elevated); }
+.account-tile-hint { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
+
 /* ── Cloud auth gate ── */
 .auth-gate {
   position: fixed; inset: 0; z-index: 1000;

@@ -723,13 +723,36 @@ function importCSV(event) {
       else if (isNaN(qty) || qty <= 0)     { status = 'err';  statusMsg = 'Invalid shares'; }
       else if (isNaN(price) || price <= 0) { status = 'warn'; statusMsg = 'No price — fetch after import'; }
 
-      return {
+      const rec = {
         _row: idx + 1 + (looksLikeHeader ? 1 : 0),
         name, ticker, type, account,
         quantity: isNaN(qty) ? 0 : qty,
         price: (isNaN(price) || price < 0) ? 0 : price,
         status, statusMsg,
       };
+
+      // Reconcile against existing holdings: a re-import UPDATES matching
+      // positions instead of duplicating them.
+      if (status !== 'err') {
+        const match = findImportMatch(rec);
+        if (match) {
+          rec.matchIds = match.ids;
+          const oldQty = match.ids.reduce((s, mid) =>
+            s + (holdings.find(x => x.id === mid)?.quantity || 0), 0);
+          rec.oldQty = oldQty;
+          if (Math.abs(oldQty - rec.quantity) < 1e-9) {
+            rec.mode = 'same';
+            rec.statusMsg = 'No change';
+          } else {
+            rec.mode = 'update';
+            rec.statusMsg = `Update: ${fmtN(oldQty)} → ${fmtN(rec.quantity)} sh`;
+          }
+        } else {
+          rec.mode = 'add';
+          if (status === 'ok') rec.statusMsg = 'New holding';
+        }
+      }
+      return rec;
     }).filter(r => !(r.status === 'err' && !r.name && r.quantity === 0));
 
     renderImportPreview();
@@ -738,20 +761,44 @@ function importCSV(event) {
   reader.readAsText(file);
 }
 
+// Which existing holding(s) does a CSV row correspond to? Ticker wins (within
+// the row's account when it names one); otherwise normalized name. A name
+// match may hit a split pair (us_stock + intl_stock rows of one real fund) —
+// both ids are returned and the new total is distributed by the current ratio.
+function findImportMatch(row) {
+  const inAccount = h => !row.account ||
+    (h.account || '').toLowerCase() === row.account.toLowerCase();
+  const tick = (row.ticker || '').toUpperCase();
+  if (tick && tick !== 'N/A') {
+    const hits = holdings.filter(h =>
+      (h.ticker || '').toUpperCase() === tick && inAccount(h));
+    if (hits.length) return { ids: hits.map(h => h.id) };
+  }
+  const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const hits = holdings.filter(h => norm(h.name) === norm(row.name) && inAccount(h));
+  return hits.length ? { ids: hits.map(h => h.id) } : null;
+}
+
 function renderImportPreview() {
   const okRows   = importRows.filter(r => r.status === 'ok');
   const warnRows = importRows.filter(r => r.status === 'warn');
   const errRows  = importRows.filter(r => r.status === 'err');
-  const importable = okRows.length + warnRows.length;
+  const adds     = importRows.filter(r => r.mode === 'add' && r.status !== 'err');
+  const updates  = importRows.filter(r => r.mode === 'update');
+  const sames    = importRows.filter(r => r.mode === 'same');
+  const importable = okRows.length + warnRows.length - sames.length;
 
   document.getElementById('importSummary').innerHTML =
     `Found <strong>${importRows.length}</strong> rows: ` +
-    `<span style="color:#10b981">${okRows.length} ready</span>, ` +
-    `<span style="color:#d97706">${warnRows.length} missing price</span>` +
+    `<span style="color:#10b981">${adds.length} new</span>, ` +
+    `<span style="color:#3b82f6">${updates.length} updating</span>, ` +
+    `<span style="color:var(--text-muted)">${sames.length} unchanged</span>` +
+    (warnRows.length ? `, <span style="color:#d97706">${warnRows.length} missing price</span>` : '') +
     (errRows.length ? `, <span style="color:#dc2626">${errRows.length} skipped</span>` : '') + '.';
 
   document.getElementById('btnConfirmImport').textContent =
-    `Import ${importable} holding${importable !== 1 ? 's' : ''}`;
+    updates.length ? `Apply ${importable} change${importable !== 1 ? 's' : ''}`
+                   : `Import ${importable} holding${importable !== 1 ? 's' : ''}`;
   document.getElementById('btnConfirmImport').disabled = importable === 0;
 
   document.getElementById('importTableBody').innerHTML = importRows.map(r => {
@@ -773,9 +820,53 @@ function renderImportPreview() {
   document.getElementById('importPreview').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
+// Apply a new total quantity across one or more holding rows (a split pair
+// gets the total distributed by its current ratio), recording ledger
+// adjustments so TWR stays honest. Returns how many rows actually changed.
+function applyQuantityUpdate(ids, newTotalQty, { price = null, source = 'manual' } = {}) {
+  const rows = ids.map(mid => holdings.find(x => x.id === mid)).filter(Boolean);
+  if (!rows.length) return 0;
+  const oldTotal = rows.reduce((s, h) => s + h.quantity, 0);
+  const now = new Date().toISOString();
+  let changed = 0;
+  rows.forEach((h, i) => {
+    const share = rows.length === 1 ? 1
+      : (oldTotal > 0 ? h.quantity / oldTotal : 1 / rows.length);
+    const newQty = i === rows.length - 1
+      ? +(newTotalQty - rows.slice(0, -1).reduce((s, x) => s + x.quantity, 0)).toFixed(6)
+      : +(newTotalQty * share).toFixed(6);
+    const qtyDelta = +(newQty - h.quantity).toFixed(6);
+    const newPrice = price != null && price > 0 ? price : h.price;
+    if (qtyDelta === 0 && newPrice === h.price) return;
+    if (qtyDelta !== 0) {
+      transactions.push({
+        id: uid(), date: now.slice(0, 10), kind: 'adjustment',
+        holdingId: h.id, holdingName: h.name, units: qtyDelta,
+        unitPrice: newPrice, amount: +(qtyDelta * newPrice).toFixed(2), source,
+      });
+    }
+    if (newPrice !== h.price && newPrice > 0 && proxyEntryFor(h)) {
+      h.calibration = { date: now, nav: newPrice };
+    }
+    h.quantity = newQty;
+    h.price = newPrice;
+    h.updated = now;
+    changed++;
+  });
+  return changed;
+}
+
 function confirmImport() {
-  const toAdd = importRows.filter(r => r.status !== 'err');
-  toAdd.forEach(r => {
+  let added = 0, updated = 0;
+  importRows.filter(r => r.status !== 'err').forEach(r => {
+    if (r.mode === 'same') return;
+    if (r.mode === 'update') {
+      // Distributing across rows[] handles both a single match and a split
+      // pair; keep the existing rows' account/type/sleeve — the CSV only
+      // speaks for quantity and price.
+      if (applyQuantityUpdate(r.matchIds, r.quantity, { price: r.price, source: 'import' })) updated++;
+      return;
+    }
     holdings.push({
       id: uid(), name: r.name, type: r.type,
       ticker:  r.ticker  || '',
@@ -783,11 +874,15 @@ function confirmImport() {
       quantity: r.quantity, price: r.price,
       updated: new Date().toISOString(),
     });
+    added++;
   });
   importRows = [];
   document.getElementById('importPreview').style.display = 'none';
   markUnsaved(); render();
-  toast(`Imported ${toAdd.length} holding${toAdd.length !== 1 ? 's' : ''}`);
+  const parts = [];
+  if (added)   parts.push(`${added} added`);
+  if (updated) parts.push(`${updated} updated`);
+  toast(parts.length ? `Import applied: ${parts.join(', ')}` : 'Nothing to change');
 }
 
 function cancelImport() {
@@ -919,6 +1014,162 @@ function confirmSplit(id) {
   splittingId = null;
   markUnsaved(); render();
   toast(`Split into ${fmtN(qty1)} + ${fmtN(qty2)} units`);
+}
+
+// ─── Update Positions panel ──────────────────────────────────────────────────
+// One compact editor per account: every position is a single line with a big
+// numeric input; a split fund (same name held as us_stock + intl_stock rows)
+// collapses to ONE line — you type the statement's total and the current
+// ratio is preserved. Saving records ledger adjustments via applyQuantityUpdate.
+let updAccount = null;
+
+const matchesAvanza = h => Object.keys(AVANZA_FUND_IDS).some(k => (h.name || '').includes(k));
+
+// A holding whose price nothing can fetch — the user maintains it by hand.
+function isManualPrice(h) {
+  const hasTicker = h.ticker && h.ticker.toUpperCase() !== 'N/A';
+  return !hasTicker && !proxyEntryFor(h) && !matchesNavTable(h) && !matchesAvanza(h);
+}
+
+// Group an account's holdings into panel lines; split pairs become one line.
+function updateLinesFor(acct) {
+  const rows = holdings.filter(h => (h.account || '') === acct);
+  const lines = [], used = new Set();
+  for (const h of rows) {
+    if (used.has(h.id)) continue;
+    const pair = rows.filter(x => x.name === h.name &&
+      (x.sleeve === 'us_stock' || x.sleeve === 'intl_stock'));
+    if (pair.length === 2 && pair.some(x => x.id === h.id)) {
+      pair.forEach(x => used.add(x.id));
+      const totalQty = pair.reduce((s, x) => s + x.quantity, 0);
+      const usH = pair.find(x => x.sleeve === 'us_stock');
+      lines.push({
+        ids: pair.map(x => x.id), name: h.name, ticker: '',
+        qty: totalQty, price: h.price, manual: isManualPrice(h),
+        splitPct: totalQty > 0 ? Math.round(usH.quantity / totalQty * 100) : 50,
+      });
+    } else {
+      used.add(h.id);
+      lines.push({
+        ids: [h.id], name: h.name, ticker: h.ticker || '',
+        qty: h.quantity, price: h.price, manual: isManualPrice(h),
+        splitPct: null,
+      });
+    }
+  }
+  return lines;
+}
+
+function openUpdatePanel(acct) {
+  updAccount = acct;
+  renderUpdatePanel();
+  document.getElementById('updCard').style.display = '';
+  document.getElementById('updCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+function closeUpdatePanel() {
+  updAccount = null;
+  document.getElementById('updCard').style.display = 'none';
+}
+function switchUpdateAccount(acct) {
+  updAccount = acct;
+  renderUpdatePanel();
+}
+
+function renderUpdatePanel() {
+  if (!updAccount) return;
+  const sel = document.getElementById('updAccount');
+  const accts = [...new Set(holdings.map(h => h.account || ''))].filter(Boolean);
+  sel.innerHTML = accts.map(a =>
+    `<option value="${esc(a)}" ${a === updAccount ? 'selected' : ''}>${esc(a)}</option>`).join('');
+
+  const lines = updateLinesFor(updAccount);
+  document.getElementById('updBody').innerHTML = lines.length ? lines.map(l => {
+    const key = l.ids[0];
+    const ageDays = l.manual && holdings.find(h => h.id === key)?.updated
+      ? Math.floor((Date.now() - new Date(holdings.find(h => h.id === key).updated)) / 86400000)
+      : null;
+    return `<div class="upd-line">
+      <div class="upd-line-info">
+        <div class="upd-line-name">${esc(l.name)}
+          ${l.splitPct != null ? `<span class="upd-split-badge">split ${l.splitPct}% US / ${100 - l.splitPct}% Intl</span>` : ''}
+        </div>
+        <div class="upd-line-sub">
+          ${l.ticker ? esc(l.ticker) + ' · ' : ''}${fmt$(l.price)}${l.manual ? ` · manual price${ageDays != null && ageDays > 0 ? `, ${ageDays}d old` : ''}` : ''}
+        </div>
+      </div>
+      <div class="upd-line-inputs">
+        <input id="upd-q-${key}" type="number" inputmode="decimal" step="any" min="0"
+               value="${l.qty}" aria-label="Shares for ${esc(l.name)}">
+        ${l.manual ? `<input id="upd-p-${key}" type="number" inputmode="decimal" step="any" min="0"
+               value="${l.price}" aria-label="Price for ${esc(l.name)}" class="upd-price">` : ''}
+      </div>
+    </div>`;
+  }).join('') : '<p style="color:var(--text-muted);font-size:14px;">No holdings in this account.</p>';
+}
+
+function saveUpdatePanel() {
+  if (!updAccount) return;
+  let changed = 0;
+  for (const l of updateLinesFor(updAccount)) {
+    const key = l.ids[0];
+    const qEl = document.getElementById(`upd-q-${key}`);
+    if (!qEl) continue;
+    const qty = parseFloat(qEl.value);
+    if (isNaN(qty) || qty < 0) continue;
+    const pEl = document.getElementById(`upd-p-${key}`);
+    const price = pEl ? parseFloat(pEl.value) : null;
+    changed += applyQuantityUpdate(l.ids, qty,
+      { price: pEl && !isNaN(price) && price > 0 ? price : null, source: 'manual' });
+  }
+  if (changed) {
+    markUnsaved(); render(); renderUpdatePanel();
+    toast(`Updated ${changed} position${changed !== 1 ? 's' : ''} ✓`);
+  } else {
+    toast('No changes to save.');
+  }
+}
+
+// ─── Needs attention strip ───────────────────────────────────────────────────
+// Everything that requires a human: manual-price holdings gone stale, zero
+// prices, failed refreshes, and overdue proxy calibrations — each one tap
+// from its fix.
+let lastRefreshFailures = new Set(); // holding ids, set by refreshAllPrices
+
+function attentionItems() {
+  const items = [];
+  const now = Date.now();
+  for (const h of holdings) {
+    const age = h.updated ? Math.floor((now - new Date(h.updated)) / 86400000) : null;
+    if (!(h.price > 0)) {
+      items.push({ id: h.id, label: `${h.name}: no price`, kind: 'price' });
+    } else if (lastRefreshFailures.has(h.id)) {
+      items.push({ id: h.id, label: `${h.name}: refresh failed`, kind: 'price' });
+    } else if (isManualPrice(h) && age != null && age >= 7) {
+      items.push({ id: h.id, label: `${h.name}: manual price ${age}d old`, kind: 'price' });
+    } else if (proxyEntryFor(h) && h.calibration?.date &&
+               (now - new Date(h.calibration.date)) / 86400000 > PROXY_RECAL_NUDGE_DAYS) {
+      items.push({ id: h.id, label: `${h.name}: recalibrate NAV`, kind: 'price' });
+    }
+  }
+  return items;
+}
+
+function renderAttentionStrip() {
+  const el = document.getElementById('attnStrip');
+  if (!el) return;
+  const items = attentionItems();
+  if (!items.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = '';
+  el.innerHTML = `<div class="attn-title">Needs attention</div>` + items.map(it =>
+    `<button class="attn-chip" data-hid="${it.id}">⚠ ${esc(it.label)}</button>`).join('');
+  el.querySelectorAll('.attn-chip').forEach(btn => {
+    btn.onclick = () => {
+      const id = btn.dataset.hid;
+      startQuickPrice(id);
+      document.getElementById(`qp-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      document.getElementById(`qp-${id}`)?.focus();
+    };
+  });
 }
 
 // ─── Quick inline price edit ──────────────────────────────────────────────────
@@ -1503,6 +1754,7 @@ async function refreshAllPrices({ silent = false, autoSave = false } = {}) {
 
   let updated = 0, failed = 0;
   const failedTickers = [];
+  const failedIds = new Set();
   for (const h of fetchable) {
     const hasRealTicker = h.ticker && h.ticker.toUpperCase() !== 'N/A';
     const lookup = (hasRealTicker ? h.ticker : h.name).toUpperCase();
@@ -1517,6 +1769,7 @@ async function refreshAllPrices({ silent = false, autoSave = false } = {}) {
     } else {
       failed++;
       failedTickers.push(lookup);
+      failedIds.add(h.id);
     }
     btn.textContent = `↻ ${updated + failed}/${fetchable.length}…`;
     render();
@@ -1525,6 +1778,8 @@ async function refreshAllPrices({ silent = false, autoSave = false } = {}) {
   if (updated > 0) markUnsaved();
   btn.disabled = false; btn.textContent = '↻ Refresh All';
 
+  lastRefreshFailures = failedIds;
+  renderAttentionStrip();
   lastRefreshed = new Date();
   updateRefreshLabel();
 
@@ -1588,12 +1843,18 @@ function renderAccountTiles() {
   el.innerHTML = sorted.map(([acct, val], i) => {
     const pct   = tot > 0 ? (val / tot * 100).toFixed(1) : '0.0';
     const color = ACCT_COLORS[i % ACCT_COLORS.length];
-    return `<div class="account-tile" style="border-top-color:${color}">
+    return `<div class="account-tile" style="border-top-color:${color}" role="button" tabindex="0"
+      data-acct="${esc(acct)}" title="Update positions in ${esc(acct)}">
       <div class="account-tile-name">${esc(acct)}</div>
       <div class="account-tile-value">${fmt$(val)}</div>
       <div class="account-tile-pct">${pct}% of portfolio</div>
+      <div class="account-tile-hint">✎ update positions</div>
     </div>`;
   }).join('');
+  el.querySelectorAll('.account-tile').forEach(tile => {
+    tile.onclick = () => openUpdatePanel(tile.dataset.acct);
+    tile.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') openUpdatePanel(tile.dataset.acct); };
+  });
 }
 
 // ─── Render: Holdings Table ───────────────────────────────────────────────────
@@ -1898,6 +2159,7 @@ function render() {
   }
 
   renderAccountTiles();
+  renderAttentionStrip();
   renderTable();
   renderChart();
   renderContributions();
