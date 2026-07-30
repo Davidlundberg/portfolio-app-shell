@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Portfolio Tracker</title>
+  <!-- GitHub Pages can't send response headers, so the CSP rides in the page.
+       Every host the app talks to is enumerated; anything else is refused. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://umimaxkucnugmkifenyg.supabase.co wss://umimaxkucnugmkifenyg.supabase.co https://query1.finance.yahoo.com https://query2.finance.yahoo.com https://corsproxy.io https://api.allorigins.win https://api.frankfurter.app https://cdn.jsdelivr.net; worker-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#fafaf8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#09090b" media="(prefers-color-scheme: dark)">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="static/icon-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Portfolio">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://umimaxkucnugmkifenyg.supabase.co">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..700&display=swap" rel="stylesheet">
+  <!-- CDN dependencies: EXACT version + SRI hash (supply-chain hardening, same
+       discipline as Perq). A CDN rollover or tampered file fails closed. To bump:
+       change the version, recompute from the npm package's exact file:
+         openssl dgst -sha384 -binary <file> | openssl base64 -A -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"
+          integrity="sha384-FcQlsUOd0TJjROrBxhJdUhXTUgNJQxTMcxZe6nHbaEfFL1zjQ+bq/uRoBQxb0KMo"
+          crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.110.0/dist/umd/supabase.js"
+          integrity="sha384-3wY11tldQ5+yWqAvmTN4XtQvnjoTva0cV15O/O/O5NTtp0ivVopSzLOzsVXWZse9"
+          crossorigin="anonymous"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <span class="total-label">Portfolio Value</span>
+      <span class="total-value" id="totalValue">$0.00</span>
+      <span class="total-updated" id="sinceInceptionReturn"></span>
+      <span class="total-updated" id="trueTwrLabel"></span>
+      <span class="total-updated" id="lastSavedLabel"></span>
+      <span class="total-updated" id="lastRefreshedLabel"></span>
+    </div>
+    <div class="header-actions">
+      <button class="btn btn-ghost" id="btnCloud" style="display:none;">☁</button>
+      <button class="btn btn-ghost" onclick="triggerImportCSV()">📋 Import CSV</button>
+      <button class="btn btn-ghost" id="btnRefreshAll" onclick="refreshAllPrices()">↻ Refresh All</button>
+      <button class="btn btn-ghost" onclick="exportCSV()">↓ Export CSV</button>
+      <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">☀️</button>
+      <input type="file" id="fileInputCSV"  accept=".csv,.txt" onchange="importCSV(event)">
+    </div>
+  </div>
+
+  <!-- Account Tiles -->
+  <div class="account-tiles" id="accountTiles" style="display:none;"></div>
+
+  <!-- Add Holding -->
+  <div class="card">
+    <h2>Add Holding</h2>
+    <div class="form-row">
+      <div class="form-group">
+        <label for="iName">Investment Name</label>
+        <input id="iName" type="text" placeholder="e.g. Vanguard 500 Index Fund" autocomplete="off" spellcheck="false">
+        <div class="fetch-status" id="fetchStatus"></div>
+      </div>
+      <div class="form-group">
+        <label for="iType">Type</label>
+        <select id="iType">
+          <option value="stock">Stock</option>
+          <option value="etf">ETF</option>
+          <option value="mutual_fund">Mutual Fund</option>
+          <option value="crypto">Crypto</option>
+          <option value="bond">Bond</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="iQty">Shares / Units</label>
+        <input id="iQty" type="number" min="0" step="any" placeholder="100">
+      </div>
+      <div class="form-group">
+        <label for="iPrice" id="iPriceLabel">Price (USD)</label>
+        <input id="iPrice" type="number" min="0" step="any" placeholder="0.00">
+      </div>
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <button class="btn btn-ghost" id="btnFetch" onclick="autoFetchPrice()">↻ Fetch</button>
+      </div>
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <button class="btn btn-primary" onclick="addHolding()">+ Add</button>
+      </div>
+    </div>
+    <!-- Optional secondary fields -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;">
+      <div class="form-group">
+        <label for="iTicker">Ticker <span style="font-weight:400;color:#94a3b8">(optional — used for price lookup)</span></label>
+        <input id="iTicker" type="text" placeholder="e.g. VFIAX" autocomplete="off" spellcheck="false" style="text-transform:uppercase;">
+      </div>
+      <div class="form-group">
+        <label for="iAccount">Account</label>
+        <select id="iAccount"></select>
+      </div>
+    </div>
+  </div>
+
+  <!-- Import Preview (hidden until CSV loaded) -->
+  <div class="card import-card" id="importPreview" style="display:none;">
+    <div class="import-header">
+      <h2>CSV Import Preview</h2>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-ghost" onclick="cancelImport()">Cancel</button>
+        <button class="btn btn-primary" id="btnConfirmImport" onclick="confirmImport()">Import</button>
+      </div>
+    </div>
+    <div class="import-summary" id="importSummary"></div>
+    <div class="import-table-wrap">
+      <table class="import-table">
+        <thead><tr>
+          <th>#</th><th>Name / Ticker</th><th>Type</th>
+          <th class="num">Shares</th><th class="num">Price</th><th>Status</th>
+        </tr></thead>
+        <tbody id="importTableBody"></tbody>
+      </table>
+    </div>
+    <div class="import-note">
+      Rows highlighted in yellow are missing a price — they'll be imported with $0.00 and you can
+      update them after. Rows in red will be skipped. &nbsp;·&nbsp;
+      <a onclick="downloadCSVTemplate()">Download CSV template</a>
+    </div>
+  </div>
+
+  <!-- Holdings Table -->
+  <div class="card">
+    <h2>Holdings</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Name / Ticker</th>
+          <th>Type</th>
+          <th class="num">Shares</th>
+          <th class="num">Price</th>
+          <th class="num">Value</th>
+          <th>Allocation</th>
+          <th class="num">Actions</th>
+        </tr></thead>
+        <tbody id="tableBody"></tbody>
+        <tfoot id="tableFoot"></tfoot>
+      </table>
+    </div>
+  </div>
+
+  <!-- Chart + Legend -->
+  <div class="bottom-row">
+    <div class="card" style="min-height:260px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <h2 style="margin:0;">Allocation</h2>
+        <div class="chart-toggle">
+          <button class="toggle-btn active" onclick="setChartView('sleeve')">Sleeve</button>
+          <button class="toggle-btn"        onclick="setChartView('ticker')">Ticker</button>
+          <button class="toggle-btn"        onclick="setChartView('account')">Account</button>
+        </div>
+      </div>
+      <div class="chart-container"><canvas id="allocChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Breakdown</h2>
+      <ul class="legend" id="legend"></ul>
+    </div>
+  </div>
+
+  <!-- Allocation Strategy -->
+  <div class="card" id="allocStratCard" style="display:none;">
+    <h2>Allocation Strategy</h2>
+    <div class="alloc-grid">
+      <div>
+        <div class="subsection-label">Total Mix (%)</div>
+        <div class="target-inputs" id="targetInputsTot"></div>
+        <div class="subsection-label">Within Stocks (%)</div>
+        <div class="target-inputs" id="targetInputsStk"></div>
+        <div class="target-warning" id="targetWarning"></div>
+      </div>
+      <div>
+        <div class="subsection-label">Current vs Target</div>
+        <table class="gap-table">
+          <thead><tr>
+            <th>Sleeve</th>
+            <th class="r">Target</th>
+            <th class="r">Current</th>
+            <th class="r">Value</th>
+            <th class="r">Gap</th>
+          </tr></thead>
+          <tbody id="gapTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Recurring Contributions (P1a — auto-accrue payroll buys between statements) -->
+  <div class="card" id="contribCard" style="display:none;">
+    <h2>Recurring Contributions</h2>
+    <p style="font-size:13px;color:var(--text-secondary);margin:4px 0 6px;">
+      Auto-adds units each pay period (estimated at that day's price). Entering real
+      statement values any time trues everything up.
+    </p>
+    <div style="display:flex;gap:8px;align-items:center;margin:6px 0 2px;">
+      <input id="crNlText" type="text" style="flex:1;"
+             placeholder='Describe it: "biweekly $500 transfer to VOO and VGIT at 70/30"'
+             onkeydown="if(event.key==='Enter')parseNlContribution()">
+      <button class="btn btn-ghost btn-sm" onclick="parseNlContribution()" style="height:34px;">Parse</button>
+    </div>
+    <div id="crNlPreview" style="min-height:20px;margin-bottom:4px;"></div>
+    <div id="contribList"></div>
+    <div id="contribForm"></div>
+  </div>
+
+  <!-- Investment Advisor -->
+  <div class="card" id="advisorCard" style="display:none;">
+    <h2>Investment Advisor</h2>
+    <div class="advisor-form">
+      <div class="form-group">
+        <label for="advAmount">Amount to invest</label>
+        <input type="number" id="advAmount" min="0" step="100" placeholder="e.g. 1000">
+      </div>
+      <div class="form-group">
+        <label for="advAccount">Account (optional)</label>
+        <select id="advAccount"></select>
+      </div>
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <button class="btn btn-primary" onclick="computeAdvisorRec()">Get Recommendation</button>
+      </div>
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <button class="btn btn-ghost" onclick="runRebalancePlan(false)" title="Where should new money go? Buys only.">Rebalance Plan</button>
+      </div>
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <button class="btn btn-ghost" onclick="runRebalancePlan(true)" title="Full rebalance to targets — includes sells (tax warnings shown).">Full Rebalance</button>
+      </div>
+    </div>
+    <div id="advResult">
+      <p class="adv-placeholder">Enter an amount to see where to invest next.</p>
+    </div>
+  </div>
+
+  <!-- Dividend Income (P3 — T12M projection) -->
+  <div class="card" id="divCard" style="display:none;">
+    <h2 style="display:flex;align-items:center;justify-content:space-between;">
+      Dividend Income
+      <button class="btn btn-ghost btn-sm" id="btnDivRefresh" onclick="updateDividends()">↻ Update dividends</button>
+    </h2>
+    <p style="font-size:13px;color:var(--text-secondary);margin:4px 0 6px;">
+      Projected from trailing-12-month payments per share (forward declarations aren't
+      available on free data) — refresh after ex-dividend seasons.
+    </p>
+    <div id="divBody"></div>
+  </div>
+
+  <!-- FIRE — Monte Carlo (P5) -->
+  <div class="card" id="fireCard" style="display:none;">
+    <h2>When does work become optional?</h2>
+    <p style="font-size:13px;color:var(--text-secondary);margin:4px 0 6px;">
+      1,000 simulated futures from your current total, in today's dollars. FI target = annual spending ÷ 4%.
+    </p>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-bottom:8px;">
+      <div style="flex:1;min-width:130px;"><label style="font-size:12px;">Annual spending ($)</label><input id="fireSpend" type="number" min="0" step="1000" placeholder="e.g. 80000"></div>
+      <div style="flex:1;min-width:130px;"><label style="font-size:12px;">Monthly contributions ($)</label><input id="fireContrib" type="number" min="0" step="100"></div>
+      <div style="flex:0 0 90px;"><label style="font-size:12px;">Real return %</label><input id="fireMu" type="number" step="0.1" oninput="this.dataset.touched=1"></div>
+      <div style="flex:0 0 90px;"><label style="font-size:12px;">Volatility %</label><input id="fireSigma" type="number" step="0.1" oninput="this.dataset.touched=1"></div>
+      <button class="btn btn-primary btn-sm" onclick="runFireSim()" style="height:34px;">Simulate</button>
+    </div>
+    <div id="fireResult"></div>
+  </div>
+
+  <!-- Performance -->
+  <div class="card" id="perfCard" style="display:none;">
+    <h2>Performance</h2>
+    <div class="perf-chart-container"><canvas id="perfChart"></canvas></div>
+    <div class="perf-legend">
+      <div class="perf-legend-item"><div class="perf-legend-dot" style="background:#0d9488;"></div>Portfolio</div>
+      <div class="perf-legend-item"><div class="perf-legend-dot" style="background:#a1a1aa;"></div>SPY</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Cloud auth gate: blocking on the phone shell, cancellable "Set up phone
+     access" locally. Email → 6-digit code; no passwords anywhere. -->
+<div class="auth-gate" id="authGate" style="display:none;">
+  <div class="auth-card">
+    <h2 id="authTitle">Portfolio Tracker</h2>
+    <p class="auth-sub" id="authSub">Sign in to your portfolio.</p>
+    <div id="authStepEmail">
+      <label for="authEmail">Email</label>
+      <input id="authEmail" type="email" autocomplete="email" inputmode="email"
+             placeholder="you@example.com"
+             onkeydown="if(event.key==='Enter')authRequestCode()">
+      <button class="btn btn-primary auth-btn" onclick="authRequestCode()">Email me a code</button>
+    </div>
+    <div id="authStepCode" style="display:none;">
+      <label for="authCode">6-digit code</label>
+      <input id="authCode" type="text" inputmode="numeric" autocomplete="one-time-code"
+             pattern="[0-9]*" maxlength="6" placeholder="123456"
+             onkeydown="if(event.key==='Enter')authVerifyCode()">
+      <button class="btn btn-primary auth-btn" onclick="authVerifyCode()">Sign in</button>
+      <button class="btn btn-ghost auth-btn" onclick="authStep('email');authMsg('')">Different email</button>
+    </div>
+    <div class="auth-msg" id="authMsg" style="display:none;"></div>
+    <button class="btn btn-ghost auth-btn" id="authCancel" style="display:none;" onclick="hideAuthGate()">Cancel</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="cloud.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
