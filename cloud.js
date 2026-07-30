@@ -67,7 +67,11 @@ function cloudReady() { return !!(sb && cloudSession); }
 async function initCloud() {
   if (typeof window.supabase === 'undefined') return false; // CDN unreachable; local mode unaffected
   if (!sb) {
-    sb = window.supabase.createClient(CLOUD_URL, CLOUD_KEY);
+    // detectSessionInUrl: a magic-link redirect lands here with tokens in the
+    // URL fragment; the client consumes them into a session and scrubs the URL.
+    sb = window.supabase.createClient(CLOUD_URL, CLOUD_KEY, {
+      auth: { detectSessionInUrl: true, persistSession: true, autoRefreshToken: true },
+    });
     sb.auth.onAuthStateChange((_evt, s) => { cloudSession = s || null; });
   }
   const got = await sb.auth.getSession();
@@ -112,14 +116,19 @@ async function authRequestCode() {
   if (!email) { authMsg('Enter your email.', true); return; }
   if (!sb) { await initCloud(); }
   if (!sb) { authMsg('Cloud library not loaded — check your connection and reload.', true); return; }
-  authMsg('Sending code…');
-  // shouldCreateUser stays true: the server-side before-user-created hook
-  // rejects any email not on the allowlist, so this cannot open registration.
-  const { error } = await sb.auth.signInWithOtp({ email, options: { shouldCreateUser: true } });
+  authMsg('Sending sign-in email…');
+  // shouldCreateUser stays true: the signup allowlist (DB trigger + optional
+  // auth hook) rejects any email not on the allowlist server-side, so this
+  // cannot open registration. In shell mode the email's magic link redirects
+  // back to the app (the URL must be in Supabase Auth → Redirect URLs);
+  // supabase-js picks the session out of the redirect on load.
+  const options = { shouldCreateUser: true };
+  if (IS_SHELL) options.emailRedirectTo = CLOUD_APP_URL;
+  const { error } = await sb.auth.signInWithOtp({ email, options });
   if (error) { authMsg(error.message, true); return; }
   pendingOtpEmail = email;
   authStep('code');
-  authMsg('Check your email for a 6-digit code (or tap its sign-in link on this device).');
+  authMsg('Check your email — tap the sign-in link on this device, or enter the 6-digit code if the email shows one.');
 }
 
 async function authVerifyCode() {
