@@ -635,14 +635,20 @@ function detectColumns(headerRow) {
   return map;
 }
 
+// Returns a type, or null when the cell carries no asset-class information —
+// callers fall back to inferTypeFromInstrument. Null cases matter: Fidelity's
+// positions CSV has a "Type" column whose values are the account REGISTRATION
+// ("Cash" / "Margin" / "Short") on every row, not an asset class — mapping
+// bare "cash" to bond turned entire imports into bonds.
 function normalizeType(raw) {
-  if (!raw) return 'stock';
+  if (!raw) return null;
   const r = raw.toLowerCase().trim().replace(/[\s\-\/]+/g, '_');
+  if (['cash','margin','short'].includes(r)) return null; // brokerage registration, not an asset class
   if (['mutual_fund','mutualfund','mf','fund','open_end_fund','open_end'].includes(r)) return 'mutual_fund';
   if (['etf','exchange_traded_fund','exchange_traded'].includes(r))    return 'etf';
   if (['crypto','cryptocurrency','coin','token','digital_asset'].includes(r)) return 'crypto';
   if (['bond','bonds','fixed_income','fixed_income_bond','treasury','tbill','note',
-       'money_market','cash','cash_equivalent','stable_value'].includes(r))   return 'bond';
+       'money_market','cash_equivalent','stable_value'].includes(r))   return 'bond';
   if (['stock','stocks','equity','equities','share','common_stock',
        'domestic_stock','domestic_equity','us_stock','us_equity',
        'international_stock','international_equity','intl_stock','intl_equity',
@@ -650,7 +656,22 @@ function normalizeType(raw) {
        'large_cap','large_cap_stock','small_cap','small_cap_stock',
        'mid_cap','mid_cap_stock','growth','value','blend',
        'emerging_markets','emerging_market','real_estate','reit'].includes(r)) return 'stock';
-  return 'other';
+  return null; // unrecognized — let the instrument itself decide
+}
+
+// Type from what the instrument IS (ticker shape + name), used when the CSV's
+// type cell is absent or carries no asset-class info.
+function inferTypeFromInstrument(ticker, name) {
+  const t = (ticker || '').toUpperCase().trim().replace(/\*+$/, ''); // SPAXX** → SPAXX
+  const n = (name || '').toLowerCase();
+  if (/money market|cash reserves|government cash|treasury only/.test(n)) return 'bond';
+  if (/^(FBTC|IBIT|GBTC|ETHA|ETHE|ARKB|BITB)$/.test(t) || /bitcoin|ethereum|crypto/.test(n)) return 'crypto';
+  if (/^[A-Z]{5}$/.test(t) && t.endsWith('X')) return 'mutual_fund'; // classic US open-end fund symbol
+  if (US_STOCK_TICKERS.has(t) || INTL_TICKERS.has(t) || BOND_TICKERS.has(t) || TILT_TICKERS.has(t)) return 'etf';
+  if (/\betf\b/.test(n)) return 'etf';
+  if (/\bindex fund\b|\bfund\b/.test(n)) return 'mutual_fund';
+  if (/\bbond\b|treasury|fixed income/.test(n)) return 'bond';
+  return t ? 'stock' : 'other';
 }
 
 // ─── CSV: import flow ─────────────────────────────────────────────────────────
@@ -694,7 +715,7 @@ function importCSV(event) {
       const ticker = tickerRaw.trim();
       const qty    = parseFloat(qtyRaw.replace(/[$,\s]/g, ''));
       const price  = parseFloat(priceRaw.replace(/[$,\s]/g, ''));
-      const type   = normalizeType(typeRaw);
+      const type   = normalizeType(typeRaw) || inferTypeFromInstrument(ticker, name);
       const account = accountRaw.trim();
 
       let status = 'ok', statusMsg = 'Ready';
