@@ -102,7 +102,9 @@ function hideAuthGate() { document.getElementById('authGate').style.display = 'n
 function authStep(step) {
   document.getElementById('authStepEmail').style.display = step === 'email' ? '' : 'none';
   document.getElementById('authStepCode').style.display = step === 'code' ? '' : 'none';
+  document.getElementById('authStepPassword').style.display = step === 'password' ? '' : 'none';
   if (step === 'code') document.getElementById('authCode').focus();
+  if (step === 'password') document.getElementById('authPassword').focus();
 }
 
 async function authRequestCode() {
@@ -127,6 +129,27 @@ async function authVerifyCode() {
   const { data, error } = await sb.auth.verifyOtp({ email: pendingOtpEmail, token, type: 'email' });
   if (error) { authMsg(error.message, true); return; }
   cloudSession = data.session;
+  await afterSignIn();
+}
+
+// Fallback: password sign-in against the existing personal-cloud account
+// (same credentials as Closet/Perq). Kept alongside OTP so sign-in works
+// even before the email template carries the 6-digit code.
+async function authSubmitPassword() {
+  const email = document.getElementById('authEmail').value.trim().toLowerCase();
+  const password = document.getElementById('authPassword').value;
+  if (!email) { authStep('email'); authMsg('Enter your email first.', true); return; }
+  if (!password) { authMsg('Enter your password.', true); return; }
+  if (!sb) { await initCloud(); }
+  if (!sb) { authMsg('Cloud library not loaded — check your connection and reload.', true); return; }
+  authMsg('Signing in…');
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) { authMsg(error.message, true); return; }
+  cloudSession = data.session;
+  await afterSignIn();
+}
+
+async function afterSignIn() {
   if (cloudGateMode === 'migrate') {
     authMsg('Pushing your portfolio to the cloud…');
     const ok = await migrateLocalToCloud();

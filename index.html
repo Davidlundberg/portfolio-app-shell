@@ -302,6 +302,7 @@
              placeholder="you@example.com"
              onkeydown="if(event.key==='Enter')authRequestCode()">
       <button class="btn btn-primary auth-btn" onclick="authRequestCode()">Email me a code</button>
+      <button class="btn btn-ghost auth-btn" onclick="authStep('password');authMsg('')">Use password instead</button>
     </div>
     <div id="authStepCode" style="display:none;">
       <label for="authCode">6-digit code</label>
@@ -310,6 +311,14 @@
              onkeydown="if(event.key==='Enter')authVerifyCode()">
       <button class="btn btn-primary auth-btn" onclick="authVerifyCode()">Sign in</button>
       <button class="btn btn-ghost auth-btn" onclick="authStep('email');authMsg('')">Different email</button>
+    </div>
+    <div id="authStepPassword" style="display:none;">
+      <label for="authPassword">Password</label>
+      <input id="authPassword" type="password" autocomplete="current-password"
+             placeholder="••••••••"
+             onkeydown="if(event.key==='Enter')authSubmitPassword()">
+      <button class="btn btn-primary auth-btn" onclick="authSubmitPassword()">Sign in</button>
+      <button class="btn btn-ghost auth-btn" onclick="authStep('email');authMsg('')">Back</button>
     </div>
     <div class="auth-msg" id="authMsg" style="display:none;"></div>
     <button class="btn btn-ghost auth-btn" id="authCancel" style="display:none;" onclick="hideAuthGate()">Cancel</button>
