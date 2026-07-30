@@ -256,11 +256,21 @@ async function loadHistory() {
 const LEDGER_EPOCH = '2026-06-11';
 
 // + = money into the portfolio (contributions and manual statement true-ups).
+// 'dividend' rows are deliberately NOT flows: a reinvested distribution is
+// investment income, and subtracting it here would strip income out of TWR —
+// which is exactly what happened before the kind existed.
 function externalFlows(txns) {
   return (txns || [])
     .filter(t => t.kind === 'contribution' || t.kind === 'adjustment')
     .map(t => ({ date: String(t.date).slice(0, 10), amount: +(t.amount || 0) }))
     .filter(f => f.amount !== 0 && f.date);
+}
+
+// Recorded income (reinvested or cash dividends) since the ledger epoch.
+function recordedIncome(txns) {
+  return (txns || [])
+    .filter(t => t.kind === 'dividend')
+    .reduce((s, t) => s + (+t.amount || 0), 0);
 }
 
 // Time-weighted return over [first..last] snapshot, end-of-period flow
@@ -311,6 +321,67 @@ function computeMWR(snapshots, flows) {
   return (lo + hi) / 2;
 }
 
+// ─── Policy benchmark ────────────────────────────────────────────────────────
+// A price-only SPY line answers the wrong question for a policy investor. The
+// honest benchmark is his own target mix as a blended TOTAL-return index:
+// VTI/VXUS/BND daily adjcloses (dividend-adjusted), weighted from targets,
+// compounded daily. 'other' has no benchmark — weights renormalize over the
+// investable three. Tilt maps to VTI (disclosed simplification).
+function policyWeights(t) {
+  const stocks = (+t.stocks || 0) / 100;
+  const w = {
+    VTI:  stocks * (((+t.us || 0) + (+t.tilts || 0)) / 100),
+    VXUS: stocks * ((+t.intl || 0) / 100),
+    BND:  (+t.bonds || 0) / 100,
+  };
+  const sum = w.VTI + w.VXUS + w.BND;
+  if (!(sum > 0)) return null;
+  for (const k in w) w[k] = w[k] / sum;
+  return w;
+}
+
+// seriesByTicker: {T:{timestamps:[unix s],adjcloses:[]}}; returns a
+// daily-rebalanced blended index [{date, level}] from the first date where
+// every ticker has a close (level 100), or null when not computable.
+function computePolicySeries(seriesByTicker, weights) {
+  const byDate = {};
+  for (const [tick, s] of Object.entries(seriesByTicker || {})) {
+    if (!s || !Array.isArray(s.timestamps) || !s.timestamps.length) return null;
+    s.timestamps.forEach((ts, i) => {
+      const px = s.adjcloses[i];
+      if (px == null || !(px > 0)) return;
+      const date = new Date(ts * 1000).toISOString().slice(0, 10);
+      (byDate[date] = byDate[date] || {})[tick] = px;
+    });
+  }
+  const ticks = Object.keys(weights);
+  const dates = Object.keys(byDate)
+    .filter(d => ticks.every(t => byDate[d][t] != null))
+    .sort();
+  if (dates.length < 2) return null;
+  let level = 100;
+  const out = [{ date: dates[0], level }];
+  for (let i = 1; i < dates.length; i++) {
+    let r = 0;
+    for (const t of ticks) r += weights[t] * (byDate[dates[i]][t] / byDate[dates[i - 1]][t] - 1);
+    level *= 1 + r;
+    out.push({ date: dates[i], level: +level.toFixed(4) });
+  }
+  return out;
+}
+
+// Blended level at-or-before each wanted date (null before the series starts).
+function samplePolicyAt(series, dates) {
+  return dates.map(d => {
+    let last = null;
+    for (const p of series) {
+      if (p.date > d) break;
+      last = p.level;
+    }
+    return last;
+  });
+}
+
 // Annualized MWR is statistical noise on short spans — suppress under 30 days.
 const MWR_MIN_SPAN_DAYS = 30;
 
@@ -354,7 +425,9 @@ function renderPerformanceChart() {
     if (twr !== null) {
       const ts = twr >= 0 ? '+' : '';
       const mwrTxt = mwr !== null ? ` · MWR ${(mwr >= 0 ? '+' : '')}${(mwr * 100).toFixed(1)}%/yr` : '';
-      trueEl.textContent = `TWR since ${LEDGER_EPOCH}: ${ts}${(twr * 100).toFixed(2)}%${mwrTxt}`;
+      const inc = recordedIncome(transactions);
+      const incTxt = inc > 0 ? ` · income ${fmt$(inc)}` : '';
+      trueEl.textContent = `TWR since ${LEDGER_EPOCH}: ${ts}${(twr * 100).toFixed(2)}%${mwrTxt}${incTxt}`;
       trueEl.className = 'total-updated ' + (twr >= 0 ? 'return-positive' : 'return-negative');
     } else {
       trueEl.textContent = '';
@@ -419,6 +492,74 @@ function renderPerformanceChart() {
       },
     },
   });
+
+  perfChartGen++;
+  loadPolicyBenchmark(snapshots, postEpoch, twr, perfChartGen);
+}
+
+// Fetch VTI/VXUS/BND total-return series, blend by targets, and add the policy
+// line + "vs policy" delta once ready. Failures skip silently — the chart is
+// complete without it. Cached per range+weights for the session.
+let policyCache = null;
+let perfChartGen = 0;
+
+function policyRangeFor(firstDate) {
+  const days = (Date.now() - new Date(firstDate + 'T00:00:00Z')) / 86400000;
+  if (days <= 80)  return '3mo';
+  if (days <= 170) return '6mo';
+  if (days <= 350) return '1y';
+  if (days <= 700) return '2y';
+  return '5y';
+}
+
+async function loadPolicyBenchmark(snapshots, postEpoch, twr, gen) {
+  const weights = policyWeights(targets);
+  if (!weights || snapshots.length < 2) return;
+  const range = policyRangeFor(snapshots[0].date);
+  const key = range + ':' + JSON.stringify(weights);
+  if (!policyCache || policyCache.key !== key) {
+    const fetched = {};
+    for (const tick of Object.keys(weights)) {
+      const s = await fetchYahooChart(tick, range).catch(() => null);
+      if (!s) return; // offline or blocked — keep the chart as-is
+      fetched[tick] = s;
+    }
+    const series = computePolicySeries(fetched, weights);
+    if (!series) return;
+    policyCache = { key, series };
+  }
+  if (gen !== perfChartGen || !perfChartInst) return; // superseded render
+
+  const sampled = samplePolicyAt(policyCache.series, snapshots.map(s => s.date));
+  const firstIdx = sampled.findIndex(v => v != null);
+  if (firstIdx === -1) return;
+  const base = sampled[firstIdx];
+  const serie = sampled.map(v => v == null ? null : +((v / base * 100).toFixed(2)));
+  perfChartInst.data.datasets.push({
+    label: 'Policy (your targets)',
+    data: serie,
+    borderColor: '#3b6da0',
+    backgroundColor: 'transparent',
+    borderDash: [6, 4],
+    fill: false,
+    tension: 0.3,
+    pointRadius: 0,
+    pointHoverRadius: 4,
+  });
+  perfChartInst.update();
+
+  // "Did my implementation beat my policy?" over the post-epoch TWR window.
+  if (twr !== null && postEpoch.length >= 2) {
+    const [p0, p1] = samplePolicyAt(policyCache.series,
+      [postEpoch[0].date, postEpoch[postEpoch.length - 1].date]);
+    if (p0 != null && p1 != null && p0 > 0) {
+      const delta = twr - (p1 / p0 - 1);
+      const el = document.getElementById('trueTwrLabel');
+      if (el && el.textContent && !el.textContent.includes('vs policy')) {
+        el.textContent += ` · vs policy ${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(2)}%`;
+      }
+    }
+  }
 }
 
 function toast(msg, ms = 2800) {
@@ -585,9 +726,16 @@ function loadFromFile(event) {
       holdings  = data.holdings.map(h => ({ type:'stock', ...h }));
       lastSaved = data.lastSaved || null;
       if (data.targets) Object.assign(targets, data.targets);
+      // The backup carries the whole ledger — dropping it here silently
+      // destroyed post-epoch TWR/MWR on every restore.
+      transactions      = data.transactions || [];
+      contributionRules = data.contributionRules || [];
       unsaved   = false;
-      saveLocal(); render(); renderTargetInputs();
-      toast(`Loaded ${holdings.length} holdings from ${file.name}`);
+      saveLocal();
+      applyContributionRules();
+      render(); renderTargetInputs();
+      renderPerformanceChart();
+      toast(`Restored ${holdings.length} holdings + ${transactions.length} ledger rows from ${file.name}`);
     } catch { toast('Error: not a valid portfolio.json file'); }
     event.target.value = '';
   };
@@ -803,6 +951,15 @@ function renderImportPreview() {
 
   document.getElementById('importTableBody').innerHTML = importRows.map(r => {
     const sub = [r.ticker && r.ticker !== r.name ? r.ticker : '', r.account].filter(Boolean).join(' · ');
+    // A quantity INCREASE on an existing holding may be a reinvested
+    // distribution rather than new money — misclassifying it as a flow would
+    // strip that income out of TWR, so the human decides here, one tap.
+    const kindPicker = r.mode === 'update' && r.quantity > r.oldQty
+      ? `<div style="margin-top:4px;"><select id="imp-kind-${r._row}" class="imp-kind">
+           <option value="adjustment">New money / true-up</option>
+           <option value="dividend">Reinvested dividend</option>
+         </select></div>`
+      : '';
     return `<tr class="row-${r.status}">
       <td style="color:var(--text-muted)">${r._row}</td>
       <td>
@@ -812,7 +969,7 @@ function renderImportPreview() {
       <td>${typeBadge(r.type)}</td>
       <td class="num">${r.quantity > 0 ? fmtN(r.quantity) : '—'}</td>
       <td class="num">${r.price > 0 ? fmt$(r.price) : '—'}</td>
-      <td class="status-${r.status}">${r.statusMsg}</td>
+      <td class="status-${r.status}">${r.statusMsg}${kindPicker}</td>
     </tr>`;
   }).join('');
 
@@ -823,7 +980,7 @@ function renderImportPreview() {
 // Apply a new total quantity across one or more holding rows (a split pair
 // gets the total distributed by its current ratio), recording ledger
 // adjustments so TWR stays honest. Returns how many rows actually changed.
-function applyQuantityUpdate(ids, newTotalQty, { price = null, source = 'manual' } = {}) {
+function applyQuantityUpdate(ids, newTotalQty, { price = null, source = 'manual', kind = 'adjustment' } = {}) {
   const rows = ids.map(mid => holdings.find(x => x.id === mid)).filter(Boolean);
   if (!rows.length) return 0;
   const oldTotal = rows.reduce((s, h) => s + h.quantity, 0);
@@ -840,7 +997,7 @@ function applyQuantityUpdate(ids, newTotalQty, { price = null, source = 'manual'
     if (qtyDelta === 0 && newPrice === h.price) return;
     if (qtyDelta !== 0) {
       transactions.push({
-        id: uid(), date: now.slice(0, 10), kind: 'adjustment',
+        id: uid(), date: now.slice(0, 10), kind,
         holdingId: h.id, holdingName: h.name, units: qtyDelta,
         unitPrice: newPrice, amount: +(qtyDelta * newPrice).toFixed(2), source,
       });
@@ -864,7 +1021,9 @@ function confirmImport() {
       // Distributing across rows[] handles both a single match and a split
       // pair; keep the existing rows' account/type/sleeve — the CSV only
       // speaks for quantity and price.
-      if (applyQuantityUpdate(r.matchIds, r.quantity, { price: r.price, source: 'import' })) updated++;
+      const kind = document.getElementById(`imp-kind-${r._row}`)?.value === 'dividend'
+        ? 'dividend' : 'adjustment';
+      if (applyQuantityUpdate(r.matchIds, r.quantity, { price: r.price, source: 'import', kind })) updated++;
       return;
     }
     holdings.push({
@@ -1015,6 +1174,44 @@ function confirmSplit(id) {
   markUnsaved(); render();
   toast(`Split into ${fmtN(qty1)} + ${fmtN(qty2)} units`);
 }
+
+// ─── "Since you last looked" ─────────────────────────────────────────────────
+// The first question of every visit, answered as a RETURN-like number:
+// value change minus external flows in the window, so a payroll contribution
+// doesn't masquerade as growth. Per-device by design (localStorage).
+const LAST_LOOK_KEY = 'portfolio_last_look';
+let lastLookDone = false;
+
+function renderLastLookChip() {
+  if (lastLookDone || !holdings.length || !(total() > 0)) return;
+  const el = document.getElementById('sinceLastLook');
+  if (!el) return;
+  lastLookDone = true; // computed once per visit, against the previous look
+  let prev = null;
+  try { prev = JSON.parse(localStorage.getItem(LAST_LOOK_KEY)); } catch { /* ignore */ }
+  if (prev && prev.value > 0 && Date.now() - prev.ts > 6 * 3600000) {
+    const flowsSince = externalFlows(transactions)
+      .filter(f => f.date > prev.date)
+      .reduce((s, f) => s + f.amount, 0);
+    const delta = total() - prev.value - flowsSince;
+    const pct = Math.abs(delta / prev.value * 100);
+    const sign = delta >= 0 ? '+' : '−';
+    const when = new Date(prev.ts).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+    el.textContent = `Since ${when}: ${sign}${fmt$(Math.abs(delta))} (${sign}${pct.toFixed(1)}%)` +
+      (flowsSince > 0 ? ` · excl. ${fmt$(flowsSince)} added` : '');
+    el.className = 'total-updated ' + (delta >= 0 ? 'return-positive' : 'return-negative');
+  }
+  noteLook();
+}
+
+function noteLook() {
+  if (!holdings.length || !(total() > 0)) return;
+  localStorage.setItem(LAST_LOOK_KEY, JSON.stringify({
+    ts: Date.now(), date: new Date().toISOString().slice(0, 10), value: total(),
+  }));
+}
+document.addEventListener('visibilitychange', () => { if (document.hidden) noteLook(); });
+window.addEventListener('pagehide', noteLook);
 
 // ─── Update Positions panel ──────────────────────────────────────────────────
 // One compact editor per account: every position is a single line with a big
@@ -2160,6 +2357,7 @@ function render() {
 
   renderAccountTiles();
   renderAttentionStrip();
+  renderLastLookChip();
   renderTable();
   renderChart();
   renderContributions();

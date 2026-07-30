@@ -548,6 +548,13 @@ td select { padding-right: 24px; }
 
 input[type="file"] { display: none; }
 
+/* ── Import kind picker (true-up vs reinvested dividend) ── */
+.imp-kind {
+  font-size: 12px; padding: 4px 6px;
+  border: 1px solid var(--border-default); border-radius: 6px;
+  background: var(--bg-input); color: var(--text-primary);
+}
+
 /* ── Needs attention strip ── */
 #attnStrip {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;

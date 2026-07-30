@@ -43,6 +43,7 @@
       <span class="total-value" id="totalValue">$0.00</span>
       <span class="total-updated" id="sinceInceptionReturn"></span>
       <span class="total-updated" id="trueTwrLabel"></span>
+      <span class="total-updated" id="sinceLastLook"></span>
       <span class="total-updated" id="lastSavedLabel"></span>
       <span class="total-updated" id="lastRefreshedLabel"></span>
     </div>
@@ -51,8 +52,11 @@
       <button class="btn btn-ghost" onclick="triggerImportCSV()">📋 Import CSV</button>
       <button class="btn btn-ghost" id="btnRefreshAll" onclick="refreshAllPrices()">↻ Refresh All</button>
       <button class="btn btn-ghost" onclick="exportCSV()">↓ Export CSV</button>
+      <button class="btn btn-ghost" onclick="saveToFile()" title="Save a full JSON backup (holdings + ledger)">⤓ Backup</button>
+      <button class="btn btn-ghost" onclick="triggerLoadJSON()" title="Restore from a JSON backup">⤒ Restore</button>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">☀️</button>
       <input type="file" id="fileInputCSV"  accept=".csv,.txt" onchange="importCSV(event)">
+      <input type="file" id="fileInputJSON" accept=".json" onchange="loadFromFile(event)">
     </div>
   </div>
 
