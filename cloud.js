@@ -69,8 +69,17 @@ async function initCloud() {
   if (!sb) {
     // detectSessionInUrl: a magic-link redirect lands here with tokens in the
     // URL fragment; the client consumes them into a session and scrubs the URL.
+    // storageKey ISOLATES this app's session: Closet/Perq share this origin
+    // (github.io) and this Supabase project, so the default key would make any
+    // of their sessions silently unlock the portfolio (and portfolio sign-out
+    // would sign them out). The portfolio always demands its own sign-in.
     sb = window.supabase.createClient(CLOUD_URL, CLOUD_KEY, {
-      auth: { detectSessionInUrl: true, persistSession: true, autoRefreshToken: true },
+      auth: {
+        storageKey: 'sb-portfolio-auth',
+        detectSessionInUrl: true,
+        persistSession: true,
+        autoRefreshToken: true,
+      },
     });
     sb.auth.onAuthStateChange((_evt, s) => { cloudSession = s || null; });
   }

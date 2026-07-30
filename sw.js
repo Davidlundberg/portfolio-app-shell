@@ -17,7 +17,7 @@
  * Bump VERSION on any shell change — activate deletes all older caches.
  * tools/publish_shell.py asserts the published version matches this constant.
  */
-const VERSION = 'v1.0.2';
+const VERSION = 'v1.0.3';
 const SHELL_CACHE = `portfolio-shell-${VERSION}`;
 const RUNTIME_CACHE = `portfolio-runtime-${VERSION}`;
 
