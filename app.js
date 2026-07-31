@@ -1178,6 +1178,154 @@ function confirmSplit(id) {
   toast(`Split into ${fmtN(qty1)} + ${fmtN(qty2)} units`);
 }
 
+// ─── Risk & Exposure ─────────────────────────────────────────────────────────
+// Three honest views: employer-correlated concentration (salary + ESPP + any
+// employer stock is ONE bet), look-through company exposure across index
+// funds (static top-10 fact-sheet weights — lower bounds, dated), and the
+// Swedish pension's fund-vs-krona return split from the stamped fxHistory.
+
+const EMPLOYER = { name: 'Nasdaq', tickers: ['NDAQ'], accounts: ['ESPP - Trade'] };
+const EMPLOYER_CAP_PCT = 10; // concentration alert threshold (% of portfolio)
+
+// Approximate top-10 index weights (%), from public fact sheets. String
+// values alias another entry. Truncated at top-10 by nature — the card shows
+// "at least X%" and the as-of date, never a false total.
+const FUND_TOP_HOLDINGS = {
+  asOf: '2026-06',
+  funds: {
+    VOO: [['Nvidia', 7.5], ['Microsoft', 7.0], ['Apple', 5.8], ['Amazon', 4.2], ['Alphabet', 4.0],
+          ['Meta', 3.0], ['Broadcom', 2.8], ['Tesla', 1.9], ['Berkshire Hathaway', 1.6], ['Eli Lilly', 1.4]],
+    SPY: 'VOO', IVV: 'VOO', FXAIX: 'VOO', VFIAX: 'VOO', SWPPX: 'VOO', FNILX: 'VOO', SPLG: 'VOO',
+    VTI: [['Nvidia', 6.4], ['Microsoft', 6.0], ['Apple', 5.0], ['Amazon', 3.6], ['Alphabet', 3.4],
+          ['Meta', 2.6], ['Broadcom', 2.4], ['Tesla', 1.6], ['Berkshire Hathaway', 1.4], ['Eli Lilly', 1.2]],
+    ITOT: 'VTI', FSKAX: 'VTI', SWTSX: 'VTI', FZROX: 'VTI',
+    QQQ: [['Nvidia', 9.5], ['Microsoft', 8.8], ['Apple', 7.5], ['Amazon', 5.5], ['Broadcom', 5.2],
+          ['Alphabet', 5.0], ['Meta', 4.8], ['Tesla', 3.5], ['Costco', 2.6], ['Netflix', 2.5]],
+    VXUS: [['TSMC', 2.3], ['Tencent', 1.0], ['ASML', 1.0], ['SAP', 0.9], ['Nestlé', 0.8],
+           ['Novo Nordisk', 0.8], ['Samsung', 0.8], ['Roche', 0.7], ['Shell', 0.7], ['AstraZeneca', 0.7]],
+    IXUS: 'VXUS', VTIAX: 'VXUS', FTIHX: 'VXUS', FZILX: 'VXUS',
+  },
+  // Non-tickered funds matched by name fragment.
+  byName: {
+    'State Street S&P 500': 'VOO',
+    'LF Global Index': [['Nvidia', 5.0], ['Microsoft', 4.6], ['Apple', 3.9], ['Amazon', 2.8],
+      ['Alphabet', 2.6], ['Meta', 2.0], ['Broadcom', 1.8], ['Tesla', 1.2], ['JPMorgan', 1.0], ['Eli Lilly', 0.9]],
+    'Länsförsäkringar Global Index': 'LF Global Index',
+  },
+};
+
+function fundTopFor(h) {
+  const F = FUND_TOP_HOLDINGS;
+  const resolve = v => typeof v === 'string' ? (F.funds[v] ?? F.byName[v]) : v;
+  const tick = (h.ticker || '').toUpperCase();
+  if (tick && F.funds[tick]) return resolve(F.funds[tick]);
+  for (const [frag, v] of Object.entries(F.byName)) {
+    if ((h.name || '').includes(frag)) return resolve(v);
+  }
+  return null;
+}
+
+function employerExposure() {
+  const tot = total();
+  if (!(tot > 0)) return null;
+  let value = 0;
+  const parts = [];
+  for (const h of holdings) {
+    const v = h.quantity * h.price;
+    if (!(v > 0)) continue;
+    const byTicker = EMPLOYER.tickers.includes((h.ticker || '').toUpperCase());
+    const byAccount = EMPLOYER.accounts.includes(h.account || '');
+    if (byTicker || byAccount) {
+      value += v;
+      parts.push(`${h.ticker || h.name} (${byAccount && !byTicker ? 'ESPP' : 'stock'})`);
+    }
+  }
+  if (!(value > 0)) return null;
+  return { value, pct: value / tot * 100, parts };
+}
+
+// Look-through: Σ fund value × top-10 weight, plus direct single-stock
+// positions at 100%. Returns [{company, value, pct}] sorted desc — a LOWER
+// BOUND (top-10 data only).
+function lookThroughExposure() {
+  const tot = total();
+  if (!(tot > 0)) return [];
+  const byCompany = {};
+  const add = (company, v) => { byCompany[company] = (byCompany[company] || 0) + v; };
+  for (const h of holdings) {
+    const v = h.quantity * h.price;
+    if (!(v > 0)) continue;
+    const top = fundTopFor(h);
+    if (top) {
+      for (const [company, wPct] of top) add(company, v * wPct / 100);
+    } else if (h.type === 'stock' && h.ticker && h.ticker.toUpperCase() !== 'N/A') {
+      add(h.name || h.ticker, v);
+    }
+  }
+  return Object.entries(byCompany)
+    .map(([company, value]) => ({ company, value, pct: value / tot * 100 }))
+    .sort((a, b) => b.value - a.value);
+}
+
+// Krona split: (1+local)×(1+fx)−1 between the first and last fxHistory stamp.
+function sekDecomposition() {
+  for (const h of holdings) {
+    if (Array.isArray(h.fxHistory) && h.fxHistory.length >= 2) {
+      const a = h.fxHistory[0], b = h.fxHistory[h.fxHistory.length - 1];
+      if (!(a.nav > 0 && a.rate > 0 && b.nav > 0 && b.rate > 0)) continue;
+      const local = b.nav / a.nav - 1;
+      const fx = b.rate / a.rate - 1;
+      return { name: h.name, from: a.date, to: b.date, local, fx, net: (1 + local) * (1 + fx) - 1 };
+    }
+  }
+  return null;
+}
+
+function renderRiskCard() {
+  const card = document.getElementById('riskCard');
+  const body = document.getElementById('riskBody');
+  if (!card || !body) return;
+  const emp = employerExposure();
+  const look = lookThroughExposure().slice(0, 8);
+  const sek = sekDecomposition();
+  if (!emp && !look.length && !sek) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const pctFmt = (x, signed = false) =>
+    `${signed && x >= 0 ? '+' : ''}${(x * 100).toFixed(1)}%`;
+  let html = '';
+
+  if (emp) {
+    const over = emp.pct > EMPLOYER_CAP_PCT;
+    html += `<div class="subsection-label">Employer concentration — ${esc(EMPLOYER.name)}</div>
+      <p class="risk-line ${over ? 'risk-over' : ''}">
+        ${fmt$(emp.value)} · <strong>${emp.pct.toFixed(1)}%</strong> of portfolio
+        ${over ? `— above the ${EMPLOYER_CAP_PCT}% concentration guideline` : `(guideline: keep under ${EMPLOYER_CAP_PCT}%)`}
+      </p>
+      <p class="risk-note">Counts ${esc(emp.parts.join(', '))} — the same single bet as your salary.</p>`;
+  }
+
+  if (look.length) {
+    html += `<div class="subsection-label">Top companies across all funds (look-through)</div>
+      <div class="risk-look">` +
+      look.map(r => `<div class="risk-row">
+          <span>${esc(r.company)}</span>
+          <span class="risk-bar"><span style="width:${Math.min(100, r.pct * 8)}%"></span></span>
+          <span class="num">≥ ${r.pct.toFixed(1)}%</span>
+        </div>`).join('') +
+      `</div>
+      <p class="risk-note">Lower bounds — computed from top-10 fund weights (approx., as of ${FUND_TOP_HOLDINGS.asOf}) plus direct positions.</p>`;
+  }
+
+  if (sek) {
+    html += `<div class="subsection-label">Swedish pension — fund vs krona (${esc(sek.from)} → ${esc(sek.to)})</div>
+      <p class="risk-line">
+        Fund ${pctFmt(sek.local, true)} in SEK · krona ${pctFmt(sek.fx, true)} vs USD
+        → net <strong>${pctFmt(sek.net, true)}</strong> in USD
+      </p>`;
+  }
+  body.innerHTML = html;
+}
+
 // ─── "Since you last looked" ─────────────────────────────────────────────────
 // The first question of every visit, answered as a RETURN-like number:
 // value change minus external flows in the window, so a payroll contribution
@@ -1351,6 +1499,11 @@ function attentionItems() {
       items.push({ id: h.id, label: `${h.name}: recalibrate NAV`, kind: 'price' });
     }
   }
+  const emp = employerExposure();
+  if (emp && emp.pct > EMPLOYER_CAP_PCT) {
+    items.push({ id: '__risk', kind: 'risk',
+      label: `${EMPLOYER.name} exposure ${emp.pct.toFixed(1)}% — over the ${EMPLOYER_CAP_PCT}% guideline` });
+  }
   return items;
 }
 
@@ -1365,6 +1518,10 @@ function renderAttentionStrip() {
   el.querySelectorAll('.attn-chip').forEach(btn => {
     btn.onclick = () => {
       const id = btn.dataset.hid;
+      if (id === '__risk') {
+        document.getElementById('riskCard')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return;
+      }
       startQuickPrice(id);
       document.getElementById(`qp-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       document.getElementById(`qp-${id}`)?.focus();
@@ -2379,6 +2536,7 @@ function render() {
   renderAccountTiles();
   renderAttentionStrip();
   renderLastLookChip();
+  renderRiskCard();
   renderTable();
   renderChart();
   renderContributions();

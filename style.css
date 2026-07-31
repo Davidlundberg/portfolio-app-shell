@@ -548,6 +548,24 @@ td select { padding-right: 24px; }
 
 input[type="file"] { display: none; }
 
+/* ── Risk & Exposure card ── */
+.risk-line { font-size: 14px; margin: 4px 0 2px; }
+.risk-line.risk-over { color: #dc2626; }
+[data-theme="dark"] .risk-line.risk-over { color: #f87171; }
+.risk-note { font-size: 12px; color: var(--text-muted); margin: 2px 0 12px; }
+.risk-look { margin: 4px 0 2px; }
+.risk-row {
+  display: grid; grid-template-columns: minmax(90px, 1fr) 2fr 64px;
+  gap: 10px; align-items: center;
+  font-size: 13px; padding: 3px 0;
+}
+.risk-bar {
+  height: 8px; border-radius: 4px; background: var(--bar-bg);
+  overflow: hidden; display: block;
+}
+.risk-bar > span { display: block; height: 100%; background: var(--navy); border-radius: 4px; }
+.risk-row .num { text-align: right; font-variant-numeric: tabular-nums; }
+
 /* ── Import kind picker (true-up vs reinvested dividend) ── */
 .imp-kind {
   font-size: 12px; padding: 4px 6px;
