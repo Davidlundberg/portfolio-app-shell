@@ -1310,8 +1310,20 @@ function locationCheck() {
 // funds (static top-10 fact-sheet weights — lower bounds, dated), and the
 // Swedish pension's fund-vs-krona return split from the stamped fxHistory.
 
-const EMPLOYER = { name: 'Nasdaq', tickers: ['NDAQ'], accounts: ['ESPP - Trade'] };
+// Employer identity lives in the PRIVATE synced doc (targets.employerName /
+// targets.employerTickers), never in this public shell source — the code
+// ships only neutral defaults. The ESPP account is employer-tied by nature.
+const EMPLOYER_DEFAULTS = { name: 'Employer', tickers: [], accounts: ['ESPP - Trade'] };
 const EMPLOYER_CAP_PCT = 10; // concentration alert threshold (% of portfolio)
+
+function employerConfig() {
+  return {
+    name: targets.employerName || EMPLOYER_DEFAULTS.name,
+    tickers: (Array.isArray(targets.employerTickers) ? targets.employerTickers : EMPLOYER_DEFAULTS.tickers)
+      .map(t => String(t).toUpperCase()),
+    accounts: EMPLOYER_DEFAULTS.accounts,
+  };
+}
 
 // Approximate top-10 index weights (%), from public fact sheets. String
 // values alias another entry. Truncated at top-10 by nature — the card shows
@@ -1354,20 +1366,21 @@ function fundTopFor(h) {
 function employerExposure() {
   const tot = total();
   if (!(tot > 0)) return null;
+  const emp = employerConfig();
   let value = 0;
   const parts = [];
   for (const h of holdings) {
     const v = h.quantity * h.price;
     if (!(v > 0)) continue;
-    const byTicker = EMPLOYER.tickers.includes((h.ticker || '').toUpperCase());
-    const byAccount = EMPLOYER.accounts.includes(h.account || '');
+    const byTicker = emp.tickers.includes((h.ticker || '').toUpperCase());
+    const byAccount = emp.accounts.includes(h.account || '');
     if (byTicker || byAccount) {
       value += v;
       parts.push(`${h.ticker || h.name} (${byAccount && !byTicker ? 'ESPP' : 'stock'})`);
     }
   }
   if (!(value > 0)) return null;
-  return { value, pct: value / tot * 100, parts };
+  return { name: emp.name, value, pct: value / tot * 100, parts };
 }
 
 // Look-through: Σ fund value × top-10 weight, plus direct single-stock
@@ -1422,7 +1435,7 @@ function renderRiskCard() {
 
   if (emp) {
     const over = emp.pct > EMPLOYER_CAP_PCT;
-    html += `<div class="subsection-label">Employer concentration — ${esc(EMPLOYER.name)}</div>
+    html += `<div class="subsection-label">Employer concentration — ${esc(emp.name)}</div>
       <p class="risk-line ${over ? 'risk-over' : ''}">
         ${fmt$(emp.value)} · <strong>${emp.pct.toFixed(1)}%</strong> of portfolio
         ${over ? `— above the ${EMPLOYER_CAP_PCT}% concentration guideline` : `(guideline: keep under ${EMPLOYER_CAP_PCT}%)`}
@@ -1529,7 +1542,7 @@ function renderTaxCard() {
   }
 
   // 3 ── ESPP disposition planner
-  const espp = holdings.filter(h => EMPLOYER.accounts.includes(h.account || '') && h.quantity > 0);
+  const espp = holdings.filter(h => employerConfig().accounts.includes(h.account || '') && h.quantity > 0);
   if (espp.length) {
     html += `<div class="subsection-label">ESPP — disposition planner</div>`;
     for (const h of espp) {
@@ -1781,7 +1794,11 @@ function attentionItems() {
   const emp = employerExposure();
   if (emp && emp.pct > EMPLOYER_CAP_PCT) {
     items.push({ id: '__risk', kind: 'risk',
-      label: `${EMPLOYER.name} exposure ${emp.pct.toFixed(1)}% — over the ${EMPLOYER_CAP_PCT}% guideline` });
+      label: `${emp.name} exposure ${emp.pct.toFixed(1)}% — over the ${EMPLOYER_CAP_PCT}% guideline` });
+  }
+  if (typeof cloudSyncIssue === 'function') {
+    const err = cloudSyncIssue();
+    if (err) items.push({ id: '__sync', kind: 'sync', label: `Cloud sync failing — ${err}` });
   }
   return items;
 }
@@ -1799,6 +1816,11 @@ function renderAttentionStrip() {
       const id = btn.dataset.hid;
       if (id === '__risk') {
         document.getElementById('riskCard')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        return;
+      }
+      if (id === '__sync') {
+        toast('Cloud sync is failing — your edits are safe locally but not backed up. ' +
+              (typeof cloudSyncIssue === 'function' ? (cloudSyncIssue() || '') : ''), 8000);
         return;
       }
       startQuickPrice(id);

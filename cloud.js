@@ -64,6 +64,11 @@ function noteLocalChange() {
 // ─── Client bootstrap ────────────────────────────────────────────────────────
 function cloudReady() { return !!(sb && cloudSession); }
 
+// Sync health: the needs-attention strip surfaces this so a silently failing
+// backup can never go unnoticed for weeks.
+let lastCloudError = null;
+function cloudSyncIssue() { return lastCloudError; }
+
 async function initCloud() {
   if (typeof window.supabase === 'undefined') return false; // CDN unreachable; local mode unaffected
   if (!sb) {
@@ -239,7 +244,12 @@ async function cloudPushState() {
       .upsert({ user_id: cloudSession.user.id, doc: stateDoc() })
       .select('updated_at').single());
   }
-  if (error || !data) { console.warn('[cloud] push failed:', error?.message); return false; }
+  if (error || !data) {
+    lastCloudError = error?.message || 'push returned no row';
+    console.warn('[cloud] push failed:', lastCloudError);
+    return false;
+  }
+  lastCloudError = null;
   lastSaved = new Date().toISOString();
   unsaved = false;
   setSyncMeta({ knownCloudStamp: data.updated_at, everSynced: true, localDirty: false });
@@ -296,7 +306,12 @@ async function syncOnSignIn() {
   try {
     let row;
     try { row = await cloudFetchState(); }
-    catch (e) { toast('Cloud unreachable — working from this device. ' + e.message, 6000); return; }
+    catch (e) {
+      lastCloudError = e.message;
+      toast('Cloud unreachable — working from this device. ' + e.message, 6000);
+      return;
+    }
+    lastCloudError = null;
     const meta = syncMeta();
     const dec = syncDecision({
       cloudStamp: row ? row.updated_at : null,

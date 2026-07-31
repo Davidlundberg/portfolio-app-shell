@@ -719,6 +719,7 @@ input[type="file"] { display: none; }
   .btn { min-height: 44px; }
   .header-actions .btn, .theme-toggle { min-height: 40px; }
   input, select { font-size: 16px; min-height: 40px; }
+  .tax-rates input, .tax-edit-form input, .imp-kind { font-size: 16px; }
   .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   table { min-width: 560px; }
 }
