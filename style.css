@@ -566,6 +566,39 @@ input[type="file"] { display: none; }
 .risk-bar > span { display: block; height: 100%; background: var(--navy); border-radius: 4px; }
 .risk-row .num { text-align: right; font-variant-numeric: tabular-nums; }
 
+/* ── Tax card ── */
+.tax-rates { font-size: 12px; font-weight: 400; color: var(--text-secondary); }
+.tax-rates input {
+  width: 48px; padding: 4px 6px; font-size: 13px; text-align: right;
+  border: 1px solid var(--border-default); border-radius: 6px;
+  background: var(--bg-input); color: var(--text-primary);
+}
+.tax-rows { margin: 4px 0; }
+.tax-row {
+  display: grid; grid-template-columns: 1.4fr 1fr 0.8fr auto;
+  gap: 10px; align-items: center;
+  font-size: 13px; padding: 6px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.tax-row:last-child { border-bottom: none; }
+.tax-row .num { text-align: right; font-variant-numeric: tabular-nums; }
+.tax-sub { display: block; font-size: 11px; color: var(--text-muted); }
+.tax-cov { font-size: 11px; color: #d97706; }
+.tax-loss { color: #dc2626; }
+[data-theme="dark"] .tax-loss { color: #f87171; }
+.tax-wash { display: block; font-size: 12px; color: #d97706; }
+.tax-edit-form { font-size: 12px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.tax-edit-form input {
+  padding: 6px 8px; font-size: 13px;
+  border: 1px solid var(--border-default); border-radius: 6px;
+  background: var(--bg-input); color: var(--text-primary);
+  width: 90px;
+}
+.tax-edit { grid-template-columns: minmax(120px, 0.6fr) 2fr; }
+@media (max-width: 640px) {
+  .tax-row { grid-template-columns: 1fr auto; grid-auto-flow: dense; }
+}
+
 /* ── Import kind picker (true-up vs reinvested dividend) ── */
 .imp-kind {
   font-size: 12px; padding: 4px 6px;

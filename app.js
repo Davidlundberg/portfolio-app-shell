@@ -103,8 +103,9 @@ let importRows = [];
 let lastRefreshed = null;
 let refreshing    = false;
 
-// Allocation targets
-let targets = { stocks: 80, bonds: 15, other: 5, us: 70, intl: 20, tilts: 10 };
+// Allocation targets (+ tax rates for gain estimates — directional, not advice)
+let targets = { stocks: 80, bonds: 15, other: 5, us: 70, intl: 20, tilts: 10,
+                taxMarginal: 24, taxLtcg: 15 };
 
 // Transaction ledger (P1 foundation): quantity changes get a row each, so a
 // true TWR/MWR can be computed later. Contribution rules auto-accrue payroll
@@ -1178,6 +1179,131 @@ function confirmSplit(id) {
   toast(`Split into ${fmtN(qty1)} + ${fmtN(qty2)} units`);
 }
 
+// ─── Tax engine ──────────────────────────────────────────────────────────────
+// Lots come from two places: the ledger (every positive-units row since the
+// epoch is a lot at its unitPrice) and a one-time "opening lots" entry per
+// holding for pre-epoch shares (from Fidelity's cost-basis page). An opening
+// lot without an acquisition date has an UNKNOWN term — shown as such, never
+// guessed (a synthesized date would mislabel ST/LT).
+const TAXADV_RE = /roth|401|403|pension|swedish|ira/i;
+const isTaxableAccount = h => !TAXADV_RE.test(h.account || '');
+
+function lotsFor(h) {
+  const lots = [];
+  for (const l of (h.lots || [])) {
+    const qty = +l.qty, unitCost = +l.unitCost;
+    if (qty > 0 && unitCost >= 0) lots.push({ date: l.date || null, qty, unitCost, source: 'opening' });
+  }
+  for (const t of transactions) {
+    if (t.holdingId === h.id && +t.units > 0 &&
+        ['contribution', 'adjustment', 'dividend'].includes(t.kind)) {
+      lots.push({ date: String(t.date).slice(0, 10), qty: +t.units, unitCost: +t.unitPrice || 0, source: t.kind });
+    }
+  }
+  return lots;
+}
+
+// Unrealized gain by term for one holding. covered = fraction of the position
+// the lots explain (basis for the rest is simply unknown).
+function taxSummaryFor(h) {
+  const lots = lotsFor(h);
+  if (!lots.length || !(h.price > 0)) return null;
+  const cutoff = Date.now() - 366 * 86400000;
+  let basis = 0, lotQty = 0, stGain = 0, ltGain = 0, unknownGain = 0;
+  for (const l of lots) {
+    const gain = (h.price - l.unitCost) * l.qty;
+    basis += l.unitCost * l.qty;
+    lotQty += l.qty;
+    if (!l.date) unknownGain += gain;
+    else if (new Date(l.date + 'T00:00:00Z').getTime() <= cutoff) ltGain += gain;
+    else stGain += gain;
+  }
+  return {
+    lots, lotQty, basis,
+    covered: h.quantity > 0 ? Math.min(1, lotQty / h.quantity) : 0,
+    stGain, ltGain, unknownGain,
+    totalGain: stGain + ltGain + unknownGain,
+  };
+}
+
+// Harvestable losses in taxable accounts, with a wash-sale risk flag: a buy
+// of the same holding within the last 30 days (any account — Rev. Rul.
+// 2008-5 covers IRAs), or an active contribution rule that would repurchase
+// within the next 30 days.
+function tlhScan() {
+  const out = [];
+  const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  for (const h of holdings) {
+    if (!isTaxableAccount(h)) continue;
+    const s = taxSummaryFor(h);
+    if (!s) continue;
+    const lossLots = s.lots.filter(l => (h.price - l.unitCost) * l.qty < -1);
+    if (!lossLots.length) continue;
+    const loss = lossLots.reduce((sum, l) => sum + (h.price - l.unitCost) * l.qty, 0);
+    const sameName = x => x.holdingName === h.name || x.name === h.name;
+    const recentBuy = transactions.some(t =>
+      sameName(t) && +t.units > 0 && String(t.date).slice(0, 10) >= cutoff);
+    const ruleFeeds = contributionRules.some(r =>
+      (r.splits || []).some(sp => sameName(sp)) || sameName(r));
+    out.push({ id: h.id, name: h.name, account: h.account, loss, washRisk: recentBuy || ruleFeeds });
+  }
+  return out.sort((a, b) => a.loss - b.loss);
+}
+
+// ── ESPP (Section 423 with lookback) ─────────────────────────────────────────
+// Qualifying disposition needs BOTH >2y from grant (offering start) and >1y
+// from purchase. Per-share splits:
+//   disqualifying: ordinary = fmvAtPurchase − purchasePrice (bargain element),
+//                  capital  = price − fmvAtPurchase (term from purchase date)
+//   qualifying:    ordinary = min(price − purchasePrice, discount% × fmvAtGrant)
+//                  (floored at 0; a sale below cost is all capital loss),
+//                  capital  = remainder, always LT
+function esppLotStatus(lot, price, now = Date.now()) {
+  const grant = new Date(lot.grantDate + 'T00:00:00Z').getTime();
+  const purchase = new Date(lot.purchaseDate + 'T00:00:00Z').getTime();
+  if (!isFinite(grant) || !isFinite(purchase)) return null;
+  const qualifiesAt = Math.max(grant + 2 * 365.25 * 86400000, purchase + 365.25 * 86400000);
+  const qualifying = now >= qualifiesAt;
+  const qty = +lot.qty || 0;
+  const perShareGain = price - lot.purchasePrice;
+  let ordinaryPS, capitalPS, capTerm;
+  if (qualifying) {
+    const discountPS = (lot.discountPct ?? 15) / 100 * (lot.fmvAtGrant ?? lot.purchasePrice / (1 - (lot.discountPct ?? 15) / 100));
+    ordinaryPS = Math.max(0, Math.min(perShareGain, discountPS));
+    capitalPS = perShareGain - ordinaryPS;
+    capTerm = 'LT';
+  } else {
+    ordinaryPS = (lot.fmvAtPurchase ?? lot.purchasePrice) - lot.purchasePrice;
+    capitalPS = price - (lot.fmvAtPurchase ?? lot.purchasePrice);
+    capTerm = now - purchase > 366 * 86400000 ? 'LT' : 'ST';
+  }
+  return {
+    qualifying,
+    qualifiesAt: new Date(qualifiesAt).toISOString().slice(0, 10),
+    daysToQualify: qualifying ? 0 : Math.ceil((qualifiesAt - now) / 86400000),
+    ordinary: ordinaryPS * qty,
+    capital: capitalPS * qty,
+    capTerm,
+  };
+}
+
+// ── Asset location (directional) ─────────────────────────────────────────────
+// Bonds throw ordinary income every year — sheltered space wants them first.
+function locationCheck() {
+  let bondsInTaxable = 0, taxableTotal = 0, shelteredTotal = 0;
+  for (const h of holdings) {
+    const v = h.quantity * h.price;
+    if (!(v > 0)) continue;
+    if (isTaxableAccount(h)) {
+      taxableTotal += v;
+      if (getSleeve(h) === 'bond') bondsInTaxable += v;
+    } else {
+      shelteredTotal += v;
+    }
+  }
+  return { bondsInTaxable, taxableTotal, shelteredTotal };
+}
+
 // ─── Risk & Exposure ─────────────────────────────────────────────────────────
 // Three honest views: employer-correlated concentration (salary + ESPP + any
 // employer stock is ONE bet), look-through company exposure across index
@@ -1324,6 +1450,159 @@ function renderRiskCard() {
       </p>`;
   }
   body.innerHTML = html;
+}
+
+// ─── Tax card ────────────────────────────────────────────────────────────────
+let basisEditId = null;   // holding id with the opening-basis editor open
+let esppFormId = null;    // holding id with the ESPP add-lot form open
+
+function estTaxFor(s) {
+  const mt = (+targets.taxMarginal || 0) / 100;
+  const lt = (+targets.taxLtcg || 0) / 100;
+  // Unknown-term gains priced at LTCG (the optimistic bound) but labeled.
+  return Math.max(0, s.stGain) * mt + Math.max(0, s.ltGain + s.unknownGain) * lt;
+}
+
+function renderTaxCard() {
+  const card = document.getElementById('taxCard');
+  const body = document.getElementById('taxBody');
+  if (!card || !body) return;
+  const taxable = holdings.filter(h => isTaxableAccount(h) && h.quantity * h.price > 0);
+  if (!taxable.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  document.getElementById('taxMarginal').value = targets.taxMarginal ?? 24;
+  document.getElementById('taxLtcg').value = targets.taxLtcg ?? 15;
+  let html = '';
+
+  // 1 ── Unrealized gains in taxable accounts
+  html += `<div class="subsection-label">Taxable accounts — unrealized gains</div><div class="tax-rows">`;
+  for (const h of taxable) {
+    const s = taxSummaryFor(h);
+    const v = h.quantity * h.price;
+    if (basisEditId === h.id) {
+      const ledgerQty = (s ? s.lots : lotsFor(h)).filter(l => l.source !== 'opening')
+        .reduce((sum, l) => sum + l.qty, 0);
+      const openQty = Math.max(0, +(h.quantity - ledgerQty).toFixed(6));
+      const existing = (h.lots || [])[0] || {};
+      html += `<div class="tax-row tax-edit">
+        <span>${esc(h.name)}</span>
+        <span class="tax-edit-form">
+          <input id="tb-qty-${h.id}" type="number" step="any" min="0" value="${existing.qty ?? openQty}" aria-label="shares"> sh @
+          <input id="tb-cost-${h.id}" type="number" step="any" min="0" value="${existing.unitCost ?? ''}" placeholder="avg cost" aria-label="avg cost"> $ ·
+          <input id="tb-date-${h.id}" type="date" value="${existing.date ?? ''}" aria-label="acquired (optional)">
+          <button class="btn btn-primary btn-sm" onclick="saveOpeningBasis('${h.id}')">Save</button>
+          <button class="btn btn-ghost btn-sm" onclick="basisEditId=null;renderTaxCard()">Cancel</button>
+        </span>
+      </div>`;
+      continue;
+    }
+    if (s) {
+      const chips = [
+        s.ltGain ? `LT ${fmt$(s.ltGain)}` : '',
+        s.stGain ? `ST ${fmt$(s.stGain)}` : '',
+        s.unknownGain ? `term? ${fmt$(s.unknownGain)}` : '',
+      ].filter(Boolean).join(' · ');
+      const cov = s.covered < 0.99 ? ` <span class="tax-cov">basis covers ${(s.covered * 100).toFixed(0)}%</span>` : '';
+      html += `<div class="tax-row">
+        <span>${esc(h.name)}${cov}</span>
+        <span class="num ${s.totalGain >= 0 ? '' : 'tax-loss'}">${fmt$(s.totalGain)}<span class="tax-sub">${chips}</span></span>
+        <span class="num tax-sub">est. tax ${fmt$(estTaxFor(s))}</span>
+        <button class="btn btn-ghost btn-sm" onclick="basisEditId='${h.id}';renderTaxCard()">Basis…</button>
+      </div>`;
+    } else {
+      html += `<div class="tax-row">
+        <span>${esc(h.name)}</span>
+        <span class="tax-sub">no basis yet — ${fmt$(v)} untracked</span>
+        <span></span>
+        <button class="btn btn-ghost btn-sm" onclick="basisEditId='${h.id}';renderTaxCard()">Set basis…</button>
+      </div>`;
+    }
+  }
+  html += `</div><p class="risk-note">Ledger buys since ${LEDGER_EPOCH} are lots automatically; "Basis…" records pre-epoch shares from your broker's cost-basis page. Estimates use your rates above — directional, not advice.</p>`;
+
+  // 2 ── Tax-loss harvesting
+  const tlh = tlhScan();
+  if (tlh.length) {
+    html += `<div class="subsection-label">Harvestable losses</div>` + tlh.map(t =>
+      `<p class="risk-line">${esc(t.name)} (${esc(t.account || '—')}): <strong class="tax-loss">${fmt$(t.loss)}</strong>
+        ${t.washRisk ? '<span class="tax-wash">⚠ wash-sale risk — bought (or auto-buying) within 30 days</span>' : ''}</p>`).join('');
+  }
+
+  // 3 ── ESPP disposition planner
+  const espp = holdings.filter(h => EMPLOYER.accounts.includes(h.account || '') && h.quantity > 0);
+  if (espp.length) {
+    html += `<div class="subsection-label">ESPP — disposition planner</div>`;
+    for (const h of espp) {
+      const lots = h.esppLots || [];
+      html += `<div class="risk-line" style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+        <span>${esc(h.name)} · ${fmtN(h.quantity)} sh</span>
+        <button class="btn btn-ghost btn-sm" onclick="esppFormId=esppFormId==='${h.id}'?null:'${h.id}';renderTaxCard()">+ purchase lot</button>
+      </div>`;
+      for (const lot of lots) {
+        const st = esppLotStatus(lot, h.price);
+        if (!st) continue;
+        html += `<p class="risk-note" style="margin-bottom:4px;">
+          ${fmtN(lot.qty)} sh bought ${esc(lot.purchaseDate)} @ ${fmt$(lot.purchasePrice)} —
+          ${st.qualifying
+            ? `<strong>qualifying</strong> · sell now: ordinary ${fmt$(st.ordinary)}, LT capital ${fmt$(st.capital)}`
+            : `qualifies ${esc(st.qualifiesAt)} (${st.daysToQualify}d) · sell now: ordinary ${fmt$(st.ordinary)}, ${st.capTerm} capital ${fmt$(st.capital)}`}
+        </p>`;
+      }
+      if (esppFormId === h.id) {
+        html += `<div class="tax-edit-form" style="margin:4px 0 8px;">
+          <input id="el-qty-${h.id}" type="number" step="any" min="0" placeholder="shares"> sh ·
+          grant <input id="el-grant-${h.id}" type="date"> ·
+          purchase <input id="el-pur-${h.id}" type="date"> @
+          <input id="el-price-${h.id}" type="number" step="any" min="0" placeholder="paid $"> ·
+          FMV grant <input id="el-fmvg-${h.id}" type="number" step="any" min="0" placeholder="$"> ·
+          FMV purch <input id="el-fmvp-${h.id}" type="number" step="any" min="0" placeholder="$">
+          <button class="btn btn-primary btn-sm" onclick="saveEsppLot('${h.id}')">Add</button>
+        </div>`;
+      }
+    }
+  }
+
+  // 4 ── Asset location
+  const loc = locationCheck();
+  if (loc.bondsInTaxable > 1) {
+    html += `<div class="subsection-label">Asset location</div>
+      <p class="risk-line">${fmt$(loc.bondsInTaxable)} of bonds sit in taxable accounts — bond income is taxed at your marginal rate every year; sheltered space (Roth/401K) absorbs it tax-free.</p>`;
+  }
+  body.innerHTML = html;
+}
+
+function saveOpeningBasis(id) {
+  const h = holdings.find(x => x.id === id);
+  if (!h) return;
+  const qty = parseFloat(document.getElementById(`tb-qty-${id}`)?.value);
+  const cost = parseFloat(document.getElementById(`tb-cost-${id}`)?.value);
+  const date = document.getElementById(`tb-date-${id}`)?.value || null;
+  if (isNaN(qty) || qty < 0 || isNaN(cost) || cost < 0) { toast('Enter shares and average cost.'); return; }
+  h.lots = qty > 0 ? [{ qty, unitCost: cost, date }] : [];
+  basisEditId = null;
+  markUnsaved(); renderTaxCard();
+  toast(date ? 'Basis saved' : 'Basis saved (no date — holding term unknown)');
+}
+
+function saveEsppLot(id) {
+  const h = holdings.find(x => x.id === id);
+  if (!h) return;
+  const g = k => document.getElementById(`el-${k}-${id}`)?.value;
+  const lot = {
+    qty: parseFloat(g('qty')), grantDate: g('grant'), purchaseDate: g('pur'),
+    purchasePrice: parseFloat(g('price')),
+    fmvAtGrant: parseFloat(g('fmvg')) || null,
+    fmvAtPurchase: parseFloat(g('fmvp')) || null,
+    discountPct: 15,
+  };
+  if (!(lot.qty > 0) || !lot.grantDate || !lot.purchaseDate || !(lot.purchasePrice > 0)) {
+    toast('Shares, grant date, purchase date and price paid are required.'); return;
+  }
+  if (!Array.isArray(h.esppLots)) h.esppLots = [];
+  h.esppLots.push(lot);
+  esppFormId = null;
+  markUnsaved(); renderTaxCard();
+  toast('ESPP lot recorded');
 }
 
 // ─── "Since you last looked" ─────────────────────────────────────────────────
@@ -2537,6 +2816,7 @@ function render() {
   renderAttentionStrip();
   renderLastLookChip();
   renderRiskCard();
+  renderTaxCard();
   renderTable();
   renderChart();
   renderContributions();
@@ -2997,10 +3277,23 @@ function rebalancePlan(holdingsArr, targetsObj, amount, { allowSells = false } =
       const taxAdv = inSleeve.find(h => TAX_ADVANTAGED_RE.test(h.account || ''));
       const h = taxAdv || inSleeve[0];
       const taxable = !!h && !TAX_ADVANTAGED_RE.test(h.account || '');
+      // When lots exist, replace the vague warning with an actual estimate:
+      // trimming $amt realizes ~amt/value of the position's unrealized gain.
+      let note = taxable ? 'taxable account — may realize capital gains' : 'tax-advantaged — no capital-gains impact';
+      if (taxable && h) {
+        const s = taxSummaryFor(h);
+        const v = h.quantity * h.price;
+        if (s && v > 0 && s.covered > 0.5) {
+          const frac = Math.min(1, Math.abs(amt) / v);
+          const gain = s.totalGain * frac;
+          const tax = estTaxFor({ stGain: s.stGain * frac, ltGain: s.ltGain * frac, unknownGain: s.unknownGain * frac });
+          note = `taxable — est. realized gain ${fmt$(gain)} (~${fmt$(tax)} tax at your rates)`;
+        }
+      }
       rows.push({
         sleeve: k, label, action: 'sell', amount: amt,
         suggestion: h ? `Trim ${h.name} in ${h.account || 'Unassigned'}` : '',
-        note: taxable ? 'taxable account — may realize capital gains' : 'tax-advantaged — no capital-gains impact',
+        note,
       });
       if (taxable) warnings.push(`${label}: the only sell candidates are in a taxable account — check unrealized gains before trimming.`);
     }

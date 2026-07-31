@@ -207,6 +207,20 @@
     <div id="riskBody"></div>
   </div>
 
+  <!-- Tax (P7 — lots, TLH, ESPP, location; directional, not advice) -->
+  <div class="card" id="taxCard" style="display:none;">
+    <h2 style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+      Tax
+      <span class="tax-rates">
+        marginal <input id="taxMarginal" type="number" min="0" max="60" step="1"
+          onchange="targets.taxMarginal=+this.value;markUnsaved();renderTaxCard()">%
+        · LTCG <input id="taxLtcg" type="number" min="0" max="40" step="1"
+          onchange="targets.taxLtcg=+this.value;markUnsaved();renderTaxCard()">%
+      </span>
+    </h2>
+    <div id="taxBody"></div>
+  </div>
+
   <!-- Allocation Strategy -->
   <div class="card" id="allocStratCard" style="display:none;">
     <h2>Allocation Strategy</h2>
