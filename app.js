@@ -213,6 +213,9 @@ async function autoSaveToServer() {
       saveHistorySnapshot();
     }
   } catch (_) {}
+  // Continuous Mac→cloud sync: when signed in, every local save also mirrors
+  // to the cloud (CAS-protected — a moved cloud triggers re-arbitration).
+  if (cloudReady()) cloudPushState().catch(() => {});
 }
 
 async function saveHistorySnapshot() {
@@ -1427,6 +1430,10 @@ async function autoFetchPrice() {
 }
 
 async function fetchYahoo(ticker) {
+  // Signed in → private edge proxy first (no third party sees the ticker).
+  const viaProxy = await proxyGet('/quote', { ticker });
+  if (viaProxy && viaProxy.price > 0) return viaProxy.price;
+
   const v8q1 = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`;
   const v8q2 = `https://query2.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`;
   const v7   = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${ticker}&fields=regularMarketPrice`;
@@ -1488,6 +1495,13 @@ function proxyEntryFor(h) {
 // Fetch daily dividend-adjusted closes for a ticker (same fallback chain as fetchYahoo).
 // Returns { timestamps, adjcloses } or null.
 async function fetchYahooChart(ticker, range, { events = false, interval = '1d' } = {}) {
+  // Signed in → private edge proxy first.
+  const viaProxy = await proxyGet('/chart', { ticker, range, interval, events: events ? '1' : '0' });
+  if (viaProxy && viaProxy.timestamps?.length && viaProxy.adjcloses?.length) {
+    return { timestamps: viaProxy.timestamps, adjcloses: viaProxy.adjcloses,
+             dividends: viaProxy.events || {} };
+  }
+
   const qs = `interval=${interval}&range=${range}${events ? '&events=div' : ''}`;
   const q1 = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?${qs}`;
   const q2 = `https://query2.finance.yahoo.com/v8/finance/chart/${ticker}?${qs}`;
@@ -1824,7 +1838,10 @@ async function fetchAvanza(name) {
   ];
 
   let fundData = null;
-  for (const proxy of proxies) {
+  // Signed in → private edge proxy first.
+  const viaProxy = await proxyGet('/avanza', { id: avanzaId });
+  if (viaProxy && viaProxy.nav) fundData = viaProxy;
+  for (const proxy of fundData ? [] : proxies) {
     const ctrl = new AbortController();
     const t    = setTimeout(() => ctrl.abort(), 9000);
     try {
@@ -1845,18 +1862,22 @@ async function fetchAvanza(name) {
     if (usPct !== null) rebalanceCountrySplit(name, usPct);
   }
 
-  // Convert SEK → USD (try two sources; return null on failure to avoid storing SEK as USD)
+  // Convert SEK → USD: private edge proxy first, then two public sources.
+  // Return null on total failure to avoid storing SEK as USD.
+  const viaFxProxy = await proxyGet('/fx', { from: 'SEK', to: 'USD' });
   const fxSources = [
     'https://api.frankfurter.app/latest?from=SEK&to=USD',
     'https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/sek.json',
   ];
-  for (const url of fxSources) {
+  for (const url of viaFxProxy?.rate ? ['proxy'] : fxSources) {
     try {
-      const fxRes  = await fetch(url, { signal: AbortSignal.timeout(7000) });
-      const fxData = await fxRes.json();
-      // Frankfurter: { rates: { USD: 0.09xx } }
-      // fawazahmed0: { sek: { usd: 0.09xx } }
-      const sekToUsd = fxData?.rates?.USD ?? fxData?.sek?.usd ?? null;
+      const fxData = url === 'proxy'
+        ? null
+        : await (await fetch(url, { signal: AbortSignal.timeout(7000) })).json();
+      // proxy: { rate } · Frankfurter: { rates: { USD } } · fawazahmed0: { sek: { usd } }
+      const sekToUsd = url === 'proxy'
+        ? viaFxProxy.rate
+        : (fxData?.rates?.USD ?? fxData?.sek?.usd ?? null);
       if (sekToUsd) {
         const navUSD = fundData.nav * sekToUsd;
         // P1c: stamp the SEK-native NAV + FX rate (one row per day, capped)
@@ -3012,18 +3033,19 @@ if (IS_SHELL) {
   // inside syncOnSignIn).
   cloudBoot();
 } else {
-  // If localStorage is empty, load from server-side portfolio.json
-  if (holdings.length === 0) loadFromServer();
-  // Local-data startup path: accrue any contributions that came due since the
-  // last visit (server path runs this inside loadFromServer; idempotent).
-  else applyContributionRules();
-
-  // Load performance history
-  loadHistory().then(() => renderPerformanceChart());
-
-  // Local mode still boots the cloud client so the header button can offer
-  // "Set up phone access" (and show sync status if already signed in).
-  cloudBoot();
+  // Local mode: finish loading the file-backed state BEFORE the cloud client
+  // arbitrates — syncing against a half-loaded state could push emptiness.
+  (async () => {
+    if (holdings.length === 0) await loadFromServer();
+    // Accrue any contributions that came due since the last visit (the
+    // server path runs this inside loadFromServer; idempotent).
+    else applyContributionRules();
+    await loadHistory();
+    renderPerformanceChart();
+    // Continuous two-way cloud sync when signed in; otherwise the button
+    // just offers "Set up phone access".
+    await cloudBoot();
+  })();
 }
 
 // Auto-refresh prices on load (after UI settles) and every 15 minutes

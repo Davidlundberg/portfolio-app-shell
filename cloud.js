@@ -169,11 +169,13 @@ async function authSubmitPassword() {
 
 async function afterSignIn() {
   if (cloudGateMode === 'migrate') {
-    authMsg('Pushing your portfolio to the cloud…');
-    const ok = await migrateLocalToCloud();
-    if (!ok) return;
-    authMsg('Done — your portfolio is in the cloud. Open the app on your phone and sign in with the same email.');
-    setTimeout(hideAuthGate, 3500);
+    // No blind push: the decision matrix arbitrates (an empty cloud gets a
+    // push; a cloud with data triggers the explicit conflict question).
+    authMsg('Syncing your portfolio with the cloud…');
+    await syncOnSignIn();
+    await seedHistoryIfEmpty();
+    authMsg('Done — this machine now syncs continuously. Sign in with the same email on your phone.');
+    setTimeout(hideAuthGate, 3000);
     renderCloudButton();
   } else {
     hideAuthGate();
@@ -215,10 +217,29 @@ async function cloudFetchState() {
 
 async function cloudPushState() {
   if (!cloudReady()) return false;
-  const { data, error } = await sb.from('portfolio_state')
-    .upsert({ user_id: cloudSession.user.id, doc: stateDoc() })
-    .select('updated_at').single();
-  if (error) { console.warn('[cloud] push failed:', error.message); return false; }
+  const meta = syncMeta();
+  let data, error;
+  if (meta.knownCloudStamp) {
+    // Compare-and-swap: only overwrite the cloud version this device last
+    // saw. Zero rows back = the cloud moved underneath us — never blind-
+    // overwrite; re-run the sync decision instead.
+    ({ data, error } = await sb.from('portfolio_state')
+      .update({ doc: stateDoc() })
+      .eq('user_id', cloudSession.user.id)
+      .eq('updated_at', meta.knownCloudStamp)
+      .select('updated_at'));
+    if (!error && (!data || !data.length)) {
+      console.warn('[cloud] push rejected — cloud moved; re-arbitrating');
+      await syncOnSignIn();
+      return false;
+    }
+    data = data && data[0];
+  } else {
+    ({ data, error } = await sb.from('portfolio_state')
+      .upsert({ user_id: cloudSession.user.id, doc: stateDoc() })
+      .select('updated_at').single());
+  }
+  if (error || !data) { console.warn('[cloud] push failed:', error?.message); return false; }
   lastSaved = new Date().toISOString();
   unsaved = false;
   setSyncMeta({ knownCloudStamp: data.updated_at, everSynced: true, localDirty: false });
@@ -237,11 +258,19 @@ async function cloudPullState() {
 
 async function cloudPushSnapshot(snap) {
   if (!cloudReady()) return;
+  // The nightly server snapshot writes official closes — an intraday client
+  // value must never overwrite it.
+  const { data: existing } = await sb.from('portfolio_history')
+    .select('source')
+    .eq('user_id', cloudSession.user.id).eq('snap_date', snap.date)
+    .maybeSingle();
+  if (existing?.source === 'server') return;
   const { error } = await sb.from('portfolio_history').upsert({
     user_id: cloudSession.user.id,
     snap_date: snap.date,
     value: snap.value,
     spy_price: snap.spyPrice ?? null,
+    source: 'client',
   });
   if (error) console.warn('[cloud] snapshot failed:', error.message);
 }
@@ -259,57 +288,92 @@ async function cloudFetchHistory() {
 }
 
 // ─── Sync orchestration ──────────────────────────────────────────────────────
+let syncInFlight = false;
+
 async function syncOnSignIn() {
-  let row;
-  try { row = await cloudFetchState(); }
-  catch (e) { toast('Cloud unreachable — working from this device. ' + e.message, 6000); return; }
-  const meta = syncMeta();
-  const dec = syncDecision({
-    cloudStamp: row ? row.updated_at : null,
-    knownCloudStamp: meta.knownCloudStamp || null,
-    everSynced: !!meta.everSynced,
-    localDirty: !!meta.localDirty,
-    localChangedAt: meta.localChangedAt || null,
-  });
-  if (dec === 'first-sync-conflict') {
-    const useCloud = confirm(
-      'This device has its own unsynced data, and your cloud account already has a portfolio.\n\n' +
-      'OK = use the CLOUD copy (recommended — this device\'s local data is replaced)\n' +
-      'Cancel = keep THIS DEVICE\'s data and overwrite the cloud'
-    );
-    if (useCloud) await cloudPullState(); else await cloudPushState();
-  } else if (dec === 'pull') {
-    await cloudPullState();
-  } else if (dec === 'push') {
-    await cloudPushState();
+  if (syncInFlight) return;
+  syncInFlight = true;
+  try {
+    let row;
+    try { row = await cloudFetchState(); }
+    catch (e) { toast('Cloud unreachable — working from this device. ' + e.message, 6000); return; }
+    const meta = syncMeta();
+    const dec = syncDecision({
+      cloudStamp: row ? row.updated_at : null,
+      knownCloudStamp: meta.knownCloudStamp || null,
+      everSynced: !!meta.everSynced,
+      localDirty: !!meta.localDirty,
+      localChangedAt: meta.localChangedAt || null,
+    });
+    // A deliberate overwrite (LWW push / conflict-keep-local) targets the
+    // version we just fetched — record it so the CAS in cloudPushState matches.
+    if (row) setSyncMeta({ knownCloudStamp: row.updated_at });
+    if (dec === 'first-sync-conflict') {
+      const useCloud = confirm(
+        'This device has its own unsynced data, and your cloud account already has a portfolio.\n\n' +
+        'OK = use the CLOUD copy (recommended — this device\'s local data is replaced)\n' +
+        'Cancel = keep THIS DEVICE\'s data and overwrite the cloud'
+      );
+      if (useCloud) await cloudPullState(); else await cloudPushState();
+    } else if (dec === 'pull') {
+      await cloudPullState();
+    } else if (dec === 'push') {
+      await cloudPushState();
+    }
+    applyContributionRules();
+    render();
+    renderTargetInputs();
+    await loadHistory();
+    renderPerformanceChart();
+    toast('Portfolio synced ✓');
+  } finally {
+    syncInFlight = false;
   }
-  applyContributionRules();
-  render();
-  renderTargetInputs();
-  await loadHistory();
-  renderPerformanceChart();
-  toast('Signed in — portfolio synced ✓');
 }
 
-// Local machine → cloud, once, from the "Set up phone access" flow.
-async function migrateLocalToCloud() {
+// Local machine only: seed cloud history from data/history.json the first
+// time — server-side daily snapshots take over from there.
+async function seedHistoryIfEmpty() {
+  if (IS_SHELL || !cloudReady()) return;
   try {
-    const ok = await cloudPushState();
-    if (!ok) { authMsg('Push failed — try again.', true); return false; }
-    if (historyData && Array.isArray(historyData.snapshots) && historyData.snapshots.length) {
-      const rows = historyData.snapshots
-        .filter(s => s.date && s.value > 0)
-        .map(s => ({
-          user_id: cloudSession.user.id, snap_date: s.date,
-          value: s.value, spy_price: s.spyPrice ?? null,
-        }));
-      if (rows.length) {
-        const { error } = await sb.from('portfolio_history').upsert(rows);
-        if (error) console.warn('[cloud] history migration failed:', error.message);
-      }
+    const { count } = await sb.from('portfolio_history')
+      .select('snap_date', { count: 'exact', head: true });
+    if (count > 0) return;
+    if (!historyData?.snapshots?.length) return;
+    const rows = historyData.snapshots
+      .filter(s => s.date && s.value > 0)
+      .map(s => ({
+        user_id: cloudSession.user.id, snap_date: s.date,
+        value: s.value, spy_price: s.spyPrice ?? null, source: 'client',
+      }));
+    if (rows.length) {
+      const { error } = await sb.from('portfolio_history').upsert(rows);
+      if (error) console.warn('[cloud] history seed failed:', error.message);
+      else console.log(`[cloud] seeded ${rows.length} history snapshots`);
     }
-    return true;
-  } catch (e) { authMsg('Push failed — ' + e.message, true); return false; }
+  } catch (e) { console.warn('[cloud] history seed failed:', e.message); }
+}
+
+// ─── Version restore (clobber insurance UI) ──────────────────────────────────
+async function cloudVersionRestore() {
+  if (!cloudReady()) { toast('Sign in first.'); return; }
+  const { data, error } = await sb.from('portfolio_state_versions')
+    .select('id, saved_at').order('id', { ascending: false }).limit(5);
+  if (error || !data || !data.length) { toast('No cloud versions yet.'); return; }
+  const list = data.map((v, i) => `${i + 1}. ${new Date(v.saved_at).toLocaleString()}`).join('\n');
+  const pick = prompt(
+    `Restore which cloud version?\n${list}\n\nEnter a number (the current state is versioned first, so this is reversible).`);
+  if (pick == null) return;
+  const chosen = data[parseInt(pick, 10) - 1];
+  if (!chosen) { toast('No such version.'); return; }
+  const { data: v, error: vErr } = await sb.from('portfolio_state_versions')
+    .select('doc').eq('id', chosen.id).single();
+  if (vErr || !v || !adoptDoc(v.doc)) { toast('Version unreadable — nothing changed.'); return; }
+  await cloudPushState();
+  applyContributionRules();
+  render(); renderTargetInputs();
+  await loadHistory(); renderPerformanceChart();
+  toast('Cloud version restored ✓');
 }
 
 // ─── Header button ───────────────────────────────────────────────────────────
@@ -317,24 +381,61 @@ function renderCloudButton() {
   const btn = document.getElementById('btnCloud');
   if (!btn) return;
   btn.style.display = '';
-  if (IS_SHELL) {
-    btn.textContent = cloudReady() ? '☁ Sign out' : '☁ Sign in';
-    btn.onclick = cloudReady() ? cloudSignOut : () => showAuthGate('gate');
+  if (cloudReady()) {
+    btn.textContent = IS_SHELL ? '☁ Synced' : '☁ Cloud synced';
+    btn.onclick = showCloudMenu;
   } else {
-    btn.textContent = cloudReady() ? '☁ Phone synced' : '☁ Set up phone access';
-    btn.onclick = cloudReady()
-      ? () => toast('Phone sync is on — open ' + CLOUD_APP_URL + ' on your phone.', 6000)
-      : () => showAuthGate('migrate');
+    btn.textContent = IS_SHELL ? '☁ Sign in' : '☁ Set up phone access';
+    btn.onclick = () => showAuthGate(IS_SHELL ? 'gate' : 'migrate');
   }
+}
+
+function showCloudMenu() {
+  document.getElementById('cloudMenu').style.display = 'flex';
+  const info = document.getElementById('cloudMenuInfo');
+  if (info) {
+    info.textContent = IS_SHELL
+      ? 'Synced with your private cloud.'
+      : 'This machine syncs continuously. Phone app: ' + CLOUD_APP_URL;
+  }
+}
+function hideCloudMenu() { document.getElementById('cloudMenu').style.display = 'none'; }
+
+// ─── Quote proxy (edge function) ─────────────────────────────────────────────
+// When signed in, market data flows through the private portfolio-quotes
+// function instead of anonymous public CORS proxies. Callers fall back to
+// their original chains when this returns null.
+const CLOUD_FN = CLOUD_URL + '/functions/v1/portfolio-quotes';
+
+async function proxyGet(path, params) {
+  if (!cloudReady()) return null;
+  try {
+    const qs = new URLSearchParams(params).toString();
+    const res = await fetch(`${CLOUD_FN}${path}?${qs}`, {
+      headers: {
+        Authorization: 'Bearer ' + cloudSession.access_token,
+        apikey: CLOUD_KEY,
+      },
+      signal: AbortSignal.timeout(9000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
 }
 
 // ─── Boot (called at the end of app.js init) ─────────────────────────────────
 async function cloudBoot() {
   const signedIn = await initCloud();
   renderCloudButton();
-  if (!IS_SHELL) return;            // local mode: nothing else changes
-  if (!signedIn) { showAuthGate('gate'); return; }
-  await syncOnSignIn();
+  if (IS_SHELL) {
+    if (!signedIn) { showAuthGate('gate'); return; }
+    await syncOnSignIn();
+  } else if (signedIn) {
+    // Continuous two-way sync for the Mac — the one-shot "migrate" trap is
+    // gone; every boot arbitrates through the decision matrix.
+    await syncOnSignIn();
+    await seedHistoryIfEmpty();
+  }
 }
 
 // Service worker: shell only — local dev must never fight a cache.

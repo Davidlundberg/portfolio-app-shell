@@ -352,6 +352,17 @@
   </div>
 </div>
 
+<!-- Cloud menu: version restore + sign out -->
+<div class="auth-gate" id="cloudMenu" style="display:none;" onclick="if(event.target===this)hideCloudMenu()">
+  <div class="auth-card">
+    <h2>Cloud sync</h2>
+    <p class="auth-sub" id="cloudMenuInfo"></p>
+    <button class="btn btn-ghost auth-btn" onclick="hideCloudMenu();cloudVersionRestore()">↩ Restore a previous version…</button>
+    <button class="btn btn-ghost auth-btn" onclick="hideCloudMenu();cloudSignOut()">Sign out</button>
+    <button class="btn btn-primary auth-btn" onclick="hideCloudMenu()">Close</button>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 <script src="cloud.js"></script>
 <script src="app.js"></script>
