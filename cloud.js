@@ -178,7 +178,7 @@ async function afterSignIn() {
     // push; a cloud with data triggers the explicit conflict question).
     authMsg('Syncing your portfolio with the cloud…');
     await syncOnSignIn();
-    await seedHistoryIfEmpty();
+    await seedHistory();
     authMsg('Done — this machine now syncs continuously. Sign in with the same email on your phone.');
     setTimeout(hideAuthGate, 3000);
     renderCloudButton();
@@ -346,17 +346,18 @@ async function syncOnSignIn() {
   }
 }
 
-// Local machine only: seed cloud history from data/history.json the first
-// time — server-side daily snapshots take over from there.
-async function seedHistoryIfEmpty() {
+// Local machine only: merge data/history.json into cloud history — fills
+// every date the cloud lacks, never touches existing rows (server close
+// rows especially). Server-side daily snapshots take over going forward.
+async function seedHistory() {
   if (IS_SHELL || !cloudReady()) return;
   try {
-    const { count } = await sb.from('portfolio_history')
-      .select('snap_date', { count: 'exact', head: true });
-    if (count > 0) return;
-    if (!historyData?.snapshots?.length) return;
+    if (!historyData || !Array.isArray(historyData.snapshots) || !historyData.snapshots.length) return;
+    const { data: existing, error: exErr } = await sb.from('portfolio_history').select('snap_date');
+    if (exErr) { console.warn('[cloud] history seed skipped:', exErr.message); return; }
+    const have = new Set((existing || []).map(r => r.snap_date));
     const rows = historyData.snapshots
-      .filter(s => s.date && s.value > 0)
+      .filter(s => s.date && s.value > 0 && !have.has(s.date))
       .map(s => ({
         user_id: cloudSession.user.id, snap_date: s.date,
         value: s.value, spy_price: s.spyPrice ?? null, source: 'client',
@@ -449,7 +450,7 @@ async function cloudBoot() {
     // Continuous two-way sync for the Mac — the one-shot "migrate" trap is
     // gone; every boot arbitrates through the decision matrix.
     await syncOnSignIn();
-    await seedHistoryIfEmpty();
+    await seedHistory();
   }
 }
 
