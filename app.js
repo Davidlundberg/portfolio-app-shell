@@ -734,8 +734,9 @@ function loadFromFile(event) {
       // destroyed post-epoch TWR/MWR on every restore.
       transactions      = data.transactions || [];
       contributionRules = data.contributionRules || [];
-      unsaved   = false;
-      saveLocal();
+      // A restore IS a local change: mark dirty so it propagates to the
+      // cloud (and to every other device) instead of sitting on this one.
+      markUnsaved();
       applyContributionRules();
       render(); renderTargetInputs();
       renderPerformanceChart();
