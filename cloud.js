@@ -445,6 +445,30 @@ async function proxyGet(path, params) {
   } catch { return null; }
 }
 
+// Same auth, but for routes that send a body and must surface WHY they failed.
+// proxyGet swallows every error into null because its callers have their own
+// fallback chains; /ask has none — a silent null there is indistinguishable
+// from "the model had nothing to say", so this throws with the server's own
+// message instead. The timeout is long because the answer involves reasoning;
+// it deliberately outlives the function's own 55s upstream budget.
+async function proxyPost(path, body, timeoutMs = 60000) {
+  if (!cloudReady()) throw new Error('not signed in');
+  const res = await fetch(`${CLOUD_FN}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + cloudSession.access_token,
+      apikey: CLOUD_KEY,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  let data = null;
+  try { data = await res.json(); } catch { /* non-JSON body */ }
+  if (!res.ok) throw new Error(data?.error || `request failed (${res.status})`);
+  return data;
+}
+
 // ─── Boot (called at the end of app.js init) ─────────────────────────────────
 async function cloudBoot() {
   const signedIn = await initCloud();

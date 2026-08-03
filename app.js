@@ -3723,11 +3723,113 @@ function advSection(key, title, bodyFn, teaser) {
     </div>` + (open ? bodyFn() : `<p class="adv-placeholder adv-quiet">${teaser}</p>`);
 }
 
+// ─── Advisor: Ask ────────────────────────────────────────────────────────────
+// The card stopped volunteering conclusions; this is where they moved to. The
+// context is built by the SAME engines that render the sections below, so an
+// answer can never disagree with what the card shows.
+//
+// Only in cloud mode: the question goes to a JWT-gated edge function, so there
+// is no path for it in local mode and the box says so rather than failing.
+let askBusy = false;
+let askThread = [];   // [{ q, a, error }]
+
+function askContext() {
+  const tot = total();
+  const rates = effectiveRates();
+  const d = driftCheck(getSleeveTotals(), getSleeveTargetPcts(), tot,
+                       +targets.bandAbsPp || 5, +targets.bandRelPct || 25);
+  const loc = assetLocationSwap();
+  return {
+    asOf: new Date().toISOString().slice(0, 10),
+    totalValue: +tot.toFixed(2),
+    // Names and accounts only — no ids, no ledger, no personal identifiers.
+    holdings: holdings.filter(h => h.quantity * h.price > 0).map(h => ({
+      name: h.name, ticker: h.ticker && h.ticker !== 'N/A' ? h.ticker : null,
+      account: h.account || null, sleeve: getSleeve(h),
+      value: +(h.quantity * h.price).toFixed(2),
+      yieldPct: holdingYield(h) == null ? null : +(holdingYield(h) * 100).toFixed(2),
+    })),
+    targets: { ...targets, employerName: undefined, employerTickers: undefined },
+    bands: { absPp: +targets.bandAbsPp || 5, relPct: +targets.bandRelPct || 25 },
+    taxRates: { ordinaryPct: +(rates.ordinary * 100).toFixed(1),
+                qualifiedPct: +(rates.qualified * 100).toFixed(1) },
+    drift: d.rows.map(r => ({ sleeve: r.label, nowPct: +r.curPct.toFixed(1),
+      targetPct: +r.tgtPct.toFixed(1), driftDollars: +r.driftDollars.toFixed(2),
+      outOfBand: r.outOfBand })),
+    monthlyContribution: +monthlyContribution().toFixed(2),
+    assetLocation: loc.swap ? {
+      sellFrom: loc.swap.into.h.name, sellAccount: loc.swap.into.h.account,
+      amount: +loc.swap.amount.toFixed(2),
+      annualSaving: +loc.swap.annualSaving.toFixed(2),
+      estimatedYieldUsed: loc.swap.estimated,
+    } : null,
+    attribution: attribData ? {
+      since: attribData.sinceDate,
+      totalChange: +attribData.result.totalChange.toFixed(2),
+      paidIn: +attribData.result.contributed.toFixed(2),
+      market: +attribData.result.marketGain.toFixed(2),
+      coveredValue: +attribData.result.nowValue.toFixed(2),
+      notAttributable: attribData.result.skipped.map(x => x.h.name),
+    } : null,
+    marketAsOf: marketData?.rows?.find(r => r.snap)?.snap.asOfDate || null,
+  };
+}
+
+async function submitAsk() {
+  const input = document.getElementById('askInput');
+  const q = (input?.value || '').trim();
+  if (!q || askBusy) return;
+  if (!cloudReady()) {
+    askThread.push({ q, error: 'Ask needs the cloud connection — sign in with ☁ first.' });
+    renderAdvisorContext(); return;
+  }
+  askBusy = true;
+  askThread.push({ q, pending: true });
+  input.value = '';
+  renderAdvisorContext();
+
+  let entry;
+  try {
+    const r = await proxyPost('/ask', { question: q, context: askContext() });
+    entry = r?.answer ? { q, a: r.answer } : { q, error: r?.error || 'No answer came back.' };
+  } catch (e) {
+    // The edge function is deployed separately from a merge to main — the same
+    // split that left the phone on a stale shell. Name that case exactly rather
+    // than showing a bare 404, so the state is legible instead of looking broken.
+    const msg = String(e?.message || '');
+    entry = { q, error: /\(404\)/.test(msg)
+      ? 'The Ask endpoint is not deployed yet — the UI shipped ahead of the edge function. Everything else on this card works.'
+      : 'Could not reach the advisor. ' + msg };
+  }
+  askThread = askThread.filter(x => !x.pending);
+  askThread.push(entry);
+  askBusy = false;
+  renderAdvisorContext();
+}
+
+function renderAskSection() {
+  const thread = askThread.map(t => `<div class="ask-turn">
+      <p class="ask-q">${esc(t.q)}</p>
+      ${t.pending ? '<p class="ask-a ask-wait">Thinking…</p>'
+        : t.error ? `<p class="ask-a ask-err">${esc(t.error)}</p>`
+        : `<p class="ask-a">${esc(t.a).replace(/\n\n+/g, '</p><p class="ask-a">')}</p>`}
+    </div>`).join('');
+  return `<div class="ask-box">
+      <input id="askInput" type="text" placeholder="Is it time to rebalance?"
+        autocomplete="off" onkeydown="if(event.key==='Enter')submitAsk()">
+      <button class="btn btn-primary btn-sm" onclick="submitAsk()" ${askBusy ? 'disabled' : ''}>
+        ${askBusy ? '…' : 'Ask'}</button>
+    </div>${thread}
+    <p class="risk-note">Answers come from your own holdings, targets and bands — nothing else.
+      It will not tell you what to buy or where a market is going; that is yours to decide.</p>`;
+}
+
 function renderAdvisorContext() {
   const el = document.getElementById('advContext');
   if (!el) return;
   el.innerHTML =
-    `<div class="subsection-label subsection-flex">Market
+    `<div class="subsection-label">Ask</div>${renderAskSection()}
+     <div class="subsection-label subsection-flex">Market
        <button class="btn btn-ghost btn-sm" id="btnMarketRefresh" onclick="refreshMarket()">↻ Refresh market</button>
      </div>${renderMarketSection()}
      <div class="subsection-label subsection-flex">What moved your money

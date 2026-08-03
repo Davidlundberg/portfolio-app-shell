@@ -597,6 +597,19 @@ input.band-input {
   .band-input { font-size: 16px; }
 }
 
+/* ── Advisor: Ask ── */
+.ask-box { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+.ask-box input { flex: 1; min-width: 0; }
+.ask-turn { margin-bottom: 14px; }
+.ask-q {
+  font-size: 14px; font-weight: 600; margin-bottom: 6px;
+  padding-left: 10px; border-left: 2px solid var(--accent);
+}
+.ask-a { font-size: 14px; line-height: 1.55; margin-bottom: 8px; }
+.ask-wait { color: var(--text-muted); font-style: italic; }
+.ask-err { color: #b45309; }
+[data-theme="dark"] .ask-err { color: #fbbf24; }
+
 /* ── Collapsible cards ──
    <details> as a card: a native disclosure, keyboard-reachable and
    screen-reader-labelled without any JS state to keep in sync. */
