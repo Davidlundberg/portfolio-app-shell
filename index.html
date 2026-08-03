@@ -86,53 +86,6 @@
     </div>
   </div>
 
-  <!-- Add Holding -->
-  <div class="card">
-    <h2>Add Holding</h2>
-    <div class="form-row">
-      <div class="form-group">
-        <label for="iName">Investment Name</label>
-        <input id="iName" type="text" placeholder="e.g. Vanguard 500 Index Fund" autocomplete="off" spellcheck="false">
-        <div class="fetch-status" id="fetchStatus"></div>
-      </div>
-      <div class="form-group">
-        <label for="iType">Type</label>
-        <select id="iType">
-          <option value="stock">Stock</option>
-          <option value="etf">ETF</option>
-          <option value="mutual_fund">Mutual Fund</option>
-          <option value="crypto">Crypto</option>
-          <option value="bond">Bond</option>
-          <option value="other">Other</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label for="iQty">Shares / Units</label>
-        <input id="iQty" type="number" min="0" step="any" placeholder="100">
-      </div>
-      <div class="form-group">
-        <label for="iPrice" id="iPriceLabel">Price (USD)</label>
-        <input id="iPrice" type="number" min="0" step="any" placeholder="0.00">
-      </div>
-      <div class="form-group">
-        <label>&nbsp;</label>
-        <button class="btn btn-ghost" id="btnFetch" onclick="autoFetchPrice()">↻ Fetch</button>
-      </div>
-      <div class="form-group">
-        <label>&nbsp;</label>
-        <button class="btn btn-primary" onclick="addHolding()">+ Add</button>
-      </div>
-    </div>
-    <!-- Optional secondary fields -->
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;">
-      <div class="form-group">
-        <label for="iTicker">Ticker <span style="font-weight:400;color:#94a3b8">(optional — used for price lookup)</span></label>
-        <input id="iTicker" type="text" placeholder="e.g. VFIAX" autocomplete="off" spellcheck="false" style="text-transform:uppercase;">
-      </div>
-      <div class="form-group">
-        <label for="iAccount">Account</label>
-        <select id="iAccount"></select>
-      </div>
     </div>
   </div>
 
@@ -181,6 +134,54 @@
       </table>
     </div>
   </div>
+
+  <!-- Add Holding -->
+  <details class="card card-collapsible" id="addCard">
+    <summary><h2>Add Holding</h2><span class="collapse-hint">tap to open</span></summary>
+    <div class="form-row">
+      <div class="form-group">
+        <label for="iName">Investment Name</label>
+        <input id="iName" type="text" placeholder="e.g. Vanguard 500 Index Fund" autocomplete="off" spellcheck="false">
+        <div class="fetch-status" id="fetchStatus"></div>
+      </div>
+      <div class="form-group">
+        <label for="iType">Type</label>
+        <select id="iType">
+          <option value="stock">Stock</option>
+          <option value="etf">ETF</option>
+          <option value="mutual_fund">Mutual Fund</option>
+          <option value="crypto">Crypto</option>
+          <option value="bond">Bond</option>
+          <option value="other">Other</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="iQty">Shares / Units</label>
+        <input id="iQty" type="number" min="0" step="any" placeholder="100">
+      </div>
+      <div class="form-group">
+        <label for="iPrice" id="iPriceLabel">Price (USD)</label>
+        <input id="iPrice" type="number" min="0" step="any" placeholder="0.00">
+      </div>
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <button class="btn btn-ghost" id="btnFetch" onclick="autoFetchPrice()">↻ Fetch</button>
+      </div>
+      <div class="form-group">
+        <label>&nbsp;</label>
+        <button class="btn btn-primary" onclick="addHolding()">+ Add</button>
+      </div>
+    </div>
+    <!-- Optional secondary fields -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;">
+      <div class="form-group">
+        <label for="iTicker">Ticker <span style="font-weight:400;color:#94a3b8">(optional — used for price lookup)</span></label>
+        <input id="iTicker" type="text" placeholder="e.g. VFIAX" autocomplete="off" spellcheck="false" style="text-transform:uppercase;">
+      </div>
+      <div class="form-group">
+        <label for="iAccount">Account</label>
+        <select id="iAccount"></select>
+      </details>
 
   <!-- Chart + Legend -->
   <div class="bottom-row">
@@ -256,7 +257,7 @@
   <div class="card" id="advisorCard" style="display:none;">
     <h2>Advisor</h2>
     <div id="advContext"></div>
-    <div class="subsection-label">Next money</div>
+    <details class="adv-next"><summary class="subsection-label">Next money — where would $X go?</summary>
     <div class="advisor-form">
       <div class="form-group">
         <label for="advAmount">Amount to invest</label>
@@ -282,6 +283,7 @@
     <div id="advResult">
       <p class="adv-placeholder">Enter an amount to see where to invest next.</p>
     </div>
+    </details>
   </div>
 
   <!-- Dividend Income (P3 — T12M projection) -->

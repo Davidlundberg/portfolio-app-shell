@@ -3709,6 +3709,20 @@ function renderAttributionSection() {
      next.</p>`;
 }
 
+// Nothing in this card computes a verdict until it is asked to. Volunteering
+// "relocate $23,432 and save $272/year" to someone who opened the app to check
+// a balance is an opinion nobody requested — and the whole design brief was
+// data in, David decides.
+let advShow = { drift: false, location: false };
+function advToggle(key) { advShow[key] = !advShow[key]; renderAdvisorContext(); }
+
+function advSection(key, title, bodyFn, teaser) {
+  const open = advShow[key];
+  return `<div class="subsection-label subsection-flex">${title}
+      <button class="btn btn-ghost btn-sm" onclick="advToggle('${key}')">${open ? 'Hide' : 'Show'}</button>
+    </div>` + (open ? bodyFn() : `<p class="adv-placeholder adv-quiet">${teaser}</p>`);
+}
+
 function renderAdvisorContext() {
   const el = document.getElementById('advContext');
   if (!el) return;
@@ -3720,8 +3734,10 @@ function renderAdvisorContext() {
        ${attribData ? `<button class="btn btn-ghost btn-sm" id="btnAttrib"
          onclick="runAttribution('${attribData.win.key}')">↻ Recompute</button>` : ''}
      </div>${renderAttributionSection()}
-     <div class="subsection-label">Where you stand</div>${renderDriftSection()}
-     <div class="subsection-label">Where your assets sit</div>${renderLocationSection()}`;
+     ${advSection('drift', 'Where you stand', renderDriftSection,
+        'Compare each sleeve against your targets and rebalancing bands.')}
+     ${advSection('location', 'Where your assets sit', renderLocationSection,
+        'Work out what it costs to hold each sleeve where it currently sits.')}`;
 }
 
 // ─── Advisor: account dropdown ────────────────────────────────────────────────

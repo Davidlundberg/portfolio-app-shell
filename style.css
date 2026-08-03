@@ -597,6 +597,27 @@ input.band-input {
   .band-input { font-size: 16px; }
 }
 
+/* ── Collapsible cards ──
+   <details> as a card: a native disclosure, keyboard-reachable and
+   screen-reader-labelled without any JS state to keep in sync. */
+.card-collapsible > summary {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; cursor: pointer; list-style: none;
+}
+.card-collapsible > summary::-webkit-details-marker { display: none; }
+.card-collapsible > summary > h2 { margin-bottom: 0; }
+.card-collapsible[open] > summary { margin-bottom: 16px; }
+.collapse-hint {
+  font-size: 12px; color: var(--text-muted); font-weight: 400;
+}
+.card-collapsible[open] .collapse-hint::after { content: ' ✕'; }
+.card-collapsible:not([open]) .collapse-hint::after { content: ' ＋'; }
+.adv-next > summary {
+  cursor: pointer; list-style: none; margin-bottom: 10px;
+}
+.adv-next > summary::-webkit-details-marker { display: none; }
+.adv-quiet { font-size: 13px; margin-bottom: 12px; }
+
 /* ── Advisor: attribution ── */
 .attrib-picker { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .attrib-on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
