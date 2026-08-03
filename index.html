@@ -49,12 +49,20 @@
     </div>
     <div class="header-actions">
       <button class="btn btn-ghost" id="btnCloud" style="display:none;">☁</button>
-      <button class="btn btn-ghost" onclick="triggerImportCSV()">📋 Import CSV</button>
       <button class="btn btn-ghost" id="btnRefreshAll" onclick="refreshAllPrices()">↻ Refresh All</button>
-      <button class="btn btn-ghost" onclick="exportCSV()">↓ Export CSV</button>
-      <button class="btn btn-ghost" onclick="saveToFile()" title="Save a full JSON backup (holdings + ledger)">⤓ Backup</button>
-      <button class="btn btn-ghost" onclick="triggerLoadJSON()" title="Restore from a JSON backup">⤒ Restore</button>
       <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="Toggle dark mode" aria-label="Toggle dark mode">☀️</button>
+      <!-- Import / Export / Backup / Restore are used a few times a year and
+           were costing three rows of a phone screen every visit. Refresh All is
+           the only one that earns a permanent slot. -->
+      <details class="hdr-more">
+        <summary class="btn btn-ghost" aria-label="More actions">⋯</summary>
+        <div class="hdr-more-menu">
+          <button class="btn btn-ghost" onclick="triggerImportCSV()">📋 Import CSV</button>
+          <button class="btn btn-ghost" onclick="exportCSV()">↓ Export CSV</button>
+          <button class="btn btn-ghost" onclick="saveToFile()" title="Save a full JSON backup (holdings + ledger)">⤓ Backup</button>
+          <button class="btn btn-ghost" onclick="triggerLoadJSON()" title="Restore from a JSON backup">⤒ Restore</button>
+        </div>
+      </details>
       <input type="file" id="fileInputCSV"  accept=".csv,.txt" onchange="importCSV(event)">
       <input type="file" id="fileInputJSON" accept=".json" onchange="loadFromFile(event)">
     </div>
@@ -203,14 +211,14 @@
   </div>
 
   <!-- Risk & Exposure (P6 — employer concentration, look-through, krona split) -->
-  <div class="card" id="riskCard" style="display:none;">
-    <h2>Risk &amp; Exposure</h2>
+  <details class="card card-collapsible" id="riskCard" style="display:none;">
+    <summary><h2>Risk &amp; Exposure</h2><span class="collapse-hint">tap to open</span></summary>
     <div id="riskBody"></div>
-  </div>
+  </details>
 
   <!-- Allocation Strategy -->
-  <div class="card" id="allocStratCard" style="display:none;">
-    <h2>Allocation Strategy</h2>
+  <details class="card card-collapsible" id="allocStratCard" style="display:none;">
+    <summary><h2>Allocation Strategy</h2><span class="collapse-hint">tap to open</span></summary>
     <div class="alloc-grid">
       <div>
         <div class="subsection-label">Total Mix (%)</div>
@@ -233,11 +241,11 @@
         </table>
       </div>
     </div>
-  </div>
+  </details>
 
   <!-- Recurring Contributions (P1a — auto-accrue payroll buys between statements) -->
-  <div class="card" id="contribCard" style="display:none;">
-    <h2>Recurring Contributions</h2>
+  <details class="card card-collapsible" id="contribCard" style="display:none;">
+    <summary><h2>Recurring Contributions</h2><span class="collapse-hint">tap to open</span></summary>
     <p style="font-size:13px;color:var(--text-secondary);margin:4px 0 6px;">
       Auto-adds units each pay period (estimated at that day's price). Entering real
       statement values any time trues everything up.
@@ -251,7 +259,7 @@
     <div id="crNlPreview" style="min-height:20px;margin-bottom:4px;"></div>
     <div id="contribList"></div>
     <div id="contribForm"></div>
-  </div>
+  </details>
 
   <!-- Advisor — external context + policy drift, then where new money goes -->
   <div class="card" id="advisorCard" style="display:none;">
@@ -287,21 +295,21 @@
   </div>
 
   <!-- Dividend Income (P3 — T12M projection) -->
-  <div class="card" id="divCard" style="display:none;">
-    <h2 style="display:flex;align-items:center;justify-content:space-between;">
+  <details class="card card-collapsible" id="divCard" style="display:none;">
+    <summary><h2 style="display:flex;align-items:center;justify-content:space-between;">
       Dividend Income
       <button class="btn btn-ghost btn-sm" id="btnDivRefresh" onclick="updateDividends()">↻ Update dividends</button>
-    </h2>
+    </h2><span class="collapse-hint">tap to open</span></summary>
     <p style="font-size:13px;color:var(--text-secondary);margin:4px 0 6px;">
       Projected from trailing-12-month payments per share (forward declarations aren't
       available on free data) — refresh after ex-dividend seasons.
     </p>
     <div id="divBody"></div>
-  </div>
+  </details>
 
   <!-- FIRE — Monte Carlo (P5) -->
-  <div class="card" id="fireCard" style="display:none;">
-    <h2>When does work become optional?</h2>
+  <details class="card card-collapsible" id="fireCard" style="display:none;">
+    <summary><h2>When does work become optional?</h2><span class="collapse-hint">tap to open</span></summary>
     <p style="font-size:13px;color:var(--text-secondary);margin:4px 0 6px;">
       1,000 simulated futures from your current total, in today's dollars. FI target = annual spending ÷ 4%.
     </p>
@@ -313,7 +321,7 @@
       <button class="btn btn-primary btn-sm" onclick="runFireSim()" style="height:34px;">Simulate</button>
     </div>
     <div id="fireResult"></div>
-  </div>
+  </details>
 
   <!-- Performance -->
   <div class="card" id="perfCard" style="display:none;">

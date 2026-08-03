@@ -16,7 +16,7 @@
   /* Text */
   --text-primary: #18181b;
   --text-secondary: #52525b;
-  --text-muted: #a1a1aa;
+  --text-muted: #6b7280;
   /* Borders */
   --border-default: #e5e3de;
   --border-subtle: #eeece7;
@@ -64,7 +64,7 @@
   --bg-surface: #0f1117;
   --text-primary: #f0f2f5;
   --text-secondary: #8b95a8;
-  --text-muted: #5a6478;
+  --text-muted: #8b95a8;
   --border-default: #1e2433;
   --border-subtle: rgba(255,255,255,0.05);
   --border-hover: #2a3247;
@@ -102,7 +102,7 @@
     --bg-surface: #0f1117;
     --text-primary: #f0f2f5;
     --text-secondary: #8b95a8;
-    --text-muted: #5a6478;
+    --text-muted: #8b95a8;
     --border-default: #1e2433;
     --border-subtle: rgba(255,255,255,0.05);
     --border-hover: #2a3247;
@@ -180,6 +180,16 @@ h2 {
   font-size: 13px; font-weight: 400; color: var(--text-muted); margin-top: 2px;
 }
 .header-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.hdr-more { position: relative; }
+.hdr-more > summary { list-style: none; cursor: pointer; }
+.hdr-more > summary::-webkit-details-marker { display: none; }
+.hdr-more-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
+  display: flex; flex-direction: column; gap: 4px; padding: 8px;
+  background: var(--bg-elevated); border: 1px solid var(--border-default);
+  border-radius: 10px; box-shadow: var(--shadow-elevated); min-width: 180px;
+}
+.hdr-more-menu .btn { justify-content: flex-start; width: 100%; }
 
 /* ── Theme toggle ── */
 .theme-toggle {
@@ -593,7 +603,7 @@ input.band-input {
 @media (max-width: 640px) {
   .mkt-tick { min-width: 100%; }
   .mkt-off { margin-left: 0; }
-  .drift-row { grid-template-columns: 1fr repeat(3, minmax(58px, auto)); gap: 6px; }
+  .drift-row { grid-template-columns: minmax(60px, 1.2fr) repeat(3, minmax(56px, 1fr)); gap: 6px; }
   .band-input { font-size: 16px; }
 }
 
@@ -827,6 +837,38 @@ input.band-input {
   .header-actions .btn, .theme-toggle { min-height: 40px; }
   input, select { font-size: 16px; min-height: 40px; }
   .imp-kind { font-size: 16px; }
+  .hdr-more-menu { left: 0; right: auto; }
+  /* Inline edit/split forms were laid out for a desktop row. At 390px their
+     selects collapsed to ~40px — "ETF⌄ Brok⌄ US S⌄" — and Split's fixed
+     90px/1fr/130px grid left both sleeve pickers as bare chevrons, so a sleeve
+     could be reassigned without being legible. Stack them. */
+  .edit-form, .split-form, .tax-edit-form, .split-row {
+    display: flex !important; flex-direction: column; align-items: stretch; gap: 8px;
+  }
+  .edit-form input, .edit-form select,
+  .split-form input, .split-form select { width: 100% !important; min-height: 40px; }
+  .split-grid, .split-cols { grid-template-columns: 1fr !important; }
+  /* Stacked list, not a sideways-scrolling table. A row per holding, each
+     cell labelled by the column it came from. */
   .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  table { min-width: 560px; }
+  table { min-width: 0; width: 100%; }
+  thead { display: none; }
+  tbody tr, tfoot tr { display: block; padding: 10px 0; border-bottom: 1px solid var(--border-subtle); }
+  tbody tr.account-row { padding: 8px 0 4px; }
+  tbody td, tfoot td, tfoot th {
+             display: flex; justify-content: space-between; align-items: baseline;
+             gap: 12px; border: none; padding: 2px 0; text-align: right; }
+  tbody td::before, tfoot td::before {
+    content: attr(data-label); text-align: left; flex: 0 0 auto;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em;
+    color: var(--text-muted); font-weight: 600;
+  }
+  tbody td:first-child { display: block; text-align: left; font-weight: 600; padding-bottom: 6px; }
+  tbody td:first-child::before { content: none; }
+  /* The name cell has its own two-column layout for desktop; at 390px that
+     crowds the fund name against its ticker. Stack them. */
+  tbody td:first-child > * { display: block; text-align: left; }
+  tbody td:first-child .num, tbody td:first-child .sub { text-align: left; }
+  /* The account divider is a heading, not a boxed row. */
+  tbody tr.account-row td { display: block; text-align: left; }
 }

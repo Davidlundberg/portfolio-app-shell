@@ -2730,14 +2730,14 @@ function renderTable() {
           </div>
           <div class="ticker-sub">${esc(subtitle)}${staleTag}</div>
         </td>
-        <td>${typeBadge(h.type)}</td>
-        <td class="num">${fmtN(h.quantity)}</td>
-        <td class="num" style="cursor:pointer;" onclick="startQuickPrice('${h.id}')" title="Click to edit price">
+        <td data-label="Type">${typeBadge(h.type)}</td>
+        <td class="num" data-label="Shares">${fmtN(h.quantity)}</td>
+        <td class="num" data-label="Price" style="cursor:pointer;" onclick="startQuickPrice('${h.id}')" title="Click to edit price">
           ${quickPriceId === h.id
             ? `<input id="qp-${h.id}" type="number" step="any" value="${h.price}" style="width:85px;text-align:right;" onkeydown="if(event.key==='Enter')saveQuickPrice('${h.id}');if(event.key==='Escape')cancelQuickPrice();" onblur="saveQuickPrice('${h.id}')">`
             : fmt$(h.price)}
         </td>
-        <td class="num">${fmt$(val)}</td>
+        <td class="num" data-label="Value">${fmt$(val)}</td>
         <td>
           <div class="bar-wrap">
             <div class="bar-bg"><div class="bar-fill" style="width:${pct}%;background:${color};"></div></div>
@@ -3713,7 +3713,7 @@ function renderAttributionSection() {
 // "relocate $23,432 and save $272/year" to someone who opened the app to check
 // a balance is an opinion nobody requested — and the whole design brief was
 // data in, David decides.
-let advShow = { drift: false, location: false };
+let advShow = { drift: true, location: false };
 function advToggle(key) { advShow[key] = !advShow[key]; renderAdvisorContext(); }
 
 function advSection(key, title, bodyFn, teaser) {
@@ -3828,7 +3828,9 @@ function renderAdvisorContext() {
   const el = document.getElementById('advContext');
   if (!el) return;
   el.innerHTML =
-    `<div class="subsection-label">Ask</div>${renderAskSection()}
+    `${advSection('drift', 'Where you stand', renderDriftSection,
+        'Compare each sleeve against your targets and rebalancing bands.')}
+     <div class="subsection-label">Ask</div>${renderAskSection()}
      <div class="subsection-label subsection-flex">Market
        <button class="btn btn-ghost btn-sm" id="btnMarketRefresh" onclick="refreshMarket()">↻ Refresh market</button>
      </div>${renderMarketSection()}
@@ -3836,8 +3838,6 @@ function renderAdvisorContext() {
        ${attribData ? `<button class="btn btn-ghost btn-sm" id="btnAttrib"
          onclick="runAttribution('${attribData.win.key}')">↻ Recompute</button>` : ''}
      </div>${renderAttributionSection()}
-     ${advSection('drift', 'Where you stand', renderDriftSection,
-        'Compare each sleeve against your targets and rebalancing bands.')}
      ${advSection('location', 'Where your assets sit', renderLocationSection,
         'Work out what it costs to hold each sleeve where it currently sits.')}`;
 }
