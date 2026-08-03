@@ -263,6 +263,12 @@ async function cloudPullState() {
   unsaved = false;
   setSyncMeta({ knownCloudStamp: row.updated_at, everSynced: true, localDirty: false });
   saveLocal();
+  // localStorage alone is not enough on a Mac: data/portfolio.json is the file
+  // Claude, the MCP server, and Vertex read. Without this, a doc pulled from
+  // another device never reaches disk and every local reader goes stale.
+  // Safe here by construction — syncOnSignIn only pulls once arbitration has
+  // already decided the cloud copy wins.
+  await writeDiskMirror();
   return true;
 }
 

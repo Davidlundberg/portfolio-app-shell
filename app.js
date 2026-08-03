@@ -189,6 +189,29 @@ function markUnsaved() {
   autosaveTimer = setTimeout(autoSaveToServer, 1000);
 }
 
+// Mirror the in-memory state to data/portfolio.json via server.py.
+//
+// This exists because a cloud PULL is not a save: when this Mac adopts a doc
+// another device wrote (phone edits, a different laptop), only localStorage
+// was updated and the on-disk JSON silently went stale — permanently, since
+// opening the app never backfilled it either. That file is what Claude, the
+// MCP server, and Vertex read, so a stale mirror means every one of them
+// answers from a portfolio that no longer exists. Never called in shell mode
+// (a phone has no server.py); returns false rather than throwing when the
+// local server isn't there.
+async function writeDiskMirror() {
+  if (IS_SHELL) return false;
+  try {
+    const res = await fetch('data/portfolio.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ holdings, targets, transactions, contributionRules,
+                             lastSaved: lastSaved || new Date().toISOString() }),
+    });
+    return res.ok;
+  } catch (_) { return false; }
+}
+
 async function autoSaveToServer() {
   if (IS_SHELL) {
     // Shell mode: the cloud row is the save target. localStorage already has
@@ -1180,131 +1203,6 @@ function confirmSplit(id) {
   toast(`Split into ${fmtN(qty1)} + ${fmtN(qty2)} units`);
 }
 
-// ─── Tax engine ──────────────────────────────────────────────────────────────
-// Lots come from two places: the ledger (every positive-units row since the
-// epoch is a lot at its unitPrice) and a one-time "opening lots" entry per
-// holding for pre-epoch shares (from Fidelity's cost-basis page). An opening
-// lot without an acquisition date has an UNKNOWN term — shown as such, never
-// guessed (a synthesized date would mislabel ST/LT).
-const TAXADV_RE = /roth|401|403|pension|swedish|ira/i;
-const isTaxableAccount = h => !TAXADV_RE.test(h.account || '');
-
-function lotsFor(h) {
-  const lots = [];
-  for (const l of (h.lots || [])) {
-    const qty = +l.qty, unitCost = +l.unitCost;
-    if (qty > 0 && unitCost >= 0) lots.push({ date: l.date || null, qty, unitCost, source: 'opening' });
-  }
-  for (const t of transactions) {
-    if (t.holdingId === h.id && +t.units > 0 &&
-        ['contribution', 'adjustment', 'dividend'].includes(t.kind)) {
-      lots.push({ date: String(t.date).slice(0, 10), qty: +t.units, unitCost: +t.unitPrice || 0, source: t.kind });
-    }
-  }
-  return lots;
-}
-
-// Unrealized gain by term for one holding. covered = fraction of the position
-// the lots explain (basis for the rest is simply unknown).
-function taxSummaryFor(h) {
-  const lots = lotsFor(h);
-  if (!lots.length || !(h.price > 0)) return null;
-  const cutoff = Date.now() - 366 * 86400000;
-  let basis = 0, lotQty = 0, stGain = 0, ltGain = 0, unknownGain = 0;
-  for (const l of lots) {
-    const gain = (h.price - l.unitCost) * l.qty;
-    basis += l.unitCost * l.qty;
-    lotQty += l.qty;
-    if (!l.date) unknownGain += gain;
-    else if (new Date(l.date + 'T00:00:00Z').getTime() <= cutoff) ltGain += gain;
-    else stGain += gain;
-  }
-  return {
-    lots, lotQty, basis,
-    covered: h.quantity > 0 ? Math.min(1, lotQty / h.quantity) : 0,
-    stGain, ltGain, unknownGain,
-    totalGain: stGain + ltGain + unknownGain,
-  };
-}
-
-// Harvestable losses in taxable accounts, with a wash-sale risk flag: a buy
-// of the same holding within the last 30 days (any account — Rev. Rul.
-// 2008-5 covers IRAs), or an active contribution rule that would repurchase
-// within the next 30 days.
-function tlhScan() {
-  const out = [];
-  const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-  for (const h of holdings) {
-    if (!isTaxableAccount(h)) continue;
-    const s = taxSummaryFor(h);
-    if (!s) continue;
-    const lossLots = s.lots.filter(l => (h.price - l.unitCost) * l.qty < -1);
-    if (!lossLots.length) continue;
-    const loss = lossLots.reduce((sum, l) => sum + (h.price - l.unitCost) * l.qty, 0);
-    const sameName = x => x.holdingName === h.name || x.name === h.name;
-    const recentBuy = transactions.some(t =>
-      sameName(t) && +t.units > 0 && String(t.date).slice(0, 10) >= cutoff);
-    const ruleFeeds = contributionRules.some(r =>
-      (r.splits || []).some(sp => sameName(sp)) || sameName(r));
-    out.push({ id: h.id, name: h.name, account: h.account, loss, washRisk: recentBuy || ruleFeeds });
-  }
-  return out.sort((a, b) => a.loss - b.loss);
-}
-
-// ── ESPP (Section 423 with lookback) ─────────────────────────────────────────
-// Qualifying disposition needs BOTH >2y from grant (offering start) and >1y
-// from purchase. Per-share splits:
-//   disqualifying: ordinary = fmvAtPurchase − purchasePrice (bargain element),
-//                  capital  = price − fmvAtPurchase (term from purchase date)
-//   qualifying:    ordinary = min(price − purchasePrice, discount% × fmvAtGrant)
-//                  (floored at 0; a sale below cost is all capital loss),
-//                  capital  = remainder, always LT
-function esppLotStatus(lot, price, now = Date.now()) {
-  const grant = new Date(lot.grantDate + 'T00:00:00Z').getTime();
-  const purchase = new Date(lot.purchaseDate + 'T00:00:00Z').getTime();
-  if (!isFinite(grant) || !isFinite(purchase)) return null;
-  const qualifiesAt = Math.max(grant + 2 * 365.25 * 86400000, purchase + 365.25 * 86400000);
-  const qualifying = now >= qualifiesAt;
-  const qty = +lot.qty || 0;
-  const perShareGain = price - lot.purchasePrice;
-  let ordinaryPS, capitalPS, capTerm;
-  if (qualifying) {
-    const discountPS = (lot.discountPct ?? 15) / 100 * (lot.fmvAtGrant ?? lot.purchasePrice / (1 - (lot.discountPct ?? 15) / 100));
-    ordinaryPS = Math.max(0, Math.min(perShareGain, discountPS));
-    capitalPS = perShareGain - ordinaryPS;
-    capTerm = 'LT';
-  } else {
-    ordinaryPS = (lot.fmvAtPurchase ?? lot.purchasePrice) - lot.purchasePrice;
-    capitalPS = price - (lot.fmvAtPurchase ?? lot.purchasePrice);
-    capTerm = now - purchase > 366 * 86400000 ? 'LT' : 'ST';
-  }
-  return {
-    qualifying,
-    qualifiesAt: new Date(qualifiesAt).toISOString().slice(0, 10),
-    daysToQualify: qualifying ? 0 : Math.ceil((qualifiesAt - now) / 86400000),
-    ordinary: ordinaryPS * qty,
-    capital: capitalPS * qty,
-    capTerm,
-  };
-}
-
-// ── Asset location (directional) ─────────────────────────────────────────────
-// Bonds throw ordinary income every year — sheltered space wants them first.
-function locationCheck() {
-  let bondsInTaxable = 0, taxableTotal = 0, shelteredTotal = 0;
-  for (const h of holdings) {
-    const v = h.quantity * h.price;
-    if (!(v > 0)) continue;
-    if (isTaxableAccount(h)) {
-      taxableTotal += v;
-      if (getSleeve(h) === 'bond') bondsInTaxable += v;
-    } else {
-      shelteredTotal += v;
-    }
-  }
-  return { bondsInTaxable, taxableTotal, shelteredTotal };
-}
-
 // ─── Risk & Exposure ─────────────────────────────────────────────────────────
 // Three honest views: employer-correlated concentration (salary + ESPP + any
 // employer stock is ONE bet), look-through company exposure across index
@@ -1464,159 +1362,6 @@ function renderRiskCard() {
       </p>`;
   }
   body.innerHTML = html;
-}
-
-// ─── Tax card ────────────────────────────────────────────────────────────────
-let basisEditId = null;   // holding id with the opening-basis editor open
-let esppFormId = null;    // holding id with the ESPP add-lot form open
-
-function estTaxFor(s) {
-  const mt = (+targets.taxMarginal || 0) / 100;
-  const lt = (+targets.taxLtcg || 0) / 100;
-  // Unknown-term gains priced at LTCG (the optimistic bound) but labeled.
-  return Math.max(0, s.stGain) * mt + Math.max(0, s.ltGain + s.unknownGain) * lt;
-}
-
-function renderTaxCard() {
-  const card = document.getElementById('taxCard');
-  const body = document.getElementById('taxBody');
-  if (!card || !body) return;
-  const taxable = holdings.filter(h => isTaxableAccount(h) && h.quantity * h.price > 0);
-  if (!taxable.length) { card.style.display = 'none'; return; }
-  card.style.display = '';
-  document.getElementById('taxMarginal').value = targets.taxMarginal ?? 24;
-  document.getElementById('taxLtcg').value = targets.taxLtcg ?? 15;
-  let html = '';
-
-  // 1 ── Unrealized gains in taxable accounts
-  html += `<div class="subsection-label">Taxable accounts — unrealized gains</div><div class="tax-rows">`;
-  for (const h of taxable) {
-    const s = taxSummaryFor(h);
-    const v = h.quantity * h.price;
-    if (basisEditId === h.id) {
-      const ledgerQty = (s ? s.lots : lotsFor(h)).filter(l => l.source !== 'opening')
-        .reduce((sum, l) => sum + l.qty, 0);
-      const openQty = Math.max(0, +(h.quantity - ledgerQty).toFixed(6));
-      const existing = (h.lots || [])[0] || {};
-      html += `<div class="tax-row tax-edit">
-        <span>${esc(h.name)}</span>
-        <span class="tax-edit-form">
-          <input id="tb-qty-${h.id}" type="number" step="any" min="0" value="${existing.qty ?? openQty}" aria-label="shares"> sh @
-          <input id="tb-cost-${h.id}" type="number" step="any" min="0" value="${existing.unitCost ?? ''}" placeholder="avg cost" aria-label="avg cost"> $ ·
-          <input id="tb-date-${h.id}" type="date" value="${existing.date ?? ''}" aria-label="acquired (optional)">
-          <button class="btn btn-primary btn-sm" onclick="saveOpeningBasis('${h.id}')">Save</button>
-          <button class="btn btn-ghost btn-sm" onclick="basisEditId=null;renderTaxCard()">Cancel</button>
-        </span>
-      </div>`;
-      continue;
-    }
-    if (s) {
-      const chips = [
-        s.ltGain ? `LT ${fmt$(s.ltGain)}` : '',
-        s.stGain ? `ST ${fmt$(s.stGain)}` : '',
-        s.unknownGain ? `term? ${fmt$(s.unknownGain)}` : '',
-      ].filter(Boolean).join(' · ');
-      const cov = s.covered < 0.99 ? ` <span class="tax-cov">basis covers ${(s.covered * 100).toFixed(0)}%</span>` : '';
-      html += `<div class="tax-row">
-        <span>${esc(h.name)}${cov}</span>
-        <span class="num ${s.totalGain >= 0 ? '' : 'tax-loss'}">${fmt$(s.totalGain)}<span class="tax-sub">${chips}</span></span>
-        <span class="num tax-sub">est. tax ${fmt$(estTaxFor(s))}</span>
-        <button class="btn btn-ghost btn-sm" onclick="basisEditId='${h.id}';renderTaxCard()">Basis…</button>
-      </div>`;
-    } else {
-      html += `<div class="tax-row">
-        <span>${esc(h.name)}</span>
-        <span class="tax-sub">no basis yet — ${fmt$(v)} untracked</span>
-        <span></span>
-        <button class="btn btn-ghost btn-sm" onclick="basisEditId='${h.id}';renderTaxCard()">Set basis…</button>
-      </div>`;
-    }
-  }
-  html += `</div><p class="risk-note">Ledger buys since ${LEDGER_EPOCH} are lots automatically; "Basis…" records pre-epoch shares from your broker's cost-basis page. Estimates use your rates above — directional, not advice.</p>`;
-
-  // 2 ── Tax-loss harvesting
-  const tlh = tlhScan();
-  if (tlh.length) {
-    html += `<div class="subsection-label">Harvestable losses</div>` + tlh.map(t =>
-      `<p class="risk-line">${esc(t.name)} (${esc(t.account || '—')}): <strong class="tax-loss">${fmt$(t.loss)}</strong>
-        ${t.washRisk ? '<span class="tax-wash">⚠ wash-sale risk — bought (or auto-buying) within 30 days</span>' : ''}</p>`).join('');
-  }
-
-  // 3 ── ESPP disposition planner
-  const espp = holdings.filter(h => employerConfig().accounts.includes(h.account || '') && h.quantity > 0);
-  if (espp.length) {
-    html += `<div class="subsection-label">ESPP — disposition planner</div>`;
-    for (const h of espp) {
-      const lots = h.esppLots || [];
-      html += `<div class="risk-line" style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
-        <span>${esc(h.name)} · ${fmtN(h.quantity)} sh</span>
-        <button class="btn btn-ghost btn-sm" onclick="esppFormId=esppFormId==='${h.id}'?null:'${h.id}';renderTaxCard()">+ purchase lot</button>
-      </div>`;
-      for (const lot of lots) {
-        const st = esppLotStatus(lot, h.price);
-        if (!st) continue;
-        html += `<p class="risk-note" style="margin-bottom:4px;">
-          ${fmtN(lot.qty)} sh bought ${esc(lot.purchaseDate)} @ ${fmt$(lot.purchasePrice)} —
-          ${st.qualifying
-            ? `<strong>qualifying</strong> · sell now: ordinary ${fmt$(st.ordinary)}, LT capital ${fmt$(st.capital)}`
-            : `qualifies ${esc(st.qualifiesAt)} (${st.daysToQualify}d) · sell now: ordinary ${fmt$(st.ordinary)}, ${st.capTerm} capital ${fmt$(st.capital)}`}
-        </p>`;
-      }
-      if (esppFormId === h.id) {
-        html += `<div class="tax-edit-form" style="margin:4px 0 8px;">
-          <input id="el-qty-${h.id}" type="number" step="any" min="0" placeholder="shares"> sh ·
-          grant <input id="el-grant-${h.id}" type="date"> ·
-          purchase <input id="el-pur-${h.id}" type="date"> @
-          <input id="el-price-${h.id}" type="number" step="any" min="0" placeholder="paid $"> ·
-          FMV grant <input id="el-fmvg-${h.id}" type="number" step="any" min="0" placeholder="$"> ·
-          FMV purch <input id="el-fmvp-${h.id}" type="number" step="any" min="0" placeholder="$">
-          <button class="btn btn-primary btn-sm" onclick="saveEsppLot('${h.id}')">Add</button>
-        </div>`;
-      }
-    }
-  }
-
-  // 4 ── Asset location
-  const loc = locationCheck();
-  if (loc.bondsInTaxable > 1) {
-    html += `<div class="subsection-label">Asset location</div>
-      <p class="risk-line">${fmt$(loc.bondsInTaxable)} of bonds sit in taxable accounts — bond income is taxed at your marginal rate every year; sheltered space (Roth/401K) absorbs it tax-free.</p>`;
-  }
-  body.innerHTML = html;
-}
-
-function saveOpeningBasis(id) {
-  const h = holdings.find(x => x.id === id);
-  if (!h) return;
-  const qty = parseFloat(document.getElementById(`tb-qty-${id}`)?.value);
-  const cost = parseFloat(document.getElementById(`tb-cost-${id}`)?.value);
-  const date = document.getElementById(`tb-date-${id}`)?.value || null;
-  if (isNaN(qty) || qty < 0 || isNaN(cost) || cost < 0) { toast('Enter shares and average cost.'); return; }
-  h.lots = qty > 0 ? [{ qty, unitCost: cost, date }] : [];
-  basisEditId = null;
-  markUnsaved(); renderTaxCard();
-  toast(date ? 'Basis saved' : 'Basis saved (no date — holding term unknown)');
-}
-
-function saveEsppLot(id) {
-  const h = holdings.find(x => x.id === id);
-  if (!h) return;
-  const g = k => document.getElementById(`el-${k}-${id}`)?.value;
-  const lot = {
-    qty: parseFloat(g('qty')), grantDate: g('grant'), purchaseDate: g('pur'),
-    purchasePrice: parseFloat(g('price')),
-    fmvAtGrant: parseFloat(g('fmvg')) || null,
-    fmvAtPurchase: parseFloat(g('fmvp')) || null,
-    discountPct: 15,
-  };
-  if (!(lot.qty > 0) || !lot.grantDate || !lot.purchaseDate || !(lot.purchasePrice > 0)) {
-    toast('Shares, grant date, purchase date and price paid are required.'); return;
-  }
-  if (!Array.isArray(h.esppLots)) h.esppLots = [];
-  h.esppLots.push(lot);
-  esppFormId = null;
-  markUnsaved(); renderTaxCard();
-  toast('ESPP lot recorded');
 }
 
 // ─── "Since you last looked" ─────────────────────────────────────────────────
@@ -1958,12 +1703,17 @@ async function fetchYahooChart(ticker, range, { events = false, interval = '1d' 
   const viaProxy = await proxyGet('/chart', { ticker, range, interval, events: events ? '1' : '0' });
   if (viaProxy && viaProxy.timestamps?.length && viaProxy.adjcloses?.length) {
     return { timestamps: viaProxy.timestamps, adjcloses: viaProxy.adjcloses,
+             closes: viaProxy.closes || viaProxy.adjcloses,
              dividends: viaProxy.events || {} };
   }
 
   const qs = `interval=${interval}&range=${range}${events ? '&events=div' : ''}`;
-  const q1 = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?${qs}`;
-  const q2 = `https://query2.finance.yahoo.com/v8/finance/chart/${ticker}?${qs}`;
+  // Index tickers carry a caret (^TNX). It must be percent-encoded in the URL
+  // path, but NOT in the proxy call above — the edge function validates the
+  // raw symbol against /^[A-Za-z0-9.^=-]{1,12}$/ and would reject "%5E".
+  const t = ticker.replace(/\^/g, '%5E');
+  const q1 = `https://query1.finance.yahoo.com/v8/finance/chart/${t}?${qs}`;
+  const q2 = `https://query2.finance.yahoo.com/v8/finance/chart/${t}?${qs}`;
   const attempts = [
     { url: q1, creds: true },
     { url: q2, creds: true },
@@ -1982,7 +1732,12 @@ async function fetchYahooChart(ticker, range, { events = false, interval = '1d' 
       const timestamps = r?.timestamp;
       const adjcloses = r?.indicators?.adjclose?.[0]?.adjclose ?? r?.indicators?.quote?.[0]?.close;
       if (timestamps?.length && adjcloses?.length) {
-        return { timestamps, adjcloses, dividends: r?.events?.dividends || {} };
+        // RAW closes are kept alongside the adjusted series. They are not
+        // interchangeable: adjclose is a total-return series (back-adjusted for
+        // distributions), raw close is the price. Attribution needs whichever
+        // matches how the holding actually treats its dividends.
+        return { timestamps, adjcloses, closes: r?.indicators?.quote?.[0]?.close ?? adjcloses,
+                 dividends: r?.events?.dividends || {} };
       }
       console.warn(`[proxy] ${ticker}: no chart data from ${url}`);
     } catch (e) {
@@ -2839,7 +2594,6 @@ function render() {
   renderAttentionStrip();
   renderLastLookChip();
   renderRiskCard();
-  renderTaxCard();
   renderTable();
   renderChart();
   renderContributions();
@@ -2852,6 +2606,7 @@ function render() {
   if (hasHoldings) {
     renderGapTable();
     updateAdvisorAccounts();
+    renderAdvisorContext();
   }
   renderPerformanceChart();
 }
@@ -3208,6 +2963,767 @@ function renderGapTable() {
   }).join('');
 }
 
+// ─── Advisor: market context ─────────────────────────────────────────────────
+// External data in, decision out — the card reports what moved and where the
+// portfolio stands against its own policy. It never says buy or sell, and it
+// never reads a market level as a signal: "VOO is 2% off its high" is a fact,
+// "therefore buy" is not one this app is entitled to make.
+//
+// The macro row is the CBOE 10-year Treasury yield index. It is quoted in
+// percent, not dollars, so its moves are shown in basis points — a "−3.2%"
+// on a yield would read as a price move and mean nothing.
+const MACRO_TICKER = '^TNX';
+const MACRO_LABEL  = '10-yr Treasury';
+
+// Pure: reduce a daily adjusted-close series to the numbers worth showing.
+// `asOf` is injectable so tests can pin the YTD boundary. Returns null when
+// the series is too short to say anything honest rather than reporting zeros.
+function marketSnapshot(timestamps, closes, asOf = Date.now()) {
+  const pts = (timestamps || [])
+    .map((t, i) => ({ t: t * 1000, c: closes?.[i] }))
+    .filter(p => Number.isFinite(p.c) && Number.isFinite(p.t))
+    .sort((a, b) => a.t - b.t);
+  if (pts.length < 2) return null;
+
+  const last = pts[pts.length - 1];
+  // Last close at or before a cutoff — the honest comparison point when the
+  // exact date is a weekend or a market holiday.
+  const atOrBefore = ms => {
+    let found = null;
+    for (const p of pts) { if (p.t <= ms) found = p; else break; }
+    return found;
+  };
+  const delta = ref => (ref && ref.c > 0 && ref !== last)
+    ? { abs: last.c - ref.c, pct: (last.c / ref.c - 1) * 100 }
+    : null;
+
+  const jan1 = Date.UTC(new Date(asOf).getUTCFullYear(), 0, 1);
+  const yearAgo = asOf - 365 * 86400000;
+  const trailing = pts.filter(p => p.t >= yearAgo);
+  const high52 = Math.max(...(trailing.length ? trailing : pts).map(p => p.c));
+
+  return {
+    last: last.c,
+    asOfDate: new Date(last.t).toISOString().slice(0, 10),
+    d1:  delta(pts[pts.length - 2]),
+    d30: delta(atOrBefore(asOf - 30 * 86400000)),
+    ytd: delta(atOrBefore(jan1)),
+    d365: delta(atOrBefore(yearAgo)) || delta(pts[0]),
+    high52,
+    offHighPct: high52 > 0 ? (last.c / high52 - 1) * 100 : 0,
+  };
+}
+
+// The instruments actually worth watching: every distinct real ticker held,
+// plus the macro row. Sorted by position size so the biggest bet reads first.
+function marketWatchlist(holdingsArr = holdings) {
+  const byTicker = new Map();
+  for (const h of holdingsArr) {
+    if (!hasRealTicker(h)) continue;
+    const t = h.ticker.toUpperCase();
+    byTicker.set(t, (byTicker.get(t) || 0) + h.quantity * h.price);
+  }
+  return [...byTicker.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([ticker, value]) => ({ ticker, value, macro: false }));
+}
+
+let marketData = null;      // { rows: [{ticker, label, macro, snap}], fetched }
+let marketBusy = false;
+
+async function refreshMarket() {
+  if (marketBusy) return;
+  marketBusy = true;
+  const btn = document.getElementById('btnMarketRefresh');
+  if (btn) { btn.disabled = true; btn.textContent = '↻ Fetching…'; }
+
+  const targetsList = [
+    ...marketWatchlist(),
+    { ticker: MACRO_TICKER, label: MACRO_LABEL, macro: true, value: 0 },
+  ];
+  const rows = [];
+  for (const item of targetsList) {
+    const chart = await fetchYahooChart(item.ticker, '1y');
+    const snap = chart ? marketSnapshot(chart.timestamps, chart.adjcloses) : null;
+    rows.push({ ...item, label: item.label || item.ticker, snap });
+  }
+  marketData = { rows, fetched: new Date().toISOString() };
+
+  marketBusy = false;
+  if (btn) { btn.disabled = false; btn.textContent = '↻ Refresh market'; }
+  renderAdvisorContext();
+  const ok = rows.filter(r => r.snap).length;
+  toast(ok === rows.length
+    ? `Market updated — ${ok} instruments`
+    : `Market updated — ${ok} of ${rows.length} (some feeds unavailable)`);
+}
+
+// ─── Advisor: drift vs policy ────────────────────────────────────────────────
+// The 5/25 rule, which is a policy and not a prediction: a sleeve is out of
+// band when it is off by at least `bandAbsPp` percentage points OR by at least
+// `bandRelPct`% of its own target weight. The relative leg is what catches
+// small sleeves — a 9% target sitting at 6.5% is only 2.5pp off but is 28%
+// short of where it should be. A zero-target sleeve has no meaningful relative
+// test (division by zero), so it is judged on the absolute leg alone.
+function driftCheck(sleeveVals, targetPcts, totalValue,
+                    bandAbsPp = 5, bandRelPct = 25) {
+  if (!(totalValue > 0)) return { rows: [], anyOutOfBand: false, worst: null };
+  const rows = Object.keys(SLEEVE_CONFIG).map(key => {
+    const curVal  = sleeveVals[key] || 0;
+    const curPct  = curVal / totalValue * 100;
+    const tgtPct  = targetPcts[key] || 0;
+    const driftPp = curPct - tgtPct;
+    const relPct  = tgtPct > 0 ? driftPp / tgtPct * 100 : null;
+    const absHit  = Math.abs(driftPp) >= bandAbsPp;
+    const relHit  = relPct !== null && Math.abs(relPct) >= bandRelPct;
+    return {
+      sleeve: key,
+      label: SLEEVE_CONFIG[key].label,
+      curPct, tgtPct, driftPp, relPct,
+      driftDollars: curVal - tgtPct / 100 * totalValue,
+      outOfBand: absHit || relHit,
+      // Which leg tripped — shown so the number is never a black box.
+      reason: absHit && relHit ? 'both' : absHit ? 'absolute' : relHit ? 'relative' : null,
+    };
+  // A sleeve with no target and no money is noise, not a row.
+  }).filter(r => r.tgtPct > 0 || Math.abs(r.curPct) > 0.05);
+
+  const breaches = rows.filter(r => r.outOfBand);
+  const worst = rows.slice().sort((a, b) => Math.abs(b.driftPp) - Math.abs(a.driftPp))[0] || null;
+  return { rows, anyOutOfBand: breaches.length > 0, breaches, worst };
+}
+
+// Monthly dollars the standing rules actually move, normalised across
+// cadences (26 biweekly payments a year, not 24).
+function monthlyContribution(rules = contributionRules) {
+  const perMonth = { biweekly: 26 / 12, semimonthly: 2, monthly: 1 };
+  return (rules || []).reduce(
+    (sum, r) => sum + (+r.amount || 0) * (perMonth[r.cadence] ?? 1), 0);
+}
+
+// Can new money alone close a gap, or does this need selling? Returns months
+// to close at the current contribution rate, assuming every dollar is aimed at
+// the shortfall — the optimistic bound. null when nothing is flowing in, or
+// when the sleeve is overweight (new money can never fix an overweight; only
+// the rest of the portfolio growing around it, or a sale, does that).
+function monthsToCloseGap(gapDollars, monthlyIn) {
+  if (!(monthlyIn > 0) || !(gapDollars > 0)) return null;
+  return gapDollars / monthlyIn;
+}
+
+// ─── Advisor: attribution ────────────────────────────────────────────────────
+// "What moved my money" — the decomposition the header cannot give you. A
+// change in total value is two different things wearing one number: money you
+// PUT IN, and money the market gave or took. Splitting them is the difference
+// between "I'm up $16K" and "I'm up $16K, of which $15K was my own paycheck".
+//
+// Per holding, exactly:
+//   marketGain(h) = (qty_now × P_now) − (qty_start × P_start) − contributed(h)
+//
+// qty_start comes from the ledger — current units minus everything the ledger
+// added inside the window. This is the first thing besides TWR that makes the
+// transaction log earn its keep.
+//
+// A holding whose starting price cannot be established is reported as
+// unattributable rather than folded in at zero, because a silent zero would
+// understate the market's contribution and quietly break the identity
+// (flows + market = total).
+const ATTRIB_WINDOWS = [
+  { key: '1w',  label: '1 week',   days: 7 },
+  { key: '1m',  label: '1 month',  days: 30 },
+  { key: '3m',  label: '3 months', days: 91 },
+  { key: 'ytd', label: 'YTD',      days: null },
+];
+
+// Windows are anchored in New York, not UTC. On UTC the evening of 31 December
+// already belongs to the next year, so a YTD run after ~7pm ET resolved to
+// 2027-01-01, `closeAtOrBefore` returned the latest close, and the card
+// cheerfully reported that the portfolio had moved $0.00.
+function nyToday(now = Date.now()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date(now));
+}
+
+function windowStartDate(win, now = Date.now()) {
+  const today = nyToday(now);
+  if (win.days == null) return `${today.slice(0, 4)}-01-01`;
+  // Calendar arithmetic on the New York date, NOT fixed milliseconds off the
+  // instant. Subtracting 7×86400000ms across a DST boundary lands a day early
+  // or late — a "1 week" window spanning 15 March silently became 8 days.
+  // Date.UTC has no DST, so day subtraction on it is exact.
+  const [y, m, d] = today.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d) - win.days * 86400000).toISOString().slice(0, 10);
+}
+
+// Units and dollars the ledger added to this holding inside the window.
+// 'dividend' rows are income, not an external flow — same rule as externalFlows.
+function ledgerAddsSince(h, sinceDate, txns = transactions) {
+  return (txns || [])
+    .filter(t => t.holdingId === h.id && String(t.date).slice(0, 10) > sinceDate &&
+                 (t.kind === 'contribution' || t.kind === 'adjustment'))
+    .reduce((a, t) => ({ units: a.units + (+t.units || 0),
+                         dollars: a.dollars + (+t.amount || 0) }), { units: 0, dollars: 0 });
+}
+
+// Units that arrived as REINVESTED distributions inside the window. These need
+// their own accounting: they were not held when the window opened, so they must
+// come out of startQty — but David did not pay for them either, so they stay
+// out of `contributed`. What's left is that they land in marketGain, which is
+// exactly right, because a reinvested dividend IS investment income.
+//
+// Leaving them in startQty (the first cut) made a DRIP invisible: 100 units at
+// a flat $100 with $2/unit reinvested reported $0.00 when the truth was +$200.
+function dividendUnitsSince(h, sinceDate, txns = transactions) {
+  return (txns || [])
+    .filter(t => t.holdingId === h.id && String(t.date).slice(0, 10) > sinceDate &&
+                 t.kind === 'dividend')
+    .reduce((s, t) => s + (+t.units || 0), 0);
+}
+
+// Close at or before a date, from a Yahoo chart series. `series` picks which
+// of the two co-indexed price series to read — see startPriceFor.
+function closeAtOrBefore(chart, dateStr, series = 'closes') {
+  const values = chart?.[series] || chart?.adjcloses;
+  if (!chart?.timestamps?.length || !values) return null;
+  const cutoff = Date.parse(dateStr + 'T23:59:59Z');
+  let found = null;
+  for (let i = 0; i < chart.timestamps.length; i++) {
+    const c = values[i];
+    if (c == null) continue;
+    if (chart.timestamps[i] * 1000 <= cutoff) found = c; else break;
+  }
+  return found;
+}
+
+// The price this holding stood at when the window opened.
+//
+// Which series to scale by is NOT cosmetic — it decides whether a dividend
+// shows up as a price gain. Adjusted closes are a TOTAL-RETURN series:
+// back-adjustment pushes the historical value down by every distribution
+// since, so scaling by the adjusted ratio understates the start price by
+// roughly the yield and reports the coupon as if the price had risen. VGIT sat
+// flat across a year while paying 3.9% to cash; on the adjusted ratio that
+// reads as "+2.3% price, +$536 market" against a truth of zero.
+//
+//   distributing holding (real ticker) -> RAW close ratio. The cash left the
+//     fund. If it was reinvested, the ledger booked a `dividend` row and the
+//     extra units are already in qty_now, so counting total return too would
+//     double-count it.
+//   accumulating CIT (proxy-priced)    -> ADJUSTED ratio. These never
+//     distribute; the dividends compound inside the NAV, which is exactly what
+//     the proxy's total-return series tracks.
+//   Avanza pension                     -> its own stamped NAV, already
+//     accumulating and already in the right units.
+// Which basis a holding's start price is derived on. ONLY the ticker route is
+// a true price return; the other two are total return, because those holdings
+// reinvest internally. Labelling all three "price" was misleading for the 401K
+// funds and the pension, which together are the larger share of the book.
+function priceBasisFor(h) {
+  const ticker = (h.ticker || '').toUpperCase();
+  return ticker && ticker !== 'N/A' ? 'price' : 'total ret.';
+}
+
+function startPriceFor(h, sinceDate, charts) {
+  const ratioFrom = (chart, series) => {
+    const start = closeAtOrBefore(chart, sinceDate, series);
+    const now = (chart?.[series] || chart?.adjcloses || []).filter(x => x != null).pop();
+    return start > 0 && now > 0 ? h.price * (start / now) : null;
+  };
+  const ticker = (h.ticker || '').toUpperCase();
+  if (ticker && ticker !== 'N/A') return ratioFrom(charts[ticker], 'closes');
+
+  const proxyKey = Object.keys(PROXY_TRACKED_FUNDS).find(k => (h.name || '').includes(k));
+  if (proxyKey) return ratioFrom(charts[PROXY_TRACKED_FUNDS[proxyKey].proxy], 'adjcloses');
+
+  if (Array.isArray(h.fxHistory) && h.fxHistory.length) {
+    const prior = h.fxHistory.filter(r => r.date <= sinceDate).pop();
+    if (prior?.nav > 0 && prior?.rate > 0) return prior.nav * prior.rate;
+  }
+  return null;
+}
+
+// Pure given `charts`. Returns per-holding rows plus totals that satisfy
+// flows + marketGain === totalChange over the attributable set.
+function attribution(holdingsArr, charts, sinceDate, txns = transactions) {
+  const rows = [], skipped = [];
+  for (const h of holdingsArr) {
+    const qtyNow = +h.quantity || 0;
+    const nowValue = qtyNow * (+h.price || 0);
+    const adds = ledgerAddsSince(h, sinceDate, txns);
+    const startQty = qtyNow - adds.units - dividendUnitsSince(h, sinceDate, txns);
+
+    // Nothing now, and nothing at the open by the ledger's account. Either the
+    // holding has been empty all along, or it was sold on a device that never
+    // wrote a row — and nothing available here separates those. `continue` was
+    // wrong for the same reason the old nowValue guard was: it hides a real
+    // disposal. Declaring costs one line of noise in the harmless case.
+    if (!(qtyNow > 0) && !(startQty > 0)) {
+      skipped.push({ h, nowValue, reason: 'position is zero and the ledger has no record for this window' });
+      continue;
+    }
+    // The ledger and the position disagree. Clamping invents a loss out of the
+    // disagreement; declaring keeps the totals honest about what they cannot know.
+    if (startQty < 0) { skipped.push({ h, nowValue, reason: 'ledger exceeds position' }); continue; }
+
+    const startPrice = startPriceFor(h, sinceDate, charts);
+    // `== null` let a ZERO price through — and 0 is reachable, because
+    // startPriceFor scales h.price, which the table itself renders as '—' when
+    // it is unset. A holding at price 0 with an in-window contribution then
+    // reported the whole contribution as a market loss.
+    if (!(startPrice > 0)) { skipped.push({ h, nowValue, reason: 'no usable price for the window start' }); continue; }
+    const startValue = startQty * startPrice;
+    rows.push({
+      h, startPrice, startValue, nowValue,
+      basis: priceBasisFor(h),
+      contributed: adds.dollars,
+      marketGain: nowValue - startValue - adds.dollars,
+      pricePct: startPrice > 0 ? (h.price / startPrice - 1) * 100 : null,
+    });
+  }
+  const sum = (k) => rows.reduce((s, r) => s + r[k], 0);
+  const totalMarket = sum('marketGain');
+  return {
+    rows: rows.sort((a, b) => b.marketGain - a.marketGain),
+    skipped,
+    startValue: sum('startValue'),
+    nowValue: sum('nowValue'),
+    contributed: sum('contributed'),
+    marketGain: totalMarket,
+    totalChange: sum('nowValue') - sum('startValue'),
+    // Share of the market move each holding is responsible for, on the
+    // magnitude of the moves so offsetting winners and losers both count.
+    grossMove: rows.reduce((s, r) => s + Math.abs(r.marketGain), 0),
+  };
+}
+
+let attribData = null;    // { win, sinceDate, result, fetched }
+let attribBusy = false;
+
+async function runAttribution(winKey) {
+  if (attribBusy) return;
+  attribBusy = true;
+  const win = ATTRIB_WINDOWS.find(w => w.key === winKey) || ATTRIB_WINDOWS[1];
+  const btn = document.getElementById('btnAttrib');
+  if (btn) { btn.disabled = true; btn.textContent = 'Working…'; }
+
+  // One chart per distinct symbol: real tickers plus the proxies that price
+  // the 401K CITs. The pension needs no fetch — its stamps are already local.
+  const symbols = new Set();
+  for (const h of holdings) {
+    const t = (h.ticker || '').toUpperCase();
+    if (t && t !== 'N/A') { symbols.add(t); continue; }
+    const key = Object.keys(PROXY_TRACKED_FUNDS).find(k => (h.name || '').includes(k));
+    if (key) symbols.add(PROXY_TRACKED_FUNDS[key].proxy);
+  }
+  const charts = {};
+  for (const s of symbols) {
+    const c = await fetchYahooChart(s, '1y');
+    if (c) charts[s] = c;
+  }
+  const sinceDate = windowStartDate(win);
+  attribData = { win, sinceDate, result: attribution(holdings, charts, sinceDate), fetched: new Date().toISOString() };
+
+  attribBusy = false;
+  if (btn) { btn.disabled = false; btn.textContent = '↻ Recompute'; }
+  renderAdvisorContext();
+}
+
+// ─── Advisor: asset location ─────────────────────────────────────────────────
+// WHERE a sleeve is held changes what it costs to hold, without changing the
+// allocation by a cent. Bond interest is ordinary income taxed every single
+// year; a broad equity fund throws mostly qualified dividends at the lower
+// rate and defers the rest into unrealised gain. So the highest-yielding,
+// worst-taxed asset wants the sheltered account — and the swap that puts it
+// there is allocation-neutral by construction, because the displaced asset
+// takes its place in taxable.
+//
+// This is arithmetic on rates the user enters, not a recommendation. It says
+// what a swap would cost or save; it does not say to make one.
+// Three categories, not two. The Swedish pension is deliberately NOT counted
+// as shelter here: its income is not taxed under US ordinary/qualified rates
+// at all, so pricing it with them is meaningless, and it is not an account
+// David trades in — a "swap" proposed inside it is advice he cannot act on.
+// It is reported as out of scope rather than silently dropped.
+//
+// This is a different question from the one TAX_ADVANTAGED_RE answers in
+// rebalancePlan. There the test is "would selling here realise a US capital
+// gain", and the pension genuinely does shelter that. Here the test is
+// "is this holding's income taxable to David under the US rates below",
+// and it is not. Same accounts, opposite answers — keep the two separate.
+const US_SHELTERED_RE = /roth|401|403|\bira\b/i;
+const FOREIGN_PENSION_RE = /pension|swedish|avanza|länsförsäkringar|lansforsakringar/i;
+
+function taxLocationOf(h) {
+  const acct = h.account || '';
+  if (FOREIGN_PENSION_RE.test(acct)) return 'foreign';
+  if (US_SHELTERED_RE.test(acct)) return 'sheltered';
+  return 'taxable';
+}
+const isShelteredAccount = h => taxLocationOf(h) === 'sheltered';
+
+// Defaults live here and NOWHERE else. They were briefly duplicated — the rate
+// inputs rendered `?? 24` while this function computed `|| 0` — so the card
+// displayed a 24% marginal rate while doing the maths at zero, and then
+// reported a confident green "nothing to gain by relocating" that was purely
+// an artefact of the missing rates. Any new reader of these numbers must come
+// through here.
+const DEFAULT_TAX_MARGINAL = 24;
+const DEFAULT_TAX_LTCG = 15;
+
+// Federal + state/local, and NIIT where it applies. One place, so the two
+// rates can never drift apart.
+function effectiveRates(t = targets) {
+  const local = (+t.taxStateLocal || 0) / 100;
+  const niit  = t.taxNiit ? 0.038 : 0;
+  const marg  = t.taxMarginal == null ? DEFAULT_TAX_MARGINAL : +t.taxMarginal || 0;
+  const ltcg  = t.taxLtcg     == null ? DEFAULT_TAX_LTCG     : +t.taxLtcg     || 0;
+  return { ordinary: marg / 100 + local + niit, qualified: ltcg / 100 + local + niit };
+}
+
+// Trailing-12-month yield from the dividend cache. Null when unknown — the
+// accumulating funds (401K CITs, the Avanza pension) never distribute, so
+// they have no cache and must never be assigned a fabricated yield.
+function holdingYield(h) {
+  const ps = h.dividends?.t12mPerShare;
+  return ps > 0 && h.price > 0 ? ps / h.price : null;
+}
+
+// An accumulating fund still WOULD throw income if it were held in a taxable
+// account — it just doesn't today. Estimate that from a real distributing
+// holding in the same sleeve, and mark it estimated so the UI can say so.
+function yieldForLocation(h, holdingsArr) {
+  const own = holdingYield(h);
+  if (own != null) return { yield: own, estimated: false };
+  const sleeve = getSleeve(h);
+  const peers = holdingsArr
+    .filter(x => x !== h && getSleeve(x) === sleeve)
+    .map(holdingYield)
+    .filter(y => y != null);
+  if (!peers.length) return null;
+  return { yield: peers.reduce((s, y) => s + y, 0) / peers.length, estimated: true };
+}
+
+// Bond interest is ordinary income; equity distributions are mostly qualified.
+const usesOrdinaryRate = h => getSleeve(h) === 'bond';
+
+// Annual tax cost per dollar held in a TAXABLE account.
+function dragRateFor(h, holdingsArr, rates) {
+  const y = yieldForLocation(h, holdingsArr);
+  if (!y) return null;
+  return {
+    rate: y.yield * (usesOrdinaryRate(h) ? rates.ordinary : rates.qualified),
+    yield: y.yield, estimated: y.estimated,
+    kind: usesOrdinaryRate(h) ? 'ordinary' : 'qualified',
+  };
+}
+
+// The single best location swap: move the highest-drag taxable holding into
+// shelter, displacing the lowest-drag sheltered holding out into taxable.
+// Allocation is untouched — only the addresses change. Returns null when
+// nothing would improve (already optimal, or nothing comparable to swap).
+function assetLocationSwap(holdingsArr = holdings, t = targets) {
+  const rates = effectiveRates(t);
+  const rows = holdingsArr
+    .map(h => {
+      const v = h.quantity * h.price;
+      const loc = taxLocationOf(h);
+      const d = v > 0 ? dragRateFor(h, holdingsArr, rates) : null;
+      return d ? { h, value: v, loc, sheltered: loc === 'sheltered', ...d } : null;
+    })
+    .filter(Boolean);
+
+  // Foreign-pension holdings are listed but never traded against — see
+  // taxLocationOf. Only US taxable and US sheltered take part in a swap.
+  const taxable   = rows.filter(r => r.loc === 'taxable').sort((a, b) => b.rate - a.rate);
+  const sheltered = rows.filter(r => r.loc === 'sheltered').sort((a, b) => a.rate - b.rate);
+  if (!taxable.length || !sheltered.length) return { rows, swap: null, rates };
+
+  const into = taxable[0];      // worst asset to hold in taxable
+  const out  = sheltered[0];    // cheapest asset to expose to taxable
+  const gain = into.rate - out.rate;
+  // Same sleeve on both sides is a no-op, and a non-positive gain means the
+  // portfolio is already located as well as these rates can make it.
+  if (!(gain > 0) || getSleeve(into.h) === getSleeve(out.h)) return { rows, swap: null, rates };
+
+  const amount = Math.min(into.value, out.value);
+  return {
+    rows, rates,
+    swap: {
+      into, out, amount,
+      annualSaving: gain * amount,
+      currentCost: into.rate * amount,
+      estimated: into.estimated || out.estimated,
+    },
+  };
+}
+
+// ─── Advisor: context rendering ──────────────────────────────────────────────
+// A move that rounds away to nothing is flat, not a tiny loss. Signing it
+// ("−0.0pp", "−0bp") reads as a real move in the wrong direction and colours
+// the row red for what is actually no change at all.
+const signed = (n, digits, unit) => {
+  const shown = Math.abs(n).toFixed(digits);
+  if (+shown === 0) return `${shown}${unit}`;
+  return `${n > 0 ? '+' : '−'}${shown}${unit}`;
+};
+const fmtSignedPct = (n, d = 2) => signed(n, d, '%');
+const fmtSignedBp   = n => signed(Math.round(n * 100), 0, 'bp');
+const fmtSignedPp   = n => signed(n, 1, 'pp');
+// Same flat-is-flat rule for dollars: under half a dollar reads as no gap.
+const fmtSigned$    = n =>
+  Math.abs(n) < 0.5 ? fmt$(0) : `${n > 0 ? '+' : '−'}${fmt$(Math.abs(n))}`;
+// Colour follows what is displayed, not the raw float — a value that renders
+// as flat must not render red.
+const moveClass = (n, digits = 2) =>
+  +Math.abs(n).toFixed(digits) === 0 ? '' : n > 0 ? 'mkt-up' : 'mkt-down';
+
+function marketMoveCell(label, d, macro) {
+  if (!d) return `<span class="mkt-move mkt-na">${label} —</span>`;
+  const shown = macro ? fmtSignedBp(d.abs) : fmtSignedPct(d.pct);
+  const cls = macro ? moveClass(d.abs * 100, 0) : moveClass(d.pct);
+  return `<span class="mkt-move ${cls}">${label} ${shown}</span>`;
+}
+
+function renderMarketSection() {
+  if (!marketData) {
+    return `<p class="adv-placeholder mkt-empty">Pull current prices, 30-day and YTD moves, and the
+      10-year Treasury yield for the instruments you actually hold.</p>`;
+  }
+  const rows = marketData.rows.map(r => {
+    if (!r.snap) {
+      return `<div class="mkt-row"><span class="mkt-tick">${esc(r.label)}</span>
+        <span class="mkt-na">feed unavailable</span></div>`;
+    }
+    const s = r.snap;
+    const level = r.macro ? `${s.last.toFixed(3)}%` : fmt$(s.last);
+    // "Off high" is a drawdown fact about price. On a yield it would invert
+    // its own meaning (a high yield is a low price), so it is omitted there.
+    const offHigh = r.macro ? '' :
+      `<span class="mkt-off">${s.offHighPct <= -0.05
+        ? `${Math.abs(s.offHighPct).toFixed(1)}% off high` : 'at 52w high'}</span>`;
+    return `<div class="mkt-row">
+      <span class="mkt-tick">${esc(r.label)}</span>
+      <span class="mkt-last">${level}</span>
+      ${marketMoveCell('1d', s.d1, r.macro)}
+      ${marketMoveCell('30d', s.d30, r.macro)}
+      ${marketMoveCell('YTD', s.ytd, r.macro)}
+      ${offHigh}
+    </div>`;
+  }).join('');
+  const asOf = marketData.rows.find(r => r.snap)?.snap.asOfDate;
+  return rows + `<p class="risk-note">Last close ${esc(asOf || '—')} · Yahoo Finance.
+    Levels and moves only — no view on what they mean.</p>`;
+}
+
+function renderDriftSection() {
+  const tot = total();
+  const bandAbs = +targets.bandAbsPp || 5;
+  const bandRel = +targets.bandRelPct || 25;
+  const d = driftCheck(getSleeveTotals(), getSleeveTargetPcts(), tot, bandAbs, bandRel);
+  if (!d.rows.length) return '';
+
+  const monthlyIn = monthlyContribution();
+  let head;
+  if (d.anyOutOfBand) {
+    // Breaches come in both directions at once, so a single "worst sleeve"
+    // verdict is the wrong shape: it can report an overweight while the thing
+    // new money actually fixes is an underweight somewhere else. Answer for
+    // the portfolio — total shortfall buying can close, and separately whether
+    // an overweight exists that buying can never touch.
+    const under = d.breaches.filter(r => r.driftDollars < 0);
+    const over  = d.breaches.filter(r => r.driftDollars > 0);
+    const shortfall = under.reduce((s, r) => s - r.driftDollars, 0);
+    const months = monthsToCloseGap(shortfall, monthlyIn);
+
+    const parts = [];
+    if (shortfall > 0) {
+      const names = under.map(r => r.label).join(' and ');
+      parts.push(months === null
+        ? `${fmt$(shortfall)} short in ${names} — no standing contributions to close it with.`
+        : months <= 24
+          ? `${fmt$(shortfall)} short in ${names} — about ${Math.ceil(months)} months of contributions at ${fmt$(monthlyIn)}/mo.`
+          : `${fmt$(shortfall)} short in ${names} — roughly ${(months / 12).toFixed(1)} years at ${fmt$(monthlyIn)}/mo, so buying alone will not close it.`);
+    }
+    if (over.length) {
+      parts.push(`${over.map(r => r.label).join(' and ')} ${over.length === 1 ? 'is' : 'are'} over target — new money cannot bring ${over.length === 1 ? 'it' : 'them'} down, only selling or the rest growing into ${over.length === 1 ? 'it' : 'them'}.`);
+    }
+    head = `<p class="drift-head drift-breach">⚠ ${d.breaches.length}
+      ${d.breaches.length === 1 ? 'sleeve is' : 'sleeves are'} outside your bands.
+      ${esc(parts.join(' '))}</p>`;
+  } else {
+    head = `<p class="drift-head drift-ok">✓ Every sleeve is inside your bands${d.worst
+      ? ` — largest drift ${Math.abs(d.worst.driftPp).toFixed(1)}pp (${esc(d.worst.label)},
+          ${fmtSigned$(d.worst.driftDollars)})` : ''}.</p>`;
+  }
+
+  const rows = d.rows.map(r => `<div class="drift-row ${r.outOfBand ? 'drift-row-breach' : ''}">
+    <span>${esc(r.label)}</span>
+    <span class="num">${r.curPct.toFixed(1)}%<span class="drift-sub">now</span></span>
+    <span class="num">${r.tgtPct.toFixed(1)}%<span class="drift-sub">target</span></span>
+    <span class="num ${moveClass(r.driftPp, 1)}">${fmtSignedPp(r.driftPp)}
+      <span class="drift-sub">${fmtSigned$(r.driftDollars)}${
+        r.reason ? ` · ${r.reason} band` : ''}</span></span>
+  </div>`).join('');
+
+  return head + `<div class="drift-rows">${rows}</div>
+    <p class="risk-note">Act when a sleeve is off by
+      <input class="band-input" id="bandAbs" type="number" min="0" max="50" step="0.5" value="${bandAbs}"
+        onchange="targets.bandAbsPp=+this.value;markUnsaved();renderAdvisorContext()"> pp
+      or <input class="band-input" id="bandRel" type="number" min="0" max="100" step="5" value="${bandRel}"
+        onchange="targets.bandRelPct=+this.value;markUnsaved();renderAdvisorContext()">% of its own
+      target weight (the 5/25 rule). Your policy, your numbers — this only reports against it.</p>`;
+}
+
+function renderLocationSection() {
+  const { rows, swap, rates } = assetLocationSwap();
+  const pct = n => `${(n * 100).toFixed(1)}%`;
+  const rateInputs = `<p class="risk-note">Your rates:
+    marginal <input class="band-input" id="taxMarg" type="number" min="0" max="60" step="1"
+      value="${targets.taxMarginal ?? DEFAULT_TAX_MARGINAL}"
+      onchange="targets.taxMarginal=+this.value;markUnsaved();renderAdvisorContext()">%
+    · long-term gains <input class="band-input" id="taxLt" type="number" min="0" max="40" step="1"
+      value="${targets.taxLtcg ?? DEFAULT_TAX_LTCG}"
+      onchange="targets.taxLtcg=+this.value;markUnsaved();renderAdvisorContext()">%
+    · state + local <input class="band-input" id="taxLocal" type="number" min="0" max="20" step="0.5"
+      value="${targets.taxStateLocal ?? 0}"
+      onchange="targets.taxStateLocal=+this.value;markUnsaved();renderAdvisorContext()">%
+    · <label class="band-check"><input type="checkbox" id="taxNiit" ${targets.taxNiit ? 'checked' : ''}
+      onchange="targets.taxNiit=this.checked;markUnsaved();renderAdvisorContext()"> NIIT 3.8%</label>
+    ${!(+targets.taxStateLocal > 0) ? '<span class="loc-hint">— state + local is 0, so these are federal-only figures.</span>' : ''}
+  </p>`;
+
+  if (!rows.length) {
+    return `<p class="adv-placeholder loc-empty">Run “Update dividends” first — location math needs a
+      yield per holding.</p>` + rateInputs;
+  }
+
+  const LOC_LABEL = { taxable: 'taxable', sheltered: 'sheltered', foreign: 'outside US tax' };
+  const table = `<div class="loc-row loc-head-row">
+      <span>Holding</span><span class="num">Yield</span>
+      <span class="num">Cost/yr if taxable</span><span class="num">Tax/yr today</span>
+    </div>` + rows
+    .slice().sort((a, b) => b.rate - a.rate)
+    .map(r => `<div class="loc-row">
+      <span>${esc(r.h.name.slice(0, 30))}<span class="drift-sub">${esc(r.h.account || '—')} ·
+        ${LOC_LABEL[r.loc]}</span></span>
+      <span class="num">${pct(r.yield)}${r.estimated ? '<span class="drift-sub">est.</span>' : ''}</span>
+      <span class="num">${pct(r.rate)}<span class="drift-sub">${r.kind}</span></span>
+      <span class="num ${r.loc === 'taxable' ? 'mkt-down' : ''}">${
+        r.loc === 'taxable' ? fmt$(r.rate * r.value) : '—'}</span>
+    </div>`).join('');
+  const foreignCount = rows.filter(r => r.loc === 'foreign').length;
+  const foreignNote = foreignCount
+    ? `<p class="risk-note">${foreignCount} holding${foreignCount === 1 ? '' : 's'} sit outside US
+       tax entirely (Swedish pension). Shown for completeness, never proposed as one side of a
+       swap — the rates above do not apply to them, and it is not an account you trade in.</p>`
+    : '';
+
+  let verdict;
+  if (rates.ordinary <= 0 && rates.qualified <= 0) {
+    // With every rate at zero there is no drag to compare, so "nothing to gain"
+    // would be an artefact of the inputs rather than a finding.
+    verdict = `<p class="loc-head loc-swap">Set your tax rates below — at 0% there is no drag to
+      compare, so this section cannot tell you anything yet.</p>`;
+  } else if (!swap) {
+    verdict = `<p class="loc-head drift-ok">✓ Nothing to gain by relocating — the assets that
+      cost the most to hold in a taxable account are already sheltered.</p>`;
+  } else {
+    const s = swap;
+    verdict = `<p class="loc-head loc-swap">⇄ Relocating ${fmt$(s.amount)} would save about
+      <strong>${fmt$(s.annualSaving)}/year</strong> at your rates, with your allocation unchanged.${
+      s.estimated ? ' One side uses an estimated yield (accumulating fund).' : ''}</p>
+      <div class="loc-plan">
+        <p class="risk-line">1 — Sell ${fmt$(s.amount)} of <strong>${esc(s.into.h.name.slice(0, 30))}</strong>
+          in ${esc(s.into.h.account || '—')} <span class="drift-sub">costs ${fmt$(s.currentCost)}/yr in tax where it sits</span></p>
+        <p class="risk-line">2 — Inside ${esc(s.out.h.account || '—')}, move ${fmt$(s.amount)} out of
+          <strong>${esc(s.out.h.name.slice(0, 30))}</strong> into
+          <strong>${esc(SLEEVE_CONFIG[getSleeve(s.into.h)]?.label || 'the same sleeve')}</strong>
+          <span class="drift-sub">not a taxable event — it happens inside the account</span></p>
+        <p class="risk-line">3 — With the step-1 proceeds, buy ${fmt$(s.amount)} of
+          <strong>${esc(SLEEVE_CONFIG[getSleeve(s.out.h)]?.label || 'that sleeve')}</strong>
+          in ${esc(s.into.h.account || '—')}</p>
+        <p class="risk-note">Steps 2 and 3 cancel out at the portfolio level — every sleeve ends at
+          exactly the weight it has now. Step 1 is a taxable sale, so check the gain before acting;
+          steps inside a sheltered account are not taxable events. Advisory math only.</p>
+      </div>`;
+  }
+  return verdict + `<div class="loc-rows">${table}</div>` + foreignNote + rateInputs;
+}
+
+function renderAttributionSection() {
+  const picker = ATTRIB_WINDOWS.map(w =>
+    `<button class="btn btn-ghost btn-sm ${attribData?.win.key === w.key ? 'attrib-on' : ''}"
+       onclick="runAttribution('${w.key}')">${w.label}</button>`).join('');
+  const controls = `<div class="attrib-picker">${picker}</div>`;
+
+  if (!attribData) {
+    return controls + `<p class="adv-placeholder attrib-empty">Pick a window to split the change in
+      your portfolio into what you paid in and what the market did — then see which holdings
+      actually drove it.</p>`;
+  }
+  const r = attribData.result;
+  if (!r.rows.length) {
+    return controls + `<p class="adv-placeholder">No holding had an establishable starting price
+      for that window.</p>`;
+  }
+
+  const head = `<p class="attrib-head">Since ${esc(attribData.sinceDate)} your portfolio moved
+    <strong class="${moveClass(r.totalChange, 0)}">${fmtSigned$(r.totalChange)}</strong> —
+    <strong>${fmtSigned$(r.contributed)}</strong> of that you paid in,
+    <strong class="${moveClass(r.marketGain, 0)}">${fmtSigned$(r.marketGain)}</strong> the market
+    ${r.marketGain >= 0 ? 'gave' : 'took'}.</p>`;
+
+  const rows = r.rows.map(row => {
+    const share = r.grossMove > 0 ? Math.abs(row.marketGain) / r.grossMove * 100 : 0;
+    return `<div class="attrib-row">
+      <span>${esc(row.h.name.slice(0, 28))}<span class="drift-sub">${esc(row.h.account || '—')}</span></span>
+      <span class="num ${moveClass(row.pricePct ?? 0)}">${row.pricePct == null ? '—' : fmtSignedPct(row.pricePct, 1)}
+        <span class="drift-sub">${row.basis}</span></span>
+      <span class="num ${moveClass(row.marketGain, 0)}">${fmtSigned$(row.marketGain)}
+        <span class="drift-sub">market</span></span>
+      <span class="num">${row.contributed ? fmtSigned$(row.contributed) : '—'}
+        <span class="drift-sub">paid in</span></span>
+      <span class="attrib-bar"><i style="width:${Math.min(100, share).toFixed(1)}%"
+        class="${row.marketGain >= 0 ? 'bar-up' : 'bar-down'}"></i></span>
+    </div>`;
+  }).join('');
+
+  const skipped = r.skipped.length
+    ? `<p class="risk-note">${r.skipped.length} holding${r.skipped.length === 1 ? '' : 's'}
+       (${esc(r.skipped.map(s => s.h.name.slice(0, 22) + (s.reason ? ` — ${s.reason}` : '')).join(', '))})
+       could not be attributed for ${esc(attribData.sinceDate)} and are left out entirely rather than
+       counted as zero — the totals above cover ${fmt$(r.nowValue)} of the portfolio, not all of it.</p>`
+    : '';
+
+  return controls + head + `<div class="attrib-rows">${rows}</div>` + skipped +
+    `<p class="risk-note">Market = value change with your own contributions stripped out, per
+     holding. Holdings with a ticker are priced off RAW closes, so a dividend never reads as a
+     price gain; the 401K funds and the Swedish pension are on TOTAL RETURN, because their
+     distributions compound inside the NAV — the per-row label says which. Reinvested dividends
+     land in market, where income belongs. Bars show each holding's share of the total movement.
+     <strong>Three things this cannot see:</strong> a holding added by hand writes no ledger entry,
+     so its purchase reads as market gain; a reinvestment entered by hand is booked as an
+     adjustment, so it reads as money paid in; and a holding you <em>delete</em> rather than zero
+     out leaves nothing to iterate, so it vanishes from the window entirely. Facts about what happened — no view on what happens
+     next.</p>`;
+}
+
+function renderAdvisorContext() {
+  const el = document.getElementById('advContext');
+  if (!el) return;
+  el.innerHTML =
+    `<div class="subsection-label subsection-flex">Market
+       <button class="btn btn-ghost btn-sm" id="btnMarketRefresh" onclick="refreshMarket()">↻ Refresh market</button>
+     </div>${renderMarketSection()}
+     <div class="subsection-label subsection-flex">What moved your money
+       ${attribData ? `<button class="btn btn-ghost btn-sm" id="btnAttrib"
+         onclick="runAttribution('${attribData.win.key}')">↻ Recompute</button>` : ''}
+     </div>${renderAttributionSection()}
+     <div class="subsection-label">Where you stand</div>${renderDriftSection()}
+     <div class="subsection-label">Where your assets sit</div>${renderLocationSection()}`;
+}
+
 // ─── Advisor: account dropdown ────────────────────────────────────────────────
 function updateAdvisorAccounts() {
   const accts  = getUniqueAccounts();
@@ -3300,19 +3816,7 @@ function rebalancePlan(holdingsArr, targetsObj, amount, { allowSells = false } =
       const taxAdv = inSleeve.find(h => TAX_ADVANTAGED_RE.test(h.account || ''));
       const h = taxAdv || inSleeve[0];
       const taxable = !!h && !TAX_ADVANTAGED_RE.test(h.account || '');
-      // When lots exist, replace the vague warning with an actual estimate:
-      // trimming $amt realizes ~amt/value of the position's unrealized gain.
-      let note = taxable ? 'taxable account — may realize capital gains' : 'tax-advantaged — no capital-gains impact';
-      if (taxable && h) {
-        const s = taxSummaryFor(h);
-        const v = h.quantity * h.price;
-        if (s && v > 0 && s.covered > 0.5) {
-          const frac = Math.min(1, Math.abs(amt) / v);
-          const gain = s.totalGain * frac;
-          const tax = estTaxFor({ stGain: s.stGain * frac, ltGain: s.ltGain * frac, unknownGain: s.unknownGain * frac });
-          note = `taxable — est. realized gain ${fmt$(gain)} (~${fmt$(tax)} tax at your rates)`;
-        }
-      }
+      const note = taxable ? 'taxable account — may realize capital gains' : 'tax-advantaged — no capital-gains impact';
       rows.push({
         sleeve: k, label, action: 'sell', amount: amt,
         suggestion: h ? `Trim ${h.name} in ${h.account || 'Unassigned'}` : '',
@@ -3479,12 +3983,22 @@ loadLocal();
 render();
 renderTargetInputs();
 
+// Adopt data/portfolio.json. Returns true when the file supplied state.
+//
+// In local mode this file IS the store — every save goes through server.py to
+// land here, and it is what Claude, the MCP server, and Vertex read.
+// localStorage is only a fast first paint and an offline fallback, so the file
+// must win whenever it has data. Booting the other way round is a data-loss
+// bug: a browser holding a stale cache skips the read, then the auto price
+// refresh autosaves that stale cache straight over a newer file. Observed
+// 2026-08-02 — a preview browser silently reverted the portfolio by a day,
+// restoring three sold positions.
 async function loadFromServer() {
   try {
     const res = await fetch('data/portfolio.json');
-    if (!res.ok) return;
+    if (!res.ok) return false;
     const data = await res.json();
-    if (!data.holdings?.length) return;
+    if (!data.holdings?.length) return false;
     holdings = data.holdings;
     if (data.targets) targets = data.targets;
     if (data.lastSaved) lastSaved = data.lastSaved;
@@ -3497,8 +4011,8 @@ async function loadFromServer() {
     // History may have rendered before transactions arrived — recompute the
     // TWR/MWR header now that external flows are known.
     renderPerformanceChart();
-    toast('Portfolio loaded from file ✓');
-  } catch (e) {}
+    return true;
+  } catch (e) { return false; }
 }
 
 if (IS_SHELL) {
@@ -3510,10 +4024,14 @@ if (IS_SHELL) {
   // Local mode: finish loading the file-backed state BEFORE the cloud client
   // arbitrates — syncing against a half-loaded state could push emptiness.
   (async () => {
-    if (holdings.length === 0) await loadFromServer();
+    const hadCache = holdings.length > 0;
+    // Always read the file — see loadFromServer. Never gate this on whether
+    // localStorage happened to have something.
+    const fromFile = await loadFromServer();
+    if (fromFile && !hadCache) toast('Portfolio loaded from file ✓');
     // Accrue any contributions that came due since the last visit (the
-    // server path runs this inside loadFromServer; idempotent).
-    else applyContributionRules();
+    // file path runs this inside loadFromServer; idempotent).
+    if (!fromFile) applyContributionRules();
     await loadHistory();
     renderPerformanceChart();
     // Continuous two-way cloud sync when signed in; otherwise the button

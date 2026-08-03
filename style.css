@@ -548,6 +548,112 @@ td select { padding-right: 24px; }
 
 input[type="file"] { display: none; }
 
+/* ── Advisor: market strip + drift vs policy ── */
+.subsection-flex {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.mkt-row {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px;
+  font-size: 13px; padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.mkt-row:last-of-type { border-bottom: none; }
+.mkt-tick { font-weight: 600; min-width: 104px; }
+.mkt-last { font-variant-numeric: tabular-nums; min-width: 84px; }
+.mkt-move { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--text-secondary); }
+.mkt-up   { color: #15803d; }
+.mkt-down { color: #dc2626; }
+[data-theme="dark"] .mkt-up   { color: #4ade80; }
+[data-theme="dark"] .mkt-down { color: #f87171; }
+.mkt-off { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+.mkt-na  { font-size: 12px; color: var(--text-muted); }
+
+.drift-head { font-size: 14px; margin: 4px 0 10px; }
+.drift-ok     { color: #15803d; }
+.drift-breach { color: #b45309; }
+[data-theme="dark"] .drift-ok     { color: #4ade80; }
+[data-theme="dark"] .drift-breach { color: #fbbf24; }
+.drift-rows { margin-bottom: 8px; max-width: 560px; }
+.drift-row {
+  display: grid; grid-template-columns: minmax(88px, 1.6fr) repeat(3, minmax(64px, 0.8fr));
+  gap: 10px; align-items: baseline;
+  font-size: 13px; padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+}
+.drift-row:last-child { border-bottom: none; }
+.drift-row .num { text-align: right; font-variant-numeric: tabular-nums; }
+.drift-row-breach { font-weight: 600; }
+.drift-sub { display: block; font-size: 11px; font-weight: 400; color: var(--text-muted); }
+/* Typed as input[type="number"] so it must out-specify the global field style
+   that stretches every input to 100% — these two sit inline inside a sentence. */
+input.band-input {
+  width: 52px; display: inline-block; vertical-align: baseline;
+  padding: 1px 5px; min-height: 0; font-size: 12px; text-align: center;
+}
+@media (max-width: 640px) {
+  .mkt-tick { min-width: 100%; }
+  .mkt-off { margin-left: 0; }
+  .drift-row { grid-template-columns: 1fr repeat(3, minmax(58px, auto)); gap: 6px; }
+  .band-input { font-size: 16px; }
+}
+
+/* ── Advisor: attribution ── */
+.attrib-picker { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.attrib-on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.attrib-head { font-size: 14px; margin: 4px 0 10px; }
+.attrib-rows { margin-bottom: 6px; max-width: 680px; }
+.attrib-row {
+  display: grid;
+  grid-template-columns: minmax(110px, 1.6fr) repeat(3, minmax(62px, 0.8fr)) 56px;
+  gap: 10px; align-items: baseline;
+  font-size: 13px; padding: 5px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.attrib-row:last-child { border-bottom: none; }
+.attrib-row .num { text-align: right; font-variant-numeric: tabular-nums; }
+.attrib-bar {
+  display: block; height: 6px; border-radius: 3px;
+  background: var(--bar-bg); overflow: hidden; align-self: center;
+}
+.attrib-bar i { display: block; height: 100%; border-radius: 3px; }
+.bar-up   { background: #15803d; }
+.bar-down { background: #dc2626; }
+[data-theme="dark"] .bar-up   { background: #4ade80; }
+[data-theme="dark"] .bar-down { background: #f87171; }
+@media (max-width: 640px) {
+  .attrib-row { grid-template-columns: 1fr repeat(3, minmax(56px, auto)); gap: 6px; }
+  .attrib-bar { display: none; }   /* the numbers already carry it on mobile */
+}
+
+/* A relocation saving is an opportunity, not a warning — it gets the neutral
+   accent, not the amber the drift breach uses. */
+.loc-head { font-size: 14px; margin: 4px 0 10px; }
+.loc-swap { color: #1d4ed8; }
+[data-theme="dark"] .loc-swap { color: #93b4fc; }
+.loc-rows { margin: 10px 0 4px; max-width: 640px; }
+.loc-row {
+  display: grid; grid-template-columns: minmax(120px, 1.8fr) repeat(3, minmax(66px, 0.9fr));
+  gap: 10px; align-items: baseline;
+  font-size: 13px; padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+}
+.loc-row:last-child { border-bottom: none; }
+.loc-head-row {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.03em; color: var(--text-muted);
+  border-bottom: 1px solid var(--border); padding-bottom: 4px;
+}
+.loc-row .num { text-align: right; font-variant-numeric: tabular-nums; }
+.loc-plan { margin: 2px 0 6px; }
+.loc-plan .risk-line { margin: 3px 0; }
+.loc-hint { color: #b45309; }
+[data-theme="dark"] .loc-hint { color: #fbbf24; }
+.band-check { white-space: nowrap; }
+.band-check input { width: auto; min-height: 0; margin-right: 3px; vertical-align: middle; }
+@media (max-width: 640px) {
+  .loc-row { grid-template-columns: 1fr repeat(3, minmax(58px, auto)); gap: 6px; }
+}
+
 /* ── Risk & Exposure card ── */
 .risk-line { font-size: 14px; margin: 4px 0 2px; }
 .risk-line.risk-over { color: #dc2626; }
@@ -565,39 +671,6 @@ input[type="file"] { display: none; }
 }
 .risk-bar > span { display: block; height: 100%; background: var(--navy); border-radius: 4px; }
 .risk-row .num { text-align: right; font-variant-numeric: tabular-nums; }
-
-/* ── Tax card ── */
-.tax-rates { font-size: 12px; font-weight: 400; color: var(--text-secondary); }
-.tax-rates input {
-  width: 48px; padding: 4px 6px; font-size: 13px; text-align: right;
-  border: 1px solid var(--border-default); border-radius: 6px;
-  background: var(--bg-input); color: var(--text-primary);
-}
-.tax-rows { margin: 4px 0; }
-.tax-row {
-  display: grid; grid-template-columns: 1.4fr 1fr 0.8fr auto;
-  gap: 10px; align-items: center;
-  font-size: 13px; padding: 6px 0;
-  border-bottom: 1px solid var(--border-subtle);
-}
-.tax-row:last-child { border-bottom: none; }
-.tax-row .num { text-align: right; font-variant-numeric: tabular-nums; }
-.tax-sub { display: block; font-size: 11px; color: var(--text-muted); }
-.tax-cov { font-size: 11px; color: #d97706; }
-.tax-loss { color: #dc2626; }
-[data-theme="dark"] .tax-loss { color: #f87171; }
-.tax-wash { display: block; font-size: 12px; color: #d97706; }
-.tax-edit-form { font-size: 12px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-.tax-edit-form input {
-  padding: 6px 8px; font-size: 13px;
-  border: 1px solid var(--border-default); border-radius: 6px;
-  background: var(--bg-input); color: var(--text-primary);
-  width: 90px;
-}
-.tax-edit { grid-template-columns: minmax(120px, 0.6fr) 2fr; }
-@media (max-width: 640px) {
-  .tax-row { grid-template-columns: 1fr auto; grid-auto-flow: dense; }
-}
 
 /* ── Import kind picker (true-up vs reinvested dividend) ── */
 .imp-kind {
@@ -719,7 +792,7 @@ input[type="file"] { display: none; }
   .btn { min-height: 44px; }
   .header-actions .btn, .theme-toggle { min-height: 40px; }
   input, select { font-size: 16px; min-height: 40px; }
-  .tax-rates input, .tax-edit-form input, .imp-kind { font-size: 16px; }
+  .imp-kind { font-size: 16px; }
   .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   table { min-width: 560px; }
 }
