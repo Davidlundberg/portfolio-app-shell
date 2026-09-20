@@ -56,7 +56,10 @@
            the only one that earns a permanent slot. -->
       <details class="hdr-more">
         <summary class="btn btn-ghost" aria-label="More actions">⋯</summary>
-        <div class="hdr-more-menu">
+        <!-- Picking an action closes the menu. It used to stay open, and once the
+             cards were back inside the column it sat on top of the import
+             preview's "Import N holdings" button on a first import. -->
+        <div class="hdr-more-menu" onclick="this.parentElement.open=false">
           <button class="btn btn-ghost" onclick="triggerImportCSV()">📋 Import CSV</button>
           <button class="btn btn-ghost" onclick="exportCSV()">↓ Export CSV</button>
           <button class="btn btn-ghost" onclick="saveToFile()" title="Save a full JSON backup (holdings + ledger)">⤓ Backup</button>
@@ -94,7 +97,31 @@
     </div>
   </div>
 
+  <!-- Ask. Its own card, outside #advContext: the Advisor rewrites that node on
+       every render, which used to wipe a half-typed question. Nothing in here
+       is computed from the portfolio until a question is sent. -->
+  <div class="card" id="askCard" style="display:none;">
+    <div class="ask-head">
+      <h2>Ask</h2>
+      <button type="button" class="ask-link" id="askClear" onclick="clearAskThread()" style="display:none;">Clear</button>
     </div>
+    <div id="askThread" aria-live="polite"></div>
+    <div class="ask-box">
+      <textarea id="askInput" rows="1" maxlength="2000" enterkeyhint="send" autocomplete="off"
+        aria-label="Ask anything about your portfolio"
+        placeholder="Ask anything about your portfolio…"
+        oninput="askAutoGrow(this)" onkeydown="askKeydown(event)"></textarea>
+      <button type="button" class="btn btn-primary" id="askSend" onclick="submitAsk()">Ask</button>
+    </div>
+    <p class="ask-signin" id="askSignin" style="display:none;">
+      <button type="button" class="ask-link" onclick="document.getElementById('btnCloud')?.click()">Sign in with ☁</button>
+      to ask.
+    </p>
+    <div class="ask-chips" id="askChips"></div>
+    <p class="risk-note ask-note">Your numbers — holdings, targets, ledger, history, tax settings — go
+      through your private cloud function to Anthropic's Claude to be answered; no account ids or
+      logins are sent. It explains and does the arithmetic. It won't pick investments or predict
+      markets.</p>
   </div>
 
   <!-- Import Preview (hidden until CSV loaded) -->
@@ -189,7 +216,9 @@
       <div class="form-group">
         <label for="iAccount">Account</label>
         <select id="iAccount"></select>
-      </details>
+      </div>
+    </div>
+  </details>
 
   <!-- Chart + Legend -->
   <div class="bottom-row">
@@ -275,17 +304,9 @@
         <label for="advAccount">Account (optional)</label>
         <select id="advAccount"></select>
       </div>
-      <div class="form-group">
-        <label>&nbsp;</label>
-        <button class="btn btn-primary" onclick="computeAdvisorRec()">Get Recommendation</button>
-      </div>
-      <div class="form-group">
-        <label>&nbsp;</label>
-        <button class="btn btn-ghost" onclick="runRebalancePlan(false)" title="Where should new money go? Buys only.">Rebalance Plan</button>
-      </div>
-      <div class="form-group">
-        <label>&nbsp;</label>
-        <button class="btn btn-ghost" onclick="runRebalancePlan(true)" title="Full rebalance to targets — includes sells (tax warnings shown).">Full Rebalance</button>
+      <div class="adv-actions">
+        <button class="btn btn-primary" onclick="computeAdvisorRec()" title="Where should new money go? Buys only.">Get Recommendation</button>
+        <button class="btn btn-ghost" onclick="runFullRebalance()" title="Full rebalance to targets — includes sells (tax warnings shown).">Full Rebalance</button>
       </div>
     </div>
     <div id="advResult">

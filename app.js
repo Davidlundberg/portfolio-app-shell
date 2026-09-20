@@ -1370,6 +1370,17 @@ function renderRiskCard() {
 // doesn't masquerade as growth. Per-device by design (localStorage).
 const LAST_LOOK_KEY = 'portfolio_last_look';
 let lastLookDone = false;
+// The look the chip compared against. Kept because the stored stamp is
+// overwritten with THIS visit straight after, and Ask answers the same question.
+let lastLookPrev = null;
+
+// Change since a previous look, minus what was paid in since.
+function sinceLook(prev) {
+  const flowsIn = externalFlows(transactions)
+    .filter(f => f.date > prev.date)
+    .reduce((s, f) => s + f.amount, 0);
+  return { flowsIn, delta: total() - prev.value - flowsIn };
+}
 
 function renderLastLookChip() {
   if (lastLookDone || !holdings.length || !(total() > 0)) return;
@@ -1379,10 +1390,8 @@ function renderLastLookChip() {
   let prev = null;
   try { prev = JSON.parse(localStorage.getItem(LAST_LOOK_KEY)); } catch { /* ignore */ }
   if (prev && prev.value > 0 && Date.now() - prev.ts > 6 * 3600000) {
-    const flowsSince = externalFlows(transactions)
-      .filter(f => f.date > prev.date)
-      .reduce((s, f) => s + f.amount, 0);
-    const delta = total() - prev.value - flowsSince;
+    lastLookPrev = prev;
+    const { flowsIn: flowsSince, delta } = sinceLook(prev);
     const pct = Math.abs(delta / prev.value * 100);
     const sign = delta >= 0 ? '+' : '−';
     const when = new Date(prev.ts).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
@@ -1918,6 +1927,9 @@ function runFireSim() {
   const sigma = parseFloat(document.getElementById('fireSigma').value) / 100;
   const out = document.getElementById('fireResult');
   if (!(spend > 0)) { out.innerHTML = '<p class="adv-placeholder">Enter your target annual spending.</p>'; return; }
+  // The one FIRE input with no derivable default. Kept with the targets so it
+  // syncs like them — and so Ask can answer "am I on pace?" without the card.
+  if (targets.fireAnnualSpend !== spend) { targets.fireAnnualSpend = spend; markUnsaved(); }
   const sim = simulateFire({
     start: total(), monthlyContrib: contrib, annualSpend: spend,
     muAnnual: isNaN(mu) ? 0.04 : mu, sigmaAnnual: isNaN(sigma) ? 0.12 : sigma,
@@ -1937,10 +1949,9 @@ function runFireSim() {
         Unlucky (p90): <strong>${sim.p90Years === null ? '>50' : sim.p90Years} yrs</strong>
         ${sim.neverPct > 0 ? ` · never within 50 yrs: ${sim.neverPct}%` : ''}
       </div>
-      <table style="font-size:13px;border-collapse:collapse;margin-top:8px;">
-        <tr style="color:var(--text-secondary);"><td style="padding:2px 14px 2px 0;">Reaching FI within…</td>${[10, 15, 20, 25, 30].map(y => `<td style="padding:2px 12px;text-align:center;">${y}y</td>`).join('')}</tr>
-        <tr><td style="padding:2px 14px 2px 0;color:var(--text-secondary);">Probability</td>${[10, 15, 20, 25, 30].map(y => `<td style="padding:2px 12px;text-align:center;font-weight:600;">${sim.successByYears[y]}%</td>`).join('')}</tr>
-      </table>`;
+      <div class="fire-odds-label">Probability of reaching FI within…</div>
+      <div class="fire-odds" role="list">${[10, 15, 20, 25, 30].map(y =>
+        `<div class="fire-odds-cell" role="listitem" data-years="${y}"><span class="fire-odds-h">${y}y</span><span class="fire-odds-v">${sim.successByYears[y]}%</span></div>`).join('')}</div>`;
   }
   html += `<div style="font-size:11px;color:var(--text-secondary);margin-top:8px;">${esc(sim.assumptionNote || '')} · today's dollars · a model, not advice</div></div>`;
   out.innerHTML = html;
@@ -1953,6 +1964,8 @@ function renderFireDefaults() {
   if (holdings.length === 0) return;
   const contribEl = document.getElementById('fireContrib');
   if (contribEl && !contribEl.value) contribEl.value = String(monthlyContribFromRules() || '');
+  const spendEl = document.getElementById('fireSpend');
+  if (spendEl && !spendEl.value && targets.fireAnnualSpend > 0) spendEl.value = String(targets.fireAnnualSpend);
   const { mu, sigma } = blendedAssumptions(holdings);
   const muEl = document.getElementById('fireMu');
   const sigmaEl = document.getElementById('fireSigma');
@@ -2603,6 +2616,8 @@ function render() {
   const hasHoldings = holdings.length > 0;
   document.getElementById('allocStratCard').style.display = hasHoldings ? '' : 'none';
   document.getElementById('advisorCard').style.display    = hasHoldings ? '' : 'none';
+  document.getElementById('askCard').style.display        = hasHoldings ? '' : 'none';
+  renderAskState();
   if (hasHoldings) {
     renderGapTable();
     updateAdvisorAccounts();
@@ -3723,105 +3738,664 @@ function advSection(key, title, bodyFn, teaser) {
     </div>` + (open ? bodyFn() : `<p class="adv-placeholder adv-quiet">${teaser}</p>`);
 }
 
-// ─── Advisor: Ask ────────────────────────────────────────────────────────────
-// The card stopped volunteering conclusions; this is where they moved to. The
-// context is built by the SAME engines that render the sections below, so an
-// answer can never disagree with what the card shows.
+// ─── Ask ─────────────────────────────────────────────────────────────────────
+// A general conversation about his own portfolio, in its own card. The cards
+// stopped volunteering conclusions; this is where they moved to. The brief is
+// built by the SAME engines that render the page, so an answer can never
+// disagree with what is on screen — and it is built at submit time only, so
+// the card shows nothing derived from his data until he asks.
 //
-// Only in cloud mode: the question goes to a JWT-gated edge function, so there
-// is no path for it in local mode and the box says so rather than failing.
+// Cloud only: the question goes to a JWT-gated edge function. Signed out, the
+// card says so inline rather than pushing an error into the thread.
+const ASK_THREAD_KEY = 'portfolio_ask_thread_v1';
+const ASK_KEEP_TURNS = 30, ASK_HISTORY_TURNS = 10, ASK_OPEN_TURNS = 2;
 let askBusy = false;
-let askThread = [];   // [{ q, a, error }]
+let askAbort = null;               // the in-flight question's AbortController
+let askShowEarlier = false;
+let askThread = loadAskThread();   // [{ q, a | error, ts }] (+ pending while in flight)
+// Turns restored from an earlier visit start folded away: the page opens quiet,
+// not with last week's answers sitting above the holdings.
+let askRestored = askThread.length;
 
-function askContext() {
+// Dollar amounts named in a question ("where would my next $5,000 go?"), so
+// the brief can carry the rebalance engine's own plan for exactly that sum
+// instead of leaving the model to redo the pro-rata maths. A number counts
+// only when something marks it as money — a $, a k/m suffix, the word
+// "dollars" — or it is a bare figure of 1,000+ that is not a year. "401k",
+// "S&P 500", "5/25", "30%" and "2026" are all deliberately not amounts, and
+// neither is a sum in another currency: "50,000 kr" is not fifty thousand dollars.
+const ASK_MAX_AMOUNTS = 3;
+function askAmounts(text) {
+  const s = String(text || '');
+  const re = /(\$\s*)?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(?:(k|mm|m)\b|\s*(thousand|million|grand)\b)?(\s*(?:dollars|usd|bucks)\b)?/gi;
+  const mult = { k: 1e3, m: 1e6, mm: 1e6, thousand: 1e3, million: 1e6, grand: 1e3 };
+  const out = [];
+  let m;
+  while ((m = re.exec(s)) && out.length < ASK_MAX_AMOUNTS) {
+    const [whole, dollar, intPart, frac, suffix, word, unit] = m;
+    // Part of a word, a decimal, a date or a fraction ("VGIT2", "1.5", "9/20").
+    if (!dollar && /[\w.,\/\-]/.test(s[m.index - 1] || '')) continue;
+    const after = s.slice(m.index + whole.length);
+    if (/^\s*(%|percent|pp\b|bps?\b)/i.test(after)) continue;
+    if (/^\s*(sek|kr|kronor|eur|euros?|gbp|pounds?)\b/i.test(after) || /([€£]|\b(sek|kr|eur|gbp))\s*$/i.test(s.slice(0, m.index))) continue;
+    const n = parseFloat(intPart.replace(/,/g, '') + (frac || ''));
+    const scale = mult[(suffix || word || '').toLowerCase()] || 1;
+    // The account, not four hundred thousand dollars.
+    if (!dollar && /^k$/i.test(suffix || '') && [401, 403, 457].includes(n)) continue;
+    if (!dollar && !suffix && !word && !unit) {
+      if (n < 1000 || /^[\/\-]|^\s*(shares|units|years?|yrs?|months?|days?|weeks?)\b/i.test(after)) continue;
+      if (!intPart.includes(',') && !frac && n >= 1900 && n <= 2100) continue;
+    }
+    const v = +(n * scale).toFixed(2);
+    if (v >= 1 && v <= 1e9 && !out.includes(v)) out.push(v);
+  }
+  return out;
+}
+
+// The portfolio brief: everything the app knows, computed by the SAME engines
+// that render the cards, so an answer can never disagree with the screen. It
+// is a projection layer — no maths of its own beyond shares-of-a-total.
+//
+// Three properties are load-bearing. It has no side effects (no DOM, no
+// network, no markUnsaved). It carries no ids and no employer identity — the
+// employer appears only as an aggregate. And identical data serialises to an
+// identical string: dates not instants, fixed key order — because the server
+// caches the brief between turns and a stray millisecond would miss every time.
+const ASK_LEDGER_ROWS = 60, ASK_SERIES_POINTS = 60, ASK_FX_STAMPS = 30, ASK_LOOKTHROUGH_ROWS = 10;
+
+function askContext(question = '') {
+  const r2 = n => n == null || !isFinite(n) ? null : +(+n).toFixed(2);
+  const r1 = n => n == null || !isFinite(n) ? null : +(+n).toFixed(1);
+  const day = iso => iso ? String(iso).slice(0, 10) : null;
+  const now = Date.now();
+  // Same whole-day age the attention strip and the table badge use.
+  const ageDays = iso => iso ? Math.floor((now - new Date(iso)) / 86400000) : null;
+  const val = h => (+h.quantity || 0) * (+h.price || 0);
+  const acctOf = h => h.account || 'Unassigned';
+  const pctOf = (v, whole) => whole > 0 ? r1(v / whole * 100) : 0;
+
   const tot = total();
+  const held = holdings.filter(h => val(h) > 0);
+  const sleeveVals = getSleeveTotals();
+  const tgtPcts = getSleeveTargetPcts();
+  const acctTotals = getAccountTotals();
+  const bandAbs = +targets.bandAbsPp || 5, bandRel = +targets.bandRelPct || 25;
   const rates = effectiveRates();
-  const d = driftCheck(getSleeveTotals(), getSleeveTargetPcts(), tot,
-                       +targets.bandAbsPp || 5, +targets.bandRelPct || 25);
+  const monthlyIn = monthlyContribution();
+  const ruleFor = h => contributionRules.some(r => r.holdingId === h.id);
+  const notLoaded = [];
+
+  const priceSource = h => hasRealTicker(h) ? 'ticker'
+    : proxyEntryFor(h) ? 'proxy:' + proxyEntryFor(h).proxy
+    : matchesAvanza(h) ? 'avanza-sek' : matchesNavTable(h) ? 'nav-table' : 'manual';
+
+  // ── freshness ──
+  // The over-cap attention label is the one place an engine embeds the
+  // employer's name; it goes out with the name replaced, never verbatim.
+  const emp = employerExposure();
+  const attention = attentionItems().map(it => it.kind === 'risk' && emp
+    ? it.label.split(emp.name).join('Employer') : it.label);
+  const ages = held.map(h => ageDays(h.updated)).filter(a => a != null);
+  const divDates = held.map(h => day(h.dividends?.updated)).filter(Boolean).sort();
+  const snaps = historyData?.snapshots || [];
+  const freshness = {
+    lastSaved: lastSaved ? String(lastSaved).slice(0, 16) : null,
+    mode: IS_SHELL ? 'shell' : 'local',
+    priceAgeDays: ages.length ? { min: Math.min(...ages), max: Math.max(...ages) } : null,
+    attention,
+    proxyCalibrations: held.filter(h => proxyEntryFor(h)).map(h => {
+      const age = ageDays(h.calibration?.date);
+      return { name: h.name, proxy: proxyEntryFor(h).proxy, index: proxyEntryFor(h).index,
+        calibratedOn: day(h.calibration?.date), daysAgo: age,
+        overdue: age == null ? null : age > PROXY_RECAL_NUDGE_DAYS };
+    }),
+    dividendCacheAsOf: divDates[0] || null,
+    historyLastSnapshot: snaps.length ? snaps[snaps.length - 1].date : null,
+  };
+
+  // ── policy ──
+  const benchW = policyWeights(targets);
+  const policy = {
+    targets: { stocks: targets.stocks, bonds: targets.bonds, other: targets.other,
+               us: targets.us, intl: targets.intl, tilts: targets.tilts },
+    sleeveTargetPct: Object.fromEntries(Object.keys(SLEEVE_CONFIG).map(k => [k, r2(tgtPcts[k])])),
+    bands: { absPp: bandAbs, relPct: bandRel },
+    tax: {
+      marginalPct: targets.taxMarginal == null ? DEFAULT_TAX_MARGINAL : +targets.taxMarginal || 0,
+      ltcgPct: targets.taxLtcg == null ? DEFAULT_TAX_LTCG : +targets.taxLtcg || 0,
+      stateLocalPct: +targets.taxStateLocal || 0, niit: !!targets.taxNiit,
+      effectiveOrdinaryPct: r1(rates.ordinary * 100), effectiveQualifiedPct: r1(rates.qualified * 100),
+    },
+    employerCapPct: EMPLOYER_CAP_PCT,
+    // The chart's blended benchmark: his own target mix, `other` left out.
+    benchmarkWeights: benchW && Object.fromEntries(Object.entries(benchW).map(([k, w]) => [k, +w.toFixed(4)])),
+  };
+
+  // ── accounts & holdings ──
+  // Two tax questions, two fields — see taxLocationOf vs TAX_ADVANTAGED_RE.
+  const accounts = Object.entries(acctTotals).filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1]).map(([account, v]) => {
+      const hs = held.filter(h => acctOf(h) === account);
+      const mix = {};
+      for (const k of Object.keys(SLEEVE_CONFIG)) {
+        const sv = hs.filter(h => getSleeve(h) === k).reduce((s, h) => s + val(h), 0);
+        if (sv > 0) mix[k] = r2(sv);
+      }
+      return { account, value: r2(v), pct: pctOf(v, tot), holdings: hs.length,
+        incomeTaxLocation: taxLocationOf({ account }),
+        sellRealisesUsGain: !TAX_ADVANTAGED_RE.test(account), sleeveValues: mix };
+    });
+
+  const holdingRows = held.map(h => {
+    const v = val(h), y = holdingYield(h);
+    return {
+      name: h.name, ticker: hasRealTicker(h) ? h.ticker.toUpperCase() : null, type: h.type,
+      account: acctOf(h), sleeve: getSleeve(h), quantity: h.quantity, price: h.price, value: r2(v),
+      pctOfPortfolio: pctOf(v, tot), pctOfAccount: pctOf(v, acctTotals[acctOf(h)]),
+      pctOfSleeve: pctOf(v, sleeveVals[getSleeve(h)]),
+      priceUpdated: day(h.updated), priceAgeDays: ageDays(h.updated), priceSource: priceSource(h),
+      yieldPct: y == null ? null : r2(y * 100),
+      annualIncome: dividendIncome([h]).rows[0]?.annualIncome ?? null,
+      incomeTaxLocation: taxLocationOf(h), hasContributionRule: ruleFor(h),
+    };
+  });
+
+  // ── drift ── the card's own headline arithmetic: shortfall across breached
+  // underweights, and how many months of standing contributions would close it.
+  // Named for what it counts: a sleeve under target but inside its band adds 0.
+  const d = driftCheck(sleeveVals, tgtPcts, tot, bandAbs, bandRel);
+  const under = (d.breaches || []).filter(r => r.driftDollars < 0);
+  const shortfall = under.reduce((s, r) => s - r.driftDollars, 0);
+  const drift = {
+    anyOutOfBand: d.anyOutOfBand,
+    rows: d.rows.map(r => ({ sleeve: r.sleeve, label: r.label, value: r2(sleeveVals[r.sleeve] || 0),
+      nowPct: r1(r.curPct), targetPct: r1(r.tgtPct), driftPp: r1(r.driftPp), relPct: r1(r.relPct),
+      driftDollars: r2(r.driftDollars), outOfBand: r.outOfBand, reason: r.reason })),
+    outOfBandShortfallDollars: r2(shortfall),
+    monthsToCloseOutOfBandShortfall: r1(monthsToCloseGap(shortfall, monthlyIn)),
+    overweightOutOfBand: (d.breaches || []).filter(r => r.driftDollars > 0).map(r => r.label),
+  };
+
+  // ── concentration ── one instrument held in three accounts is one bet.
+  const byInstr = new Map();
+  for (const h of held) {
+    const key = hasRealTicker(h) ? h.ticker.toUpperCase() : h.name;
+    const p = byInstr.get(key) || { instrument: key, value: 0, accounts: [] };
+    p.value += val(h);
+    if (!p.accounts.includes(acctOf(h))) p.accounts.push(acctOf(h));
+    byInstr.set(key, p);
+  }
+  const positions = [...byInstr.values()].sort((a, b) => b.value - a.value);
+  const concentration = {
+    positions: positions.map(p => ({ instrument: p.instrument, value: r2(p.value),
+      pct: pctOf(p.value, tot), accounts: p.accounts })),
+    over20Pct: positions.filter(p => tot > 0 && p.value / tot * 100 > 20).map(p => p.instrument),
+    // Aggregate only: no name, no tickers, no parts. "None held" and "none
+    // configured" are different facts, so neither is left as a bare null.
+    employer: emp ? { configured: true, value: r2(emp.value), pct: r1(emp.pct), capPct: EMPLOYER_CAP_PCT,
+                      over: emp.pct > EMPLOYER_CAP_PCT }
+      : targets.employerName || employerConfig().tickers.length
+        ? { configured: true, value: 0, pct: 0, capPct: EMPLOYER_CAP_PCT, over: false }
+        : { configured: false },
+    lookThrough: { asOf: FUND_TOP_HOLDINGS.asOf, lowerBound: true,
+      rows: lookThroughExposure().slice(0, ASK_LOOKTHROUGH_ROWS)
+        .map(r => ({ company: r.company, value: r2(r.value), pct: r1(r.pct) })) },
+  };
+
+  // ── contributions ──
+  const rules = contributionRules.map(r => {
+    const h = holdings.find(x => x.id === r.holdingId) || holdings.find(x => x.name === r.holdingName);
+    return { holding: h?.name || r.holdingName, account: h ? acctOf(h) : null,
+      sleeve: h ? getSleeve(h) : null, amount: r.amount,
+      cadence: CADENCE_LABELS[r.cadence] || r.cadence,
+      monthlyEquivalent: r2(monthlyContribution([r])), nextDate: ruleNextDate(r) };
+  });
+  const bySleeveMonthly = {};
+  for (const k of Object.keys(SLEEVE_CONFIG)) {
+    const sum = rules.filter(r => r.sleeve === k).reduce((s, r) => s + r.monthlyEquivalent, 0);
+    if (sum > 0) bySleeveMonthly[k] = r2(sum);
+  }
+  const contributions = { monthlyTotal: r2(monthlyIn), rules, bySleeveMonthly };
+
+  // ── ledger ── by name, never by id. The id is still what says which ACCOUNT
+  // a row belongs to — one fund can sit in two — so it is resolved here. A row
+  // whose holding is gone falls back to its name only when that is unambiguous.
+  const flows = externalFlows(transactions);
+  const txSorted = transactions.slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const txAccount = t => {
+    const h = holdings.find(x => x.id === t.holdingId);
+    if (h) return acctOf(h);
+    const named = [...new Set(holdings.filter(x => x.name === t.holdingName).map(acctOf))];
+    return named.length === 1 ? named[0] : null;
+  };
+  const byKind = {}, byMonth = {}, byHolding = new Map(), byAccount = {};
+  for (const t of txSorted) {
+    const amt = +t.amount || 0, account = txAccount(t);
+    const k = byKind[t.kind] = byKind[t.kind] || { n: 0, dollars: 0, estimatedN: 0 };
+    k.n++; k.dollars = r2(k.dollars + amt); if (t.estimated) k.estimatedN++;
+    const mo = String(t.date).slice(0, 7);
+    (byMonth[mo] = byMonth[mo] || {})[t.kind] = r2((byMonth[mo][t.kind] || 0) + amt);
+    const hKey = t.holdingName + '\n' + account;
+    const hh = byHolding.get(hKey) || { holding: t.holdingName, account, n: 0, units: 0, dollars: 0 };
+    hh.n++; hh.units = +(hh.units + (+t.units || 0)).toFixed(6); hh.dollars = r2(hh.dollars + amt);
+    byHolding.set(hKey, hh);
+    const aa = byAccount[account || 'unknown'] = byAccount[account || 'unknown'] || { n: 0, dollars: 0, byKind: {} };
+    aa.n++; aa.dollars = r2(aa.dollars + amt); aa.byKind[t.kind] = r2((aa.byKind[t.kind] || 0) + amt);
+  }
+  const ledger = {
+    epoch: LEDGER_EPOCH, count: transactions.length,
+    firstDate: txSorted.length ? day(txSorted[0].date) : null,
+    lastDate: txSorted.length ? day(txSorted[txSorted.length - 1].date) : null,
+    byKind, byMonth, byHolding: [...byHolding.values()], byAccount,
+    externalFlowsTotal: r2(flows.reduce((s, f) => s + f.amount, 0)),
+    recordedIncome: r2(recordedIncome(transactions)),
+    rows: txSorted.slice(-ASK_LEDGER_ROWS).reverse().map(t => ({ date: day(t.date), kind: t.kind,
+      holding: t.holdingName, account: txAccount(t), units: t.units, unitPrice: t.unitPrice,
+      amount: t.amount, source: t.source, estimated: !!t.estimated })),
+  };
+
+  // ── income ──
+  const inc = dividendIncome(holdings);
+  const incByAccount = {};
+  for (const r of inc.rows) incByAccount[r.account] = r2((incByAccount[r.account] || 0) + r.annualIncome);
+  const income = {
+    totalAnnual: inc.totalAnnual, monthlyAvg: inc.monthlyAvg,
+    accumulatingExcluded: inc.accumulatingExcluded,
+    rows: inc.rows.map(r => ({ name: r.name, ticker: r.ticker, account: r.account, perShare: r.perShare,
+      annualIncome: r.annualIncome, yieldPct: r.yieldPct, payments: r.payments, months: r.months })),
+    byAccount: incByAccount,
+    taxableAccountIncome: r2(inc.rows.filter(r => taxLocationOf(r) === 'taxable')
+      .reduce((s, r) => s + r.annualIncome, 0)),
+  };
+
+  // ── asset location ── the engine's rows hold live holding objects (ids and
+  // all); only plain fields leave this function.
   const loc = assetLocationSwap();
+  const side = x => ({ holding: x.h.name, account: acctOf(x.h), sleeve: getSleeve(x.h) });
+  const assetLocation = {
+    rows: loc.rows.map(r => ({ holding: r.h.name, account: acctOf(r.h), location: r.loc,
+      value: r2(r.value), yieldPct: r2(r.yield * 100), yieldEstimated: r.estimated, taxedAs: r.kind,
+      annualCostIfTaxable: r2(r.rate * r.value),
+      annualCostToday: r.loc === 'taxable' ? r2(r.rate * r.value) : 0 })),
+    swap: loc.swap ? { moveIntoShelter: side(loc.swap.into), moveOutToTaxable: side(loc.swap.out),
+      amount: r2(loc.swap.amount), annualSaving: r2(loc.swap.annualSaving),
+      currentCost: r2(loc.swap.currentCost), estimatedYieldUsed: loc.swap.estimated } : null,
+    foreignPensionExcluded: true,
+  };
+
+  // ── performance ── whole-portfolio snapshots only; true returns only from
+  // the ledger epoch, because before it nobody recorded what was paid in.
+  let performance = null;
+  if (snaps.length >= 2) {
+    const first = snaps[0], last = snaps[snaps.length - 1];
+    const post = snaps.filter(s => s.date >= LEDGER_EPOCH);
+    const flowsIn = (from, to) => flows.filter(f => f.date > from && f.date <= to)
+      .reduce((s, f) => s + f.amount, 0);
+    const twr = computeTWR(post, flows);
+    const mwr = spanDays(post) >= MWR_MIN_SPAN_DAYS ? computeMWR(post, flows) : null;
+    const atOrBefore = dstr => { let f = null; for (const s of snaps) { if (s.date <= dstr) f = s; else break; } return f; };
+    // The S&P 500 yardstick the snapshots already carry, between the same two
+    // snapshots as the figure beside it. Price only — SPY's dividends are not in it.
+    const spyPct = (a, b) => a.spyPrice > 0 && b.spyPrice > 0 ? r2((b.spyPrice / a.spyPrice - 1) * 100) : null;
+    const windows = [['7d', 7], ['30d', 30], ['90d', 90], ['ytd', null]].map(([label, days]) => {
+      // A window only exists if history reaches back to where it opens — a
+      // "90d" figure quietly covering seven weeks would be a trap.
+      const s0 = atOrBefore(windowStartDate({ days }, now));
+      if (!s0 || s0 === last) return null;
+      const F = flowsIn(s0.date, last.date);
+      const w = s0.date >= LEDGER_EPOCH ? computeTWR(snaps.filter(s => s.date >= s0.date), flows) : null;
+      return { window: label, from: s0.date, to: last.date, valueChange: r2(last.value - s0.value),
+        flowsIn: r2(F), changeExFlows: r2(last.value - s0.value - F), twrPct: w == null ? null : r2(w * 100),
+        spyPricePct: spyPct(s0, last) };
+    }).filter(Boolean);
+    let hw = first;
+    for (const s of snaps) if (s.value > hw.value) hw = s;
+    const step = (snaps.length - 1) / (ASK_SERIES_POINTS - 1);
+    const picks = snaps.length <= ASK_SERIES_POINTS ? snaps
+      : [...new Set(Array.from({ length: ASK_SERIES_POINTS }, (_, i) => Math.round(i * step)))].map(i => snaps[i]);
+    // The chart's own "vs policy" figure — only if its blended series is already
+    // in memory, and was built from the targets he has now.
+    let vsPolicy = null;
+    const policyWarm = policyCache && benchW && policyCache.key.endsWith(':' + JSON.stringify(benchW));
+    if (policyWarm && twr != null && post.length >= 2) {
+      const [p0, p1] = samplePolicyAt(policyCache.series, [post[0].date, last.date]);
+      if (p0 > 0 && p1 != null) vsPolicy = { from: post[0].date, to: last.date,
+        policyTotalReturnPct: r2((p1 / p0 - 1) * 100), twrMinusPolicyPct: r2((twr - (p1 / p0 - 1)) * 100) };
+    }
+    if (!policyWarm) notLoaded.push('Blended policy benchmark — it loads with the chart in the Performance card, and has not loaded this session');
+    performance = {
+      snapshots: { count: snaps.length, first: first.date, last: last.date },
+      valueChangeSinceFirstSnapshot: { dollars: r2(last.value - first.value),
+        pct: first.value > 0 ? r1((last.value / first.value - 1) * 100) : null, includesMoneyPaidIn: true },
+      sinceLedgerEpoch: post.length >= 2 ? { from: post[0].date, twrPct: twr == null ? null : r2(twr * 100),
+        mwrAnnualPct: mwr == null ? null : r1(mwr * 100),
+        flowsIn: r2(flowsIn(post[0].date, last.date)), spyPricePct: spyPct(post[0], last) } : null,
+      vsPolicyBenchmark: vsPolicy,
+      windows,
+      highWater: { date: hw.date, value: r2(hw.value),
+        currentVsHighPct: hw.value > 0 ? r1((last.value / hw.value - 1) * 100) : null },
+      seriesColumns: ['date', 'value', 'spyPrice'],
+      series: picks.map(s => [s.date, r2(s.value), r2(s.spyPrice)]),
+      spyNote: 'spyPrice / spyPricePct: S&P 500 (SPY) price only, no dividends',
+    };
+  } else {
+    notLoaded.push('Performance history — it needs at least two daily value snapshots; they are recorded automatically as the app is used');
+  }
+
+  // ── since last look ── the home screen's own line, against the same earlier
+  // visit. Read from memory: the stored stamp already belongs to this visit.
+  const look = lastLookPrev && sinceLook(lastLookPrev);
+  const sinceLastLook = look ? { date: lastLookPrev.date, valueThen: r2(lastLookPrev.value),
+    valueChange: r2(tot - lastLookPrev.value), flowsIn: r2(look.flowsIn), changeExFlows: r2(look.delta) } : null;
+
+  // ── fx ──
+  const sek = sekDecomposition();
+  const sekHolding = sek && holdings.find(h => h.name === sek.name && Array.isArray(h.fxHistory) && h.fxHistory.length >= 2);
+  const fx = sek && sekHolding ? {
+    fund: sek.name, from: sek.from, to: sek.to, fundInKronorPct: r2(sek.local * 100),
+    kronaVsDollarPct: r2(sek.fx * 100), netUsdPct: r2(sek.net * 100),
+    sekExposedValue: r2(held.filter(h => matchesAvanza(h) || (Array.isArray(h.fxHistory) && h.fxHistory.length))
+      .reduce((s, h) => s + val(h), 0)),
+    stamps: { columns: ['date', 'navSek', 'usdPerSek'],
+      rows: sekHolding.fxHistory.slice(-ASK_FX_STAMPS).map(r => [r.date, r.nav, r.rate]) },
+  } : null;
+
+  // ── fire ── one run with the card's own defaults (the rounded figures its
+  // inputs show), and only once a spending number has been saved.
+  const ba = blendedAssumptions(holdings);
+  const muPct = +(ba.mu * 100).toFixed(1), sigmaPct = +(ba.sigma * 100).toFixed(1);
+  const spend = +targets.fireAnnualSpend > 0 ? +targets.fireAnnualSpend : null;
+  const sim = spend ? simulateFire({ start: tot, monthlyContrib: monthlyContribFromRules(), annualSpend: spend,
+    muAnnual: muPct / 100, sigmaAnnual: sigmaPct / 100, seed: 42 }) : null;
+  const fire = {
+    start: r2(tot), monthlyContribDefault: monthlyContribFromRules(), muRealPct: muPct, sigmaPct,
+    swrPct: 4, annualSpend: spend,
+    // Where muRealPct / sigmaPct come from — the app's own table, not a forecast.
+    assumptions: {
+      perSleeve: Object.fromEntries(Object.entries(SLEEVE_ASSUMPTIONS).map(([k, a]) =>
+        [k, { realReturnPct: r2(a.mu * 100), volatilityPct: r2(a.sigma * 100) }])),
+      basis: 'blended by CURRENT holding weights (not targets); volatility is a weighted average that ignores diversification; returns are real (after inflation)',
+    },
+    simulation: sim ? { fiTarget: sim.fiTarget, alreadyFI: sim.alreadyFI, medianYears: sim.medianYears,
+      p10Years: sim.p10Years, p90Years: sim.p90Years, neverWithin50YearsPct: sim.neverPct,
+      successByYears: sim.successByYears } : null,
+  };
+  if (!sim) {
+    fire.note = 'No annual spending saved, so no simulation was run.';
+    notLoaded.push("Annual spending for the FIRE estimate — enter it in the 'When does work become optional?' card");
+  }
+
+  // ── scenarios ── the rebalance engine's own plans, including one for each
+  // dollar amount the question names.
+  const plan = (amount, allowSells) => {
+    const p = rebalancePlan(holdings, targets, amount, { allowSells });
+    return p ? { amount: r2(amount), totalBefore: p.totalBefore, totalAfter: p.totalAfter,
+      rows: p.rows.map(r => ({ sleeve: r.sleeve, label: r.label, action: r.action, amount: r.amount,
+        suggestion: r.suggestion, note: r.note })), warnings: p.warnings } : null;
+  };
+  const scenarios = {
+    fullRebalanceToTargets: plan(0, true),
+    oneMonthOfContributions: monthlyIn > 0 ? plan(monthlyIn, false) : null,
+    newMoney: askAmounts(question).map(a => plan(a, false)).filter(Boolean),
+  };
+
+  // ── session caches ── attached only if he already loaded them.
+  const delta = x => x ? { abs: r2(x.abs), pct: r2(x.pct) } : null;
+  const market = marketData ? {
+    fetched: String(marketData.fetched).slice(0, 16),
+    rows: marketData.rows.filter(r => r.snap).map(r => ({ ticker: r.ticker, label: r.label, macro: !!r.macro,
+      last: r2(r.snap.last), asOfDate: r.snap.asOfDate, d1: delta(r.snap.d1), d30: delta(r.snap.d30),
+      ytd: delta(r.snap.ytd), d365: delta(r.snap.d365), high52: r2(r.snap.high52),
+      offHighPct: r1(r.snap.offHighPct) })),
+  } : null;
+  if (!market) notLoaded.push('Market moves — tap ↻ Refresh market in the Advisor card');
+  const A = attribData?.result;
+  const attributionOut = A ? {
+    window: attribData.win.label, since: attribData.sinceDate,
+    rows: A.rows.map(r => ({ holding: r.h.name, account: acctOf(r.h), startValue: r2(r.startValue),
+      nowValue: r2(r.nowValue), paidIn: r2(r.contributed), marketGain: r2(r.marketGain),
+      pricePct: r2(r.pricePct), basis: r.basis })),
+    totals: { startValue: r2(A.startValue), nowValue: r2(A.nowValue), paidIn: r2(A.contributed),
+      marketGain: r2(A.marketGain), totalChange: r2(A.totalChange) },
+    notAttributable: A.skipped.map(x => ({ holding: x.h.name, reason: x.reason })),
+  } : null;
+  if (!attributionOut) notLoaded.push('What moved your money (attribution) — pick a window in the Advisor card');
+
   return {
-    asOf: new Date().toISOString().slice(0, 10),
-    totalValue: +tot.toFixed(2),
-    // Names and accounts only — no ids, no ledger, no personal identifiers.
-    holdings: holdings.filter(h => h.quantity * h.price > 0).map(h => ({
-      name: h.name, ticker: h.ticker && h.ticker !== 'N/A' ? h.ticker : null,
-      account: h.account || null, sleeve: getSleeve(h),
-      value: +(h.quantity * h.price).toFixed(2),
-      yieldPct: holdingYield(h) == null ? null : +(holdingYield(h) * 100).toFixed(2),
-    })),
-    targets: { ...targets, employerName: undefined, employerTickers: undefined },
-    bands: { absPp: +targets.bandAbsPp || 5, relPct: +targets.bandRelPct || 25 },
-    taxRates: { ordinaryPct: +(rates.ordinary * 100).toFixed(1),
-                qualifiedPct: +(rates.qualified * 100).toFixed(1) },
-    drift: d.rows.map(r => ({ sleeve: r.label, nowPct: +r.curPct.toFixed(1),
-      targetPct: +r.tgtPct.toFixed(1), driftDollars: +r.driftDollars.toFixed(2),
-      outOfBand: r.outOfBand })),
-    monthlyContribution: +monthlyContribution().toFixed(2),
-    assetLocation: loc.swap ? {
-      sellFrom: loc.swap.into.h.name, sellAccount: loc.swap.into.h.account,
-      amount: +loc.swap.amount.toFixed(2),
-      annualSaving: +loc.swap.annualSaving.toFixed(2),
-      estimatedYieldUsed: loc.swap.estimated,
-    } : null,
-    attribution: attribData ? {
-      since: attribData.sinceDate,
-      totalChange: +attribData.result.totalChange.toFixed(2),
-      paidIn: +attribData.result.contributed.toFixed(2),
-      market: +attribData.result.marketGain.toFixed(2),
-      coveredValue: +attribData.result.nowValue.toFixed(2),
-      notAttributable: attribData.result.skipped.map(x => x.h.name),
-    } : null,
-    marketAsOf: marketData?.rows?.find(r => r.snap)?.snap.asOfDate || null,
+    schema: 'portfolio-brief/1',
+    nyDate: nyToday(now),
+    freshness, policy,
+    totals: { totalValue: r2(tot), holdings: held.length, accounts: accounts.length },
+    accounts, holdings: holdingRows, drift, concentration, contributions, ledger, income,
+    assetLocation, performance, sinceLastLook, fx, fire, scenarios, market, attribution: attributionOut,
+    notLoaded,
+    notTracked: [
+      'Cost basis, tax lots and unrealised gains — so the tax cost of a sale cannot be computed',
+      'Per-holding or per-account history — value snapshots are whole-portfolio only',
+      'Fund expense ratios',
+      'Cash or assets held outside these accounts',
+      'Age, retirement date and income',
+      'Sells and deleted holdings — they leave no ledger row',
+    ],
   };
 }
 
-async function submitAsk() {
-  const input = document.getElementById('askInput');
-  const q = (input?.value || '').trim();
-  if (!q || askBusy) return;
-  if (!cloudReady()) {
-    askThread.push({ q, error: 'Ask needs the cloud connection — sign in with ☁ first.' });
-    renderAdvisorContext(); return;
-  }
-  askBusy = true;
-  askThread.push({ q, pending: true });
-  input.value = '';
-  renderAdvisorContext();
-
-  let entry;
-  try {
-    const r = await proxyPost('/ask', { question: q, context: askContext() });
-    entry = r?.answer ? { q, a: r.answer } : { q, error: r?.error || 'No answer came back.' };
-  } catch (e) {
-    // The edge function is deployed separately from a merge to main — the same
-    // split that left the phone on a stale shell. Name that case exactly rather
-    // than showing a bare 404, so the state is legible instead of looking broken.
-    const msg = String(e?.message || '');
-    entry = { q, error: /\(404\)/.test(msg)
-      ? 'The Ask endpoint is not deployed yet — the UI shipped ahead of the edge function. Everything else on this card works.'
-      : 'Could not reach the advisor. ' + msg };
-  }
-  askThread = askThread.filter(x => !x.pending);
-  askThread.push(entry);
-  askBusy = false;
-  renderAdvisorContext();
+// Example questions. Static strings on purpose: a chip built from live data
+// ("Which prices are stale?") would itself be a verdict nobody asked for. Three
+// show at a time, stepped through the pool by day so they hold still within one.
+const ASK_CHIPS = [
+  'How far am I from my targets?',
+  'How much have I put in this year?',
+  "What's my dividend income by account?",
+  'How has my portfolio done since June?',
+  'How much of my money rides on the krona?',
+  'How fresh is my data?',
+  'What would a 30% stock drop do to my mix?',
+  'Where would my next $5,000 go?',
+  "What's my biggest single-company exposure?",
+  'Am I on pace for work-optional?',
+  'Why does it matter which account holds my bonds?',
+  'What do my 5/25 bands mean?',
+];
+function askChipsFor(date = new Date()) {
+  const dayOfYear = Math.round((Date.UTC(date.getFullYear(), date.getMonth(), date.getDate())
+    - Date.UTC(date.getFullYear(), 0, 0)) / 86400000);
+  // A stride of four spreads the three across topics rather than neighbours.
+  return [0, 4, 8].map(step => ASK_CHIPS[(dayOfYear + step) % ASK_CHIPS.length]);
 }
 
-function renderAskSection() {
-  const thread = askThread.map(t => `<div class="ask-turn">
-      <p class="ask-q">${esc(t.q)}</p>
-      ${t.pending ? '<p class="ask-a ask-wait">Thinking…</p>'
-        : t.error ? `<p class="ask-a ask-err">${esc(t.error)}</p>`
-        : `<p class="ask-a">${esc(t.a).replace(/\n\n+/g, '</p><p class="ask-a">')}</p>`}
-    </div>`).join('');
-  return `<div class="ask-box">
-      <input id="askInput" type="text" placeholder="Is it time to rebalance?"
-        autocomplete="off" onkeydown="if(event.key==='Enter')submitAsk()">
-      <button class="btn btn-primary btn-sm" onclick="submitAsk()" ${askBusy ? 'disabled' : ''}>
-        ${askBusy ? '…' : 'Ask'}</button>
-    </div>${thread}
-    <p class="risk-note">Answers come from your own holdings, targets and bands — nothing else.
-      It will not tell you what to buy or where a market is going; that is yours to decide.</p>`;
+// The thread survives a reload, per device. Storage can be absent or full
+// (private window, blocked site data); the card must work without it.
+function loadAskThread() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(ASK_THREAD_KEY) || '[]');
+    return (Array.isArray(raw) ? raw : [])
+      .filter(t => t && typeof t.q === 'string' && (typeof t.a === 'string' || typeof t.error === 'string'))
+      .map(t => typeof t.a === 'string' ? { q: t.q, a: t.a, ts: +t.ts || 0 } : { q: t.q, error: t.error, ts: +t.ts || 0 })
+      .slice(-ASK_KEEP_TURNS);
+  } catch (e) { return []; }
+}
+function saveAskThread() {
+  try {
+    const done = askThread.filter(t => !t.pending).slice(-ASK_KEEP_TURNS);
+    if (done.length) localStorage.setItem(ASK_THREAD_KEY, JSON.stringify(done));
+    else localStorage.removeItem(ASK_THREAD_KEY);
+  } catch (e) { /* the thread still lives in memory */ }
+}
+function clearAskThread() {
+  // A question still in flight is dropped with the thread — otherwise the card
+  // sits busy, chips dead, until an answer nobody is waiting for times out.
+  askAbort?.abort();
+  askAbort = null;
+  askBusy = false;
+  askThread = [];
+  askRestored = 0;
+  askShowEarlier = false;
+  saveAskThread();
+  renderAskThread();
+}
+function toggleAskEarlier() {
+  askShowEarlier = !askShowEarlier;
+  renderAskThread();
+}
+
+// Model text → HTML. Escaped FIRST, so nothing the model (or a poisoned fund
+// name echoed back by it) writes can become markup; then a deliberately small
+// markdown subset is layered on the escaped text. No links, no raw HTML.
+function askRender(text) {
+  const bold = s => s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  let html = '', para = [], list = null;
+  const endPara = () => { if (para.length) html += `<p>${para.join('<br>')}</p>`; para = []; };
+  const endList = () => {
+    if (list) html += `<${list.tag}>${list.items.map(i => `<li>${i}</li>`).join('')}</${list.tag}>`;
+    list = null;
+  };
+  for (const raw of esc(text ?? '').replace(/\r\n?/g, '\n').split('\n')) {
+    const line = raw.trim();
+    const ul = /^[-*•]\s+(.+)$/.exec(line), ol = /^\d{1,2}[.)]\s+(.+)$/.exec(line);
+    const head = /^#{1,6}\s+(.+)$/.exec(line);
+    if (!line) endPara();               // a blank line between items must not restart an <ol>
+    else if (ul || ol) {
+      endPara();
+      const tag = ul ? 'ul' : 'ol';
+      if (list && list.tag !== tag) endList();
+      list = list || { tag, items: [] };
+      list.items.push(bold((ul || ol)[1]));
+    }
+    else if (list && !para.length && /^\s{2,}/.test(raw)) list.items[list.items.length - 1] += '<br>' + bold(line);
+    else if (head) { endPara(); endList(); html += `<p><strong>${head[1].replace(/\*\*/g, '')}</strong></p>`; }
+    else { endList(); para.push(bold(line)); }
+  }
+  endPara(); endList();
+  return html;
+}
+
+function askTurnHtml(t) {
+  // An answer kept from an earlier day carries that day's numbers — date it.
+  const d = t.ts ? new Date(t.ts) : null;
+  const when = d && d.toDateString() !== new Date().toDateString()
+    ? `<span class="ask-when">${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}</span>` : '';
+  return `<div class="ask-turn">
+      <p class="ask-q">${esc(t.q)}${when}</p>
+      ${t.pending ? '<div class="ask-a ask-wait">Thinking… this can take up to half a minute.</div>'
+        : t.error ? `<div class="ask-a ask-err">${esc(t.error)}</div>`
+        : `<div class="ask-a">${askRender(t.a)}</div>`}
+    </div>`;
+}
+
+function renderAskThread() {
+  const el = document.getElementById('askThread');
+  if (!el) return;
+  const cut = Math.max(Math.min(askRestored, askThread.length), askThread.length - ASK_OPEN_TURNS);
+  const earlier = askThread.slice(0, cut);
+  el.innerHTML =
+    (earlier.length ? `<button type="button" class="ask-link" id="askEarlier" onclick="toggleAskEarlier()"
+        aria-expanded="${askShowEarlier}">${askShowEarlier ? 'Hide earlier' : `Show earlier (${earlier.length})`}</button>` : '') +
+    (askShowEarlier ? earlier.map(askTurnHtml).join('') : '') +
+    askThread.slice(cut).map(askTurnHtml).join('');
+  renderAskState();
+}
+
+// Everything about the card that is not the thread or the typed text. Safe to
+// call from render() and from the cloud button: it never touches #askInput.
+function renderAskState() {
+  const send = document.getElementById('askSend');
+  if (!send) return;
+  // #btnCloud stays hidden until cloud.js knows whether there is a session.
+  // Until then say nothing, rather than flash "sign in" at someone signed in.
+  const known = document.getElementById('btnCloud')?.style.display !== 'none';
+  const signedOut = known && !cloudReady();
+  send.disabled = askBusy || signedOut;
+  send.textContent = askBusy ? '…' : 'Ask';
+  document.getElementById('askSignin').style.display = signedOut ? '' : 'none';
+  document.getElementById('askClear').style.display = askThread.length ? '' : 'none';
+  const chips = document.getElementById('askChips');
+  const showChips = !askThread.length && !signedOut;
+  chips.style.display = showChips ? '' : 'none';
+  if (showChips && !chips.childElementCount) {
+    chips.innerHTML = askChipsFor().map(c =>
+      `<button type="button" class="ask-chip" onclick="submitAsk(this.textContent)">${esc(c)}</button>`).join('');
+  }
+}
+
+function askAutoGrow(el) {
+  el.style.height = 'auto';
+  if (el.value) el.style.height = (el.scrollHeight + 2) + 'px';   // +2: the border; CSS max-height caps it
+}
+function askKeydown(e) {
+  if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+  e.preventDefault();
+  submitAsk();
+}
+function askScrollToLatest() {
+  const turn = document.querySelector('#askThread .ask-turn:last-child');
+  // 'nearest' moves the page only if it has to. An answer taller than the
+  // screen is the exception — land on its first line, not its last.
+  turn?.scrollIntoView({ behavior: 'smooth', block: turn.offsetHeight > window.innerHeight ? 'start' : 'nearest' });
+}
+
+// Errors are short and plain, and never the body of someone else's response.
+function askErrorText(e) {
+  const msg = String(e?.message || '').slice(0, 160);
+  // The edge function deploys separately from the shell. proxyPost surfaces
+  // the function's own {error:"not found"}; a gateway 404 has no JSON body.
+  // Anchored to those two strings: an upstream 404/401 arrives as "the model is
+  // unavailable right now (404)", which is neither of these and says so itself.
+  if (/^not found$|^request failed \(404\)$/i.test(msg))
+    return "Ask isn't deployed yet — the app shipped ahead of its cloud function. Everything else works.";
+  if (e?.name === 'TimeoutError' || e?.name === 'AbortError' || /did not respond in time|timed? ?out/i.test(msg))
+    return 'No answer in time — the model took too long. Try again.';
+  // "sign in required" is the function's own 401, which is what a lapsed JWT gets.
+  if (/^sign in required$|^request failed \(401\)$|jwt/i.test(msg))
+    return 'Your cloud session has expired — sign in again with ☁.';
+  if (e instanceof TypeError)
+    return 'Could not reach your cloud function — check the connection and try again.';
+  return 'Could not get an answer — ' + (msg || 'unknown error') + '.';
+}
+
+async function submitAsk(preset) {
+  const input = document.getElementById('askInput');
+  const fromChip = typeof preset === 'string';
+  const q = (fromChip ? preset : input?.value || '').trim().slice(0, 2000);
+  if (!q || askBusy) return;
+  // Signed out is a state of the card, not a failed question: keep what was
+  // typed, show the sign-in line, push nothing into the thread.
+  if (!cloudReady()) { renderAskState(); return; }
+
+  // Only completed turns go back to the model; an error bubble is not something it said.
+  const history = askThread.filter(t => t.a && !t.error)
+    .slice(-ASK_HISTORY_TURNS).map(t => ({ q: t.q, a: t.a }));
+  const turn = { q, pending: true, ts: Date.now() };
+  const ctl = askAbort = new AbortController();
+  askBusy = true;
+  askThread.push(turn);
+  if (input && !fromChip) { input.value = ''; askAutoGrow(input); }
+  // On a phone the keyboard would otherwise sit on top of the answer.
+  if (input && window.matchMedia?.('(pointer: coarse)').matches) input.blur();
+  renderAskThread();
+  askScrollToLatest();
+
+  let result;
+  try {
+    // 90s: deliberately outlives the function's own 85s upstream budget.
+    const r = await proxyPost('/ask', { question: q, context: askContext(q), history }, 90000, ctl.signal);
+    result = typeof r?.answer === 'string' && r.answer.trim()
+      ? { a: r.answer } : { error: 'No answer came back. Try again.' };
+  } catch (e) {
+    result = { error: askErrorText(e) };
+  }
+  // Cleared while it was thinking: Clear already reset the card and a newer
+  // question may be in flight, so this one has nothing left to touch.
+  if (!askThread.includes(turn)) return;
+  delete turn.pending;
+  Object.assign(turn, result);
+  askBusy = false;
+  askAbort = null;
+  // A failed question goes back in the box, unless he has started another.
+  if (result.error && input && !input.value) { input.value = q; askAutoGrow(input); }
+  saveAskThread();
+  renderAskThread();
+  askScrollToLatest();
 }
 
 function renderAdvisorContext() {
@@ -3830,7 +4404,6 @@ function renderAdvisorContext() {
   el.innerHTML =
     `${advSection('drift', 'Where you stand', renderDriftSection,
         'Compare each sleeve against your targets and rebalancing bands.')}
-     <div class="subsection-label">Ask</div>${renderAskSection()}
      <div class="subsection-label subsection-flex">Market
        <button class="btn btn-ghost btn-sm" id="btnMarketRefresh" onclick="refreshMarket()">↻ Refresh market</button>
      </div>${renderMarketSection()}
@@ -3946,40 +4519,77 @@ function rebalancePlan(holdingsArr, targetsObj, amount, { allowSells = false } =
   return { totalBefore: +tot.toFixed(2), totalAfter: +totalAfter.toFixed(2), rows, warnings };
 }
 
-function runRebalancePlan(allowSells) {
+// One list for both answers below. A grid, not a <table>: the phone-width
+// rules in style.css restack every tbody tr/td for the holdings table, and at
+// 390px they folded the old table here into an unlabelled column that ran off
+// the box. `detail` is HTML built by the caller; everything else is escaped.
+function planListHtml(items, { actions = false } = {}) {
+  return `<div class="adv-split${actions ? ' adv-split-acts' : ''}" data-testid="${actions ? 'rebalance-rows' : 'advisor-split'}">` +
+    items.map(it => `<div class="adv-split-row" data-sleeve="${esc(it.sleeve)}">
+      <span class="adv-split-dot"><span class="sleeve-dot" style="background:${SLEEVE_CONFIG[it.sleeve]?.color || 'var(--text-muted)'}"></span></span>
+      <span class="adv-split-name">${esc(it.label)}</span>
+      ${actions ? `<span class="adv-split-act"><span class="adv-act-${esc(it.action)}">${esc(it.action.toUpperCase())}</span></span>` : ''}
+      <span class="adv-split-amt${it.action === 'hold' ? ' adv-act-hold' : ''}">${it.action === 'hold' ? '—' : fmt$(Math.abs(it.amount))}</span>
+      <span class="adv-split-how">${it.detail || ''}</span>
+    </div>`).join('') + '</div>';
+}
+
+const planWarningsHtml = warnings => warnings.map(w =>
+  `<div class="adv-tax-tip"><strong>⚠</strong> ${esc(w)}</div>`).join('');
+
+function runFullRebalance() {
   const amount = parseFloat(document.getElementById('advAmount').value) || 0;
   const result = document.getElementById('advResult');
-  const plan = rebalancePlan(holdings, targets, amount, { allowSells });
+  const plan = rebalancePlan(holdings, targets, amount, { allowSells: true });
   if (!plan) { result.innerHTML = '<p class="adv-placeholder">Add holdings with prices first.</p>'; return; }
-  if (!plan.rows.length) {
-    result.innerHTML = `<p class="adv-placeholder">${esc(plan.warnings[0] || 'Nothing to do.')}</p>`;
-    return;
-  }
   // All interpolated values esc()-escaped or app-computed (app's render pattern).
-  let html = `<div class="adv-rec-box">
-    <div class="adv-sleeve-name">Rebalance plan ${allowSells ? '(full — sells allowed)' : '(buy-only)'}
-      <span style="font-size:13px;font-weight:400;color:var(--text-secondary);margin-left:6px;">${fmt$(plan.totalBefore)} → ${fmt$(plan.totalAfter)}</span>
+  result.innerHTML = `<div class="adv-rec-box">
+    <div class="adv-sleeve-name">Full rebalance
+      <span class="adv-plan-sub">sells allowed · ${fmt$(plan.totalBefore)} → ${fmt$(plan.totalAfter)}</span>
     </div>
-    <table style="width:100%;font-size:13px;border-collapse:collapse;margin-top:6px;" data-testid="rebalance-table">
-      <tr style="text-align:left;color:var(--text-secondary);"><th style="padding:4px 6px;">Sleeve</th><th>Action</th><th style="text-align:right;">Amount</th><th style="padding-left:10px;">Suggestion</th></tr>`;
-  for (const r of plan.rows) {
-    const color = r.action === 'buy' ? '#16a34a' : r.action === 'sell' ? '#dc2626' : 'var(--text-secondary)';
-    html += `<tr style="border-top:1px solid var(--border,#eee);">
-      <td style="padding:4px 6px;">${esc(r.label)}</td>
-      <td style="color:${color};font-weight:600;">${esc(r.action.toUpperCase())}</td>
-      <td style="text-align:right;">${r.action === 'hold' ? '—' : fmt$(Math.abs(r.amount))}</td>
-      <td style="font-size:12px;color:var(--text-secondary);padding-left:10px;">${esc(r.suggestion)}${r.note ? ` <em>(${esc(r.note)})</em>` : ''}</td>
-    </tr>`;
-  }
-  html += '</table>';
-  for (const w of plan.warnings) {
-    html += `<div class="adv-tax-tip" style="margin-top:6px;"><strong>⚠</strong> ${esc(w)}</div>`;
-  }
-  html += '</div>';
-  result.innerHTML = html;
+    ${planListHtml(plan.rows.map(r => ({ ...r,
+      detail: esc(r.suggestion) + (r.note ? ` <em>(${esc(r.note)})</em>` : '') })), { actions: true })}
+    ${planWarningsHtml(plan.warnings)}
+  </div>`;
 }
 
 // ─── Advisor: recommendation ──────────────────────────────────────────────────
+// The holding line under one BUY row. Largest position first — the same pick
+// the engine's own `suggestion` makes, so with no account chosen this names
+// the holding the Ask box names — narrowed to the chosen account when there
+// is one.
+function advisorHoldingLine(sleeve, account) {
+  const label = SLEEVE_CONFIG[sleeve].label;
+  const val = h => (h.quantity || 0) * (h.price || 0);
+  const acctOf = h => h.account || 'Unassigned';
+  const named = h => `<strong>${esc(h.name)}${h.ticker && h.ticker !== 'N/A' ? ` (${esc(h.ticker)})` : ''}</strong>`;
+  const anywhere = holdings.filter(h => getSleeve(h) === sleeve).sort((a, b) => val(b) - val(a));
+  const inAcct = account ? anywhere.filter(h => acctOf(h) === account) : anywhere;
+
+  if (inAcct.length > 0) {
+    const h = inAcct[0];
+    return `Add to ${named(h)} — you already hold this ${label} position in
+      ${account ? `your <strong>${esc(account)}</strong> account` : `<strong>${esc(acctOf(h))}</strong>`}.`;
+  }
+  if (anywhere.length > 0) {
+    const h = anywhere[0];
+    return `You hold ${named(h)} in <strong>${esc(acctOf(h))}</strong>.
+      Either open a similar position in <strong>${esc(account)}</strong>, or contribute to
+      <strong>${esc(acctOf(h))}</strong> if that's where the ${label} sleeve makes more sense.`;
+  }
+  const suggestions = {
+    us_stock:   'a US total market or S&P 500 index ETF (e.g. VOO, VTI, SCHB)',
+    intl_stock: 'an international index ETF (e.g. VXUS, VEA, VWO)',
+    tilt:       'a factor tilt, sector, or individual position aligned with your strategy',
+    bond:       'a bond ETF matching your duration preference (e.g. VGIT for intermediate, BND for total market)',
+  };
+  return `No ${label} holding yet${account ? ` in <strong>${esc(account)}</strong>` : ''}.
+    Consider adding ${suggestions[sleeve] || 'an appropriate instrument'}.`;
+}
+
+// One answer: the split is rebalancePlan's buy-only plan, the same rows the
+// Ask brief carries as `scenarios.newMoney`. This adds only what the engine
+// cannot know — which account he is paying into.
 function computeAdvisorRec() {
   const amount  = parseFloat(document.getElementById('advAmount').value);
   const account = document.getElementById('advAccount').value;
@@ -3990,95 +4600,42 @@ function computeAdvisorRec() {
     return;
   }
 
-  const tot = total();
-  if (tot === 0) {
+  const plan = rebalancePlan(holdings, targets, amount);
+  if (!plan) {
     result.innerHTML = '<p class="adv-placeholder">Add holdings with prices first, then get a recommendation.</p>';
     return;
   }
-
-  const slvVals = getSleeveTotals();
-  const tgtPcts = getSleeveTargetPcts();
-  const newTot  = tot + amount;
-
-  // Calculate gap for each sleeve ($ short after investing)
-  const gaps = {};
-  for (const sleeve of Object.keys(SLEEVE_CONFIG)) {
-    const targetVal = tgtPcts[sleeve] / 100 * newTot;
-    const curVal    = slvVals[sleeve] || 0;
-    gaps[sleeve]    = targetVal - curVal; // positive = underweight
+  const buys = plan.rows.filter(r => r.action === 'buy');
+  if (!buys.length) {   // under a dollar a sleeve — the engine holds everything
+    result.innerHTML = '<p class="adv-placeholder">That is too small to split. Enter a larger amount.</p>';
+    return;
   }
 
-  // Sort by gap descending; exclude 'other' from advice
-  const sortedGaps = Object.entries(gaps)
-    .filter(([s]) => s !== 'other')
-    .sort(([,a],[,b]) => b - a);
-
-  const [bestSleeve, bestGap] = sortedGaps[0];
-  const slvCfg = SLEEVE_CONFIG[bestSleeve];
-
-  // Find matching holdings in the chosen account
-  const acctHoldings = account
-    ? holdings.filter(h => (h.account || 'Unassigned') === account)
-    : holdings;
-  const matchInAcct  = acctHoldings.filter(h => getSleeve(h) === bestSleeve);
-  const matchAnywhere = holdings.filter(h => getSleeve(h) === bestSleeve);
-
-  const curPct = tot > 0 ? (slvVals[bestSleeve] || 0) / tot * 100 : 0;
-  const tgtPct = tgtPcts[bestSleeve] || 0;
-
-  // Build recommendation HTML
-  let html = `<div class="adv-rec-box">`;
-
-  // Headline
-  html += `<div class="adv-sleeve-name" style="color:${slvCfg.color}">
-    Invest in ${slvCfg.label}
-    <span style="font-size:13px;font-weight:400;color:var(--text-secondary);margin-left:6px;">
-      ${curPct.toFixed(1)}% current → ${tgtPct.toFixed(1)}% target
-    </span>
-  </div>`;
-
-  // Specific holding suggestion
-  if (matchInAcct.length > 0) {
-    const h = matchInAcct[0];
-    const ticker = h.ticker && h.ticker !== 'N/A' ? ` (${h.ticker})` : '';
-    html += `<div class="adv-detail">
-      Add to <strong>${esc(h.name)}${ticker}</strong> — you already hold this ${slvCfg.label} position in
-      ${account ? `your <strong>${esc(account)}</strong> account` : 'your portfolio'}.
-    </div>`;
-  } else if (matchAnywhere.length > 0 && account) {
-    const h = matchAnywhere[0];
-    const ticker = h.ticker && h.ticker !== 'N/A' ? ` (${h.ticker})` : '';
-    const otherAcct = h.account || 'Unassigned';
-    html += `<div class="adv-detail">
-      You hold <strong>${esc(h.name)}${ticker}</strong> in <strong>${esc(otherAcct)}</strong>.
-      Either open a similar position in <strong>${esc(account)}</strong>, or contribute to
-      <strong>${esc(otherAcct)}</strong> if that's where the ${slvCfg.label} sleeve makes more sense.
-    </div>`;
-  } else {
-    const suggestions = {
-      us_stock:   'a US total market or S&P 500 index ETF (e.g. VOO, VTI, SCHB)',
-      intl_stock: 'an international index ETF (e.g. VXUS, VEA, VWO)',
-      tilt:       'a factor tilt, sector, or individual position aligned with your strategy',
-      bond:       'a bond ETF matching your duration preference (e.g. VGIT for intermediate, BND for total market)',
-    };
-    html += `<div class="adv-detail">
-      No ${slvCfg.label} holding yet${account ? ` in <strong>${esc(account)}</strong>` : ''}.
-      Consider adding ${suggestions[bestSleeve] || 'an appropriate instrument'}.
-    </div>`;
-  }
+  let html = `<div class="adv-rec-box">
+    <div class="adv-sleeve-name">Where ${fmt$(amount)} goes
+      <span class="adv-plan-sub">buy-only · ${fmt$(plan.totalBefore)} → ${fmt$(plan.totalAfter)}</span>
+    </div>
+    ${planListHtml(buys.map(r => ({ ...r, detail: advisorHoldingLine(r.sleeve, account) })))}`;
 
   // Tax tip
   const tip = accountTaxTip(account);
   if (tip) {
     html += `<div class="adv-tax-tip"><strong>Tax note:</strong> ${tip}</div>`;
   }
+  html += planWarningsHtml(plan.warnings);
 
-  // All sleeve gaps summary
+  // All sleeve gaps summary ($ short of target once this money is in);
+  // 'other' is never gap-filled, so it is left out as before.
+  const slvVals = getSleeveTotals();
+  const tgtPcts = getSleeveTargetPcts();
+  const bought = new Set(buys.map(r => r.sleeve));
   html += `<div class="adv-gaps">`;
-  for (const [sleeve, gap] of sortedGaps) {
+  const gaps = Object.keys(SLEEVE_CONFIG).filter(s => s !== 'other')
+    .map(s => [s, tgtPcts[s] / 100 * plan.totalAfter - (slvVals[s] || 0)])  // positive = underweight
+    .sort(([, a], [, b]) => b - a);
+  for (const [sleeve, gap] of gaps) {
     const cfg = SLEEVE_CONFIG[sleeve];
-    const isTop = sleeve === bestSleeve;
-    html += `<span class="adv-gap-item" style="${isTop ? 'font-weight:600;' : ''}">
+    html += `<span class="adv-gap-item" style="${bought.has(sleeve) ? 'font-weight:600;' : ''}">
       <span class="sleeve-dot" style="background:${cfg.color}"></span>
       ${cfg.label}: ${gap > 50 ? fmt$(gap) + ' short' : '✓'}
     </span>`;
@@ -4099,6 +4656,7 @@ initTheme();
 document.getElementById('iAccount').innerHTML = accountOptions('');
 loadLocal();
 render();
+renderAskThread();   // a thread kept from the last visit
 renderTargetInputs();
 
 // Adopt data/portfolio.json. Returns true when the file supplied state.

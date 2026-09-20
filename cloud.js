@@ -410,6 +410,8 @@ function renderCloudButton() {
     btn.textContent = IS_SHELL ? '☁ Sign in' : '☁ Set up phone access';
     btn.onclick = () => showAuthGate(IS_SHELL ? 'gate' : 'migrate');
   }
+  // The Ask card is the other surface that reads signed-in state.
+  if (typeof renderAskState === 'function') renderAskState();
 }
 
 function showCloudMenu() {
@@ -449,10 +451,13 @@ async function proxyGet(path, params) {
 // proxyGet swallows every error into null because its callers have their own
 // fallback chains; /ask has none — a silent null there is indistinguishable
 // from "the model had nothing to say", so this throws with the server's own
-// message instead. The timeout is long because the answer involves reasoning;
-// it deliberately outlives the function's own 55s upstream budget.
-async function proxyPost(path, body, timeoutMs = 60000) {
+// message instead. The timeout is long because the answer involves reasoning:
+// Ask passes 90s, which deliberately outlives the function's own 85s upstream
+// budget. A caller that needs to cancel early (Ask's Clear) passes its own
+// signal; whichever fires first ends the request.
+async function proxyPost(path, body, timeoutMs = 60000, signal = null) {
   if (!cloudReady()) throw new Error('not signed in');
+  const timeout = AbortSignal.timeout(timeoutMs);
   const res = await fetch(`${CLOUD_FN}${path}`, {
     method: 'POST',
     headers: {
@@ -461,7 +466,7 @@ async function proxyPost(path, body, timeoutMs = 60000) {
       apikey: CLOUD_KEY,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: signal && AbortSignal.any ? AbortSignal.any([signal, timeout]) : timeout,
   });
   let data = null;
   try { data = await res.json(); } catch { /* non-JSON body */ }

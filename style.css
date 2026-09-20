@@ -153,7 +153,13 @@ h2 {
   margin-bottom: 16px;
 }
 
-.container { max-width: 1000px; margin: 0 auto; }
+/* 1160, not the original 1000. From 2026-08-03 two stray </div>s closed this
+   early, so every card below Update-positions rendered full-bleed for seven
+   weeks and the holdings table grew to need the room: at 1000px, real fund
+   names wrapped to five and six lines. 1160 (with the tighter desktop gutters
+   further down) wraps exactly the rows the full-bleed table did, and the whole
+   page still reads as one column. */
+.container { max-width: 1160px; margin: 0 auto; }
 
 /* ── Focus ring animation ── */
 @keyframes focus-glow {
@@ -338,6 +344,7 @@ select {
   padding: 2px 8px; border-radius: 9999px;
   letter-spacing: 0.03em;
   text-transform: uppercase; vertical-align: middle;
+  white-space: nowrap;   /* "MUTUAL FUND" broke onto two lines inside the pill */
 }
 .type-stock       { background: rgba(59,130,246,0.12); color: #3b82f6; }
 .type-etf         { background: rgba(13,148,136,0.12); color: #0d9488; }
@@ -541,7 +548,58 @@ td select { padding-right: 24px; }
   font-feature-settings: "cv01", "tnum";
 }
 .adv-gap-item { display: flex; align-items: center; gap: 5px; }
+.adv-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+/* inline-block: at 390px it drops to its own line whole, never mid-phrase. */
+.adv-plan-sub { display: inline-block; font-size: 13px; font-weight: 400; letter-spacing: 0; color: var(--text-secondary); }
+/* The split and the full rebalance: one grid, rows as `display: contents` so
+   the amounts share a right edge. Not a <table> — same reason as .fire-odds. */
+.adv-split {
+  display: grid; grid-template-columns: 16px minmax(0, 1fr) auto;
+  margin: 8px 0 14px; max-width: 640px; font-size: 14px; color: var(--text-primary);
+  font-feature-settings: "cv01", "tnum";
+}
+.adv-split-acts { grid-template-columns: 16px minmax(0, 1fr) auto auto; }
+.adv-split-row { display: contents; }
+.adv-split-row > * { padding-top: 10px; }
+.adv-split-row + .adv-split-row > :not(.adv-split-how) { border-top: 1px solid var(--border-subtle); }
+.adv-split-dot { display: flex; align-items: center; }
+.adv-split-name, .adv-split-amt { font-weight: 600; }
+.adv-split-amt { text-align: right; padding-left: 12px; }
+.adv-split-act { padding-left: 12px; }
+/* The word is smaller than its cell so it sits on the amount's baseline. */
+.adv-split-act > span { font-size: 12px; font-weight: 600; letter-spacing: 0.03em; }
+.adv-act-buy  { color: #15803d; }
+.adv-act-sell { color: #dc2626; }
+.adv-act-hold { color: var(--text-muted); }
+[data-theme="dark"] .adv-act-buy  { color: #4ade80; }
+[data-theme="dark"] .adv-act-sell { color: #f87171; }
+.adv-split-how {
+  grid-column: 2 / -1; padding-top: 2px; padding-bottom: 10px;
+  font-size: 13px; font-weight: 400; color: var(--text-secondary); line-height: 1.5;
+}
+.adv-split-how strong { font-weight: 600; color: var(--text-primary); }
 .adv-placeholder { font-size: 15px; color: var(--text-muted); }
+/* FIRE odds: five horizons, always one row. A grid rather than a <table> —
+   the phone-width rules below turn every tbody tr/td into a stacked list for
+   the holdings table, which folded this into a single column at 390px. */
+.fire-odds-label { font-size: 13px; color: var(--text-secondary); margin-top: 8px; }
+.fire-odds {
+  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px;
+  margin-top: 6px; max-width: 420px;
+  font-feature-settings: "cv01", "tnum";
+}
+.fire-odds-cell {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 6px 0; border: 1px solid var(--adv-box-border); border-radius: 6px;
+  background: var(--bg-card);
+}
+.fire-odds-h { font-size: 12px; color: var(--text-secondary); }
+.fire-odds-v { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+/* "88.8%" at 13px leaves 0.2px of slack in a 360px-wide phone's cell. */
+@media (max-width: 380px) {
+  .fire-odds { gap: 3px; }
+  .fire-odds-v { font-size: 12px; }
+}
 
 /* ── Toast ── */
 .toast {
@@ -607,18 +665,85 @@ input.band-input {
   .band-input { font-size: 16px; }
 }
 
-/* ── Advisor: Ask ── */
-.ask-box { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
-.ask-box input { flex: 1; min-width: 0; }
-.ask-turn { margin-bottom: 14px; }
+/* ── Ask ──
+   A conversation in a card. Figures in an answer are bolded by the model, so
+   the body text stays regular weight and the question carries the accent. */
+.ask-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.ask-link {
+  background: none; border: none; padding: 0; cursor: pointer;
+  font: inherit; font-size: 13px; color: var(--accent); text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ask-link:hover { color: var(--accent-hover); }
+.ask-link:focus-visible { outline: none; box-shadow: 0 0 0 4px rgba(13,148,136,0.2); border-radius: 4px; }
+[data-theme="dark"] .ask-link { color: var(--accent-light); }
+#askEarlier { display: block; margin-bottom: 12px; }
+/* A readable measure: on a wide screen the card is far wider than a paragraph should be. */
+#askThread, .ask-box, .ask-signin, .ask-chips, .risk-note.ask-note { max-width: 720px; }
+.ask-box { display: flex; gap: 8px; align-items: flex-end; }
+.ask-box textarea {
+  flex: 1; min-width: 0; display: block; resize: none; overflow-y: auto;
+  min-height: 40px; max-height: 128px;            /* one line → about five */
+  border: 1px solid var(--border-default); border-radius: 6px;
+  padding: 9px 12px; font: inherit; font-size: 14px; line-height: 20px;
+  color: var(--text-primary); background: var(--bg-input); outline: none;
+  transition: border-color 120ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ask-box textarea::placeholder {
+  color: var(--text-muted);
+  /* One line, always: a wrapped placeholder is clipped by a one-row box. */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ask-box textarea:focus {
+  border-color: var(--accent);
+  animation: focus-glow 200ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+.ask-box .btn { height: 40px; }
+.ask-signin { font-size: 13px; color: var(--text-secondary); margin-top: 10px; }
+.ask-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.ask-chips:empty { display: none; }
+.ask-chip {
+  font: inherit; font-size: 13px; line-height: 1.3; text-align: left; cursor: pointer;
+  color: var(--text-secondary); background: var(--bg-surface);
+  border: 1px solid var(--border-default); border-radius: 9999px; padding: 7px 12px;
+  transition: border-color 120ms cubic-bezier(0.22, 1, 0.36, 1), color 120ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.ask-chip:hover { border-color: var(--accent); color: var(--text-primary); }
+.ask-chip:focus-visible { outline: none; box-shadow: 0 0 0 4px rgba(13,148,136,0.2); }
+.risk-note.ask-note { margin: 12px 0 0; }
+.ask-turn { margin-bottom: 16px; }
 .ask-q {
   font-size: 14px; font-weight: 600; margin-bottom: 6px;
   padding-left: 10px; border-left: 2px solid var(--accent);
+  overflow-wrap: anywhere;
 }
-.ask-a { font-size: 14px; line-height: 1.55; margin-bottom: 8px; }
-.ask-wait { color: var(--text-muted); font-style: italic; }
+.ask-when { font-weight: 400; font-size: 12px; color: var(--text-muted); margin-left: 6px; white-space: nowrap; }
+.ask-a { font-size: 14px; line-height: 1.55; padding-left: 12px; overflow-wrap: anywhere; }
+.ask-a p { margin-bottom: 8px; }
+.ask-a ul, .ask-a ol { margin: 0 0 8px; padding-left: 20px; }
+.ask-a li { margin-bottom: 4px; }
+.ask-a > :last-child { margin-bottom: 0; }
+.ask-a strong { font-weight: 600; font-feature-settings: "cv01", "tnum"; }
+/* The call runs 10–60 s: a slow pulse says "still working" without a spinner. */
+.ask-wait { color: var(--text-muted); font-style: italic; animation: ask-pulse 1.8s ease-in-out infinite; }
+@keyframes ask-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+@media (prefers-reduced-motion: reduce) { .ask-wait { animation: none; } }
 .ask-err { color: #b45309; }
 [data-theme="dark"] .ask-err { color: #fbbf24; }
+@media (max-width: 640px) {
+  /* 16px stops iOS zooming on focus; that rule reads the field, not its
+     placeholder, which has to be smaller to fit beside the button at 390px. */
+  .ask-box textarea { font-size: 16px; line-height: 22px; min-height: 44px; max-height: 132px; padding: 10px; }
+  .ask-box textarea::placeholder { font-size: 13px; }
+  .ask-box .btn { height: 44px; padding: 0 12px; }
+  .ask-chip { padding: 9px 14px; }
+  /* Clear / Show earlier are a line of 13px text: a 44px tap target is laid
+     over each, so the finger gets its room and nothing on the card moves. */
+  #askClear, #askEarlier { position: relative; }
+  #askClear::after, #askEarlier::after {
+    content: ''; position: absolute; left: -8px; right: -8px; top: 50%; height: 44px; transform: translateY(-50%);
+  }
+}
 
 /* ── Collapsible cards ──
    <details> as a card: a native disclosure, keyboard-reachable and
@@ -817,6 +942,19 @@ input.band-input {
 .auth-msg.auth-err { color: #ef4444; }
 #authStepEmail, #authStepCode { display: flex; flex-direction: column; }
 
+/* ── Desktop column ──
+   Tuning for cards that now sit inside .container instead of spanning the
+   window. Desktop only: nothing here may change the phone layout. */
+@media (min-width: 641px) {
+  /* Seven columns at 16px gutters spent 224px on air; the name column paid. */
+  .table-wrap th, .table-wrap td { padding-left: 10px; padding-right: 10px; }
+  /* The left half is five short inputs; the right is a five-column table whose
+     cells have no side padding, so at half a column "TARGET" ran into
+     "CURRENT" and the gap text wrapped. */
+  .alloc-grid { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+  .gap-table th + th, .gap-table td + td { padding-left: 12px; }
+}
+
 /* ── Responsive ── */
 @media (max-width: 640px) {
   body {
@@ -832,6 +970,9 @@ input.band-input {
   .alloc-grid { grid-template-columns: 1fr; }
   .advisor-form { flex-direction: column; }
   .advisor-form .form-group { min-width: 100%; }
+  /* Side by side while both fit; each takes a full row once they do not. */
+  .adv-actions { align-self: stretch; }
+  .adv-actions .btn { flex: 1 1 auto; justify-content: center; }
   /* Phone-grade touch targets and readable inputs (16px stops iOS focus zoom) */
   .btn { min-height: 44px; }
   .header-actions .btn, .theme-toggle { min-height: 40px; }
