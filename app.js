@@ -79,7 +79,16 @@ const COL_ALIASES = {
   name:     ['name','investment name','fund name','security name','security','holding','description','asset'],
   ticker:   ['ticker','symbol','tick','fund ticker','security ticker'],
   quantity: ['shares','quantity','units','qty','amount','lots','position','shares/units','shares units','number of shares','num shares'],
-  price:    ['price','nav','cost','rate','px','last','close','market price','current price','share price','unit price'],
+  // Per-share prices only. Position totals ("Current Value", "Market Value",
+  // "Total Value", "Cost Basis Total") must never land here: a total read as a
+  // price multiplies the position by its own share count. Fidelity's positions
+  // export says "Last Price", which used to match nothing — every row imported
+  // at $0.00.
+  // 'cost' used to be here. A cost is what he paid, never what it is worth now,
+  // and a "Cost" column ahead of "Price" took the price's place.
+  price:    ['price','nav','rate','px','last','close','market price','current price','share price','unit price',
+             'last price','last trade price','latest price','closing price','close price','mark price',
+             'price per share','price per unit','nav per share'],
   type:     ['type','asset type','asset_type','asset class','category','class','kind','security type'],
   account:  ['account type','account','account name','account_type','acct','portfolio'],
 };
@@ -804,8 +813,16 @@ function detectColumns(headerRow) {
   const map = {};
   headerRow.forEach((h, i) => {
     const norm = h.toLowerCase().replace(/[_\-\/\\]+/g, ' ').replace(/\s+/g, ' ').trim();
+    // Brokers decorate price headers with the currency ("Last Price $", "Price
+    // (USD)") — a unit, not part of the name. Stripped for PRICE only: on any
+    // other field it is a warning, not decoration — "Amount ($)" is dollars, and
+    // reading it as a share count would import a position a hundred times over.
+    // And only when the header actually says price or NAV, so the stripping cannot
+    // widen a bare alias: "Rate $" stays unmatched, exactly as before.
+    const bare = norm.replace(/\(\s*(\$|usd)\s*\)|\$|\busd\b/g, ' ').replace(/\s+/g, ' ').trim();
+    const priceNorm = /\b(price|nav)\b/.test(bare) ? bare : norm;
     for (const [field, aliases] of Object.entries(COL_ALIASES)) {
-      if (!(field in map) && aliases.includes(norm)) map[field] = i;
+      if (!(field in map) && aliases.includes(field === 'price' ? priceNorm : norm)) map[field] = i;
     }
   });
   return map;
@@ -2760,7 +2777,7 @@ function renderTable() {
           </div>
         </td>
         <td class="num"><div class="actions">
-          <button class="btn btn-ghost btn-sm" title="Fetch ${isMF ? 'NAV' : 'price'} for ${fetchKey}" onclick="refreshHoldingPrice('${h.id}')">↻</button>
+          <button class="btn btn-ghost btn-sm" title="Fetch ${isMF ? 'NAV' : 'price'} for ${esc(fetchKey)}" onclick="refreshHoldingPrice('${h.id}')">↻</button>
           <button class="btn btn-ghost btn-sm" onclick="startEdit('${h.id}')">Edit</button>
           <button class="btn btn-ghost btn-sm" title="Split into two sleeve allocations" onclick="startSplit('${h.id}')">Split</button>
           <button class="btn btn-danger btn-sm" onclick="deleteHolding('${h.id}')">✕</button>
