@@ -460,7 +460,8 @@ td select { padding-right: 24px; }
 .import-table tr.row-warn td { background: rgba(245,158,11,0.06); }
 .import-table tr.row-err td { background: rgba(239,68,68,0.06); }
 .import-table .status-ok   { color: #10b981; font-size: 13px; }
-.import-table .status-warn { color: #f59e0b; font-size: 13px; }
+.import-table .status-warn { color: #b45309; font-size: 13px; }
+[data-theme="dark"] .import-table .status-warn { color: #fbbf24; }
 .import-table .status-err  { color: #ef4444; font-size: 13px; }
 
 .import-note { font-size: 13px; color: var(--text-secondary); margin-top: 10px; }
@@ -842,11 +843,29 @@ input.band-input {
 .risk-row .num { text-align: right; font-variant-numeric: tabular-nums; }
 
 /* ── Import kind picker (true-up vs reinvested dividend) ── */
+/* background-color, not the shorthand: that reset the chevron's no-repeat and
+   tiled it across the control in dark mode. */
 .imp-kind {
-  font-size: 12px; padding: 4px 6px;
+  font-size: 12px; padding: 4px 24px 4px 6px;
   border: 1px solid var(--border-default); border-radius: 6px;
-  background: var(--bg-input); color: var(--text-primary);
+  background-color: var(--bg-input); color: var(--text-primary);
 }
+
+/* ── Import account mapping (a broker's label → one of his accounts) ── */
+#importAccountMap:not(:empty) { margin-bottom: 12px; }
+.imp-map-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+  font-size: 14px; padding: 4px 0;
+}
+.imp-map-label { font-weight: 600; overflow-wrap: anywhere; }
+.imp-map-arrow { color: var(--text-muted); }
+.imp-acct { width: auto; max-width: 100%; text-overflow: ellipsis; }
+.imp-map-hint { flex-basis: 100%; font-size: 13px; color: var(--text-muted); }
+.imp-dup {
+  display: flex; align-items: center; gap: 6px; margin-top: 4px;
+  color: var(--text-primary); cursor: pointer;
+}
+.imp-dup input { width: auto; min-height: 0; margin: 0; accent-color: var(--accent); }
 
 /* ── Needs attention strip ── */
 #attnStrip {
@@ -978,6 +997,10 @@ input.band-input {
   .header-actions .btn, .theme-toggle { min-height: 40px; }
   input, select { font-size: 16px; min-height: 40px; }
   .imp-kind { font-size: 16px; }
+  .imp-acct { flex: 1 1 100%; padding-left: 8px; }
+  /* The whole label is the tap target, not the 20px box. */
+  .imp-dup { min-height: 44px; font-size: 15px; }
+  .imp-dup input { width: 20px; height: 20px; }
   .hdr-more-menu { left: 0; right: auto; }
   /* Inline edit/split forms were laid out for a desktop row. At 390px their
      selects collapsed to ~40px — "ETF⌄ Brok⌄ US S⌄" — and Split's fixed
@@ -1012,4 +1035,16 @@ input.band-input {
   tbody td:first-child .num, tbody td:first-child .sub { text-align: left; }
   /* The account divider is a heading, not a boxed row. */
   tbody tr.account-row td { display: block; text-align: left; }
+  /* The import preview stacks too, but its desktop cell padding and rules
+     outranked the list's, so one row ran taller than its 340px scroller. The
+     name and the status (a question and its checkbox) read as left-hand blocks. */
+  /* Stacked, one row is ~280px: 340px showed barely one, with the tick-boxes below the fold. */
+  .import-table-wrap { max-height: 60vh; }
+  .import-table td { padding: 2px 12px; border-top: none; }
+  .import-table td:nth-child(2), .import-table td:last-child { display: block; text-align: left; }
+  .import-table td:last-child { padding-top: 6px; }
+  /* The tint belongs to the whole stacked row, not to each cell inside its padding. */
+  .import-table tr.row-warn { background: rgba(245,158,11,0.06); }
+  .import-table tr.row-err  { background: rgba(239,68,68,0.06); }
+  .import-table tr.row-warn td, .import-table tr.row-err td { background: none; }
 }

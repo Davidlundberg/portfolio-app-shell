@@ -134,6 +134,7 @@
       </div>
     </div>
     <div class="import-summary" id="importSummary"></div>
+    <div id="importAccountMap"></div>
     <div class="import-table-wrap">
       <table class="import-table">
         <thead><tr>
@@ -144,8 +145,9 @@
       </table>
     </div>
     <div class="import-note">
-      Rows highlighted in yellow are missing a price — they'll be imported with $0.00 and you can
-      update them after. Rows in red will be skipped. &nbsp;·&nbsp;
+      Amber rows need a look: either the price is missing — they'll be imported with $0.00 and you
+      can update them after — or the position is already held in another account, and it is left out
+      unless you tick "Add anyway". Rows in red will be skipped. &nbsp;·&nbsp;
       <a onclick="downloadCSVTemplate()">Download CSV template</a>
     </div>
   </div>

@@ -109,6 +109,7 @@ let chartInst  = null;
 let chartView  = 'sleeve'; // 'sleeve' | 'ticker' | 'account'
 let unsaved    = false;
 let importRows = [];
+let importAccountMap = new Map(); // CSV account label → the account he chose for it; this import only
 let lastRefreshed = null;
 let refreshing    = false;
 
@@ -909,50 +910,34 @@ function importCSV(event) {
       const qty    = parseFloat(qtyRaw.replace(/[$,\s]/g, ''));
       const price  = parseFloat(priceRaw.replace(/[$,\s]/g, ''));
       const type   = normalizeType(typeRaw) || inferTypeFromInstrument(ticker, name);
-      const account = accountRaw.trim();
 
       let status = 'ok', statusMsg = 'Ready';
       if (!name)                           { status = 'err';  statusMsg = 'Missing name'; }
       else if (isNaN(qty) || qty <= 0)     { status = 'err';  statusMsg = 'Invalid shares'; }
       else if (isNaN(price) || price <= 0) { status = 'warn'; statusMsg = 'No price — fetch after import'; }
 
-      const rec = {
+      // csvAccount is the label exactly as the file had it. The account the row
+      // lands in is decided in reconcileImportRows, and can change while he looks.
+      const csvAccount = accountRaw.trim();
+      return {
         _row: idx + 1 + (looksLikeHeader ? 1 : 0),
-        name, ticker, type, account,
+        name, ticker, type, csvAccount, account: csvAccount,
         quantity: isNaN(qty) ? 0 : qty,
         price: (isNaN(price) || price < 0) ? 0 : price,
         status, statusMsg,
       };
-
-      // Reconcile against existing holdings: a re-import UPDATES matching
-      // positions instead of duplicating them.
-      if (status !== 'err') {
-        const match = findImportMatch(rec);
-        if (match) {
-          rec.matchIds = match.ids;
-          const oldQty = match.ids.reduce((s, mid) =>
-            s + (holdings.find(x => x.id === mid)?.quantity || 0), 0);
-          rec.oldQty = oldQty;
-          if (Math.abs(oldQty - rec.quantity) < 1e-9) {
-            rec.mode = 'same';
-            rec.statusMsg = 'No change';
-          } else {
-            rec.mode = 'update';
-            rec.statusMsg = `Update: ${fmtN(oldQty)} → ${fmtN(rec.quantity)} sh`;
-          }
-        } else {
-          rec.mode = 'add';
-          if (status === 'ok') rec.statusMsg = 'New holding';
-        }
-      }
-      return rec;
     }).filter(r => !(r.status === 'err' && !r.name && r.quantity === 0));
 
+    importAccountMap = new Map();
+    reconcileImportRows();
     renderImportPreview();
+    document.getElementById('importPreview').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     event.target.value = '';
   };
   reader.readAsText(file);
 }
+
+const importNorm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
 // Which existing holding(s) does a CSV row correspond to? Ticker wins (within
 // the row's account when it names one); otherwise normalized name. A name
@@ -967,25 +952,171 @@ function findImportMatch(row) {
       (h.ticker || '').toUpperCase() === tick && inAccount(h));
     if (hits.length) return { ids: hits.map(h => h.id) };
   }
-  const norm = s => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-  const hits = holdings.filter(h => norm(h.name) === norm(row.name) && inAccount(h));
+  const hits = holdings.filter(h => importNorm(h.name) === importNorm(row.name) && inAccount(h));
   return hits.length ? { ids: hits.map(h => h.id) } : null;
+}
+
+// The same position wherever it is held, whatever the account: by ticker, or
+// by name when the row has none.
+function importHolders(row) {
+  const tick = (row.ticker || '').toUpperCase();
+  const byTicker = tick && tick !== 'N/A';
+  return holdings.filter(h => byTicker
+    ? (h.ticker || '').toUpperCase() === tick
+    : importNorm(h.name) === importNorm(row.name));
+}
+
+const sameAccount = (a, b) => (a || '').toLowerCase() === (b || '').toLowerCase();
+
+// His accounts, in his order, plus any a holding already lives in. A holding's
+// spelling wins over the list's: a file saying "Roth IRA" joins holdings kept
+// under "ROTH IRA" instead of opening a second group beside them.
+function knownImportAccounts() {
+  const held = [];
+  holdings.forEach(h => {
+    if (h.account && !held.some(a => sameAccount(a, h.account))) held.push(h.account);
+  });
+  return [...ACCOUNTS.map(a => held.find(x => sameAccount(x, a)) || a),
+          ...held.filter(x => !ACCOUNTS.some(a => sameAccount(a, x)))];
+}
+
+// Reconcile against existing holdings: a re-import UPDATES matching positions
+// instead of duplicating them. Re-run whenever he maps a label or ticks a row.
+function reconcileImportRows() {
+  const known = knownImportAccounts();
+  const live = importRows.filter(r => r.status !== 'err');
+  live.forEach(r => {
+    // A broker's label is not his account name ("Individual" is his Brokerage),
+    // and only he knows that — so his mapping wins. Failing that, a known
+    // account keeps its spelling: "ROTH IRA" must not open a second Roth IRA.
+    r.account = importAccountMap.get(r.csvAccount)
+      || known.find(a => sameAccount(a, r.csvAccount))
+      || r.csvAccount;
+    r.matchIds = findImportMatch(r)?.ids || null;
+    r.applyQty = r.quantity; r.applyPrice = r.price;
+    r.oldQty = null; r.elsewhere = null; r.groupRows = null; r.countedWith = null;
+  });
+
+  // One position can arrive as several rows: Fidelity lists a symbol twice when
+  // it sits in both Cash and Margin, and two labels can map to one account.
+  // Applied row by row the last one won — 25 sh became "15", then "10". So the
+  // first row carries the group's SUM and the others ride along. Rows that
+  // would ADD the same new position are one holding for the same reason.
+  const groups = new Map();
+  live.forEach(r => {
+    const tick = (r.ticker || '').toUpperCase();
+    const key = r.matchIds
+      ? `held|${[...r.matchIds].sort().join('|')}`
+      : `new|${r.account.toLowerCase()}|${tick && tick !== 'N/A' ? `t:${tick}` : `n:${importNorm(r.name)}`}`;
+    groups.set(key, [...(groups.get(key) || []), r]);
+  });
+  groups.forEach(rows => {
+    if (rows.length < 2) return;
+    const [first, ...rest] = rows;
+    first.applyQty = +rows.reduce((sum, r) => sum + r.quantity, 0).toFixed(6);
+    first.applyPrice = first.price > 0 ? first.price : (rows.find(r => r.price > 0)?.price || 0);
+    first.groupRows = rows.map(r => r._row);
+    rest.forEach(r => { r.countedWith = first._row; });
+  });
+
+  live.forEach(r => {
+    if (r.countedWith) {
+      r.mode = 'same';
+      r.statusMsg = `Counted with row ${r.countedWith}`;
+      return;
+    }
+    const rowsNote = r.groupRows ? ` · rows ${r.groupRows.join(' + ')}` : '';
+    if (r.matchIds) {
+      r.oldQty = r.matchIds.reduce((s, mid) =>
+        s + (holdings.find(x => x.id === mid)?.quantity || 0), 0);
+      if (Math.abs(r.oldQty - r.applyQty) < 1e-9) {
+        r.mode = 'same';
+        r.statusMsg = `No change${rowsNote}`;
+      } else {
+        r.mode = 'update';
+        r.statusMsg = `Update: ${fmtN(r.oldQty)} → ${fmtN(r.applyQty)} sh${rowsNote}`;
+      }
+      return;
+    }
+    r.mode = 'add';
+    r.statusMsg = (r.applyPrice > 0 ? 'New holding' : 'No price — fetch after import') + rowsNote;
+    // New to this account but held in another: almost always the same position
+    // under the broker's name for the account, and importing it would count it
+    // twice. Held back until he says otherwise. A row with no account already
+    // matched across accounts above, so it never gets here.
+    if (!r.account) return;
+    const where = [...new Set(importHolders(r)
+      .filter(h => !sameAccount(h.account, r.account))
+      .map(h => h.account || 'Unassigned'))];
+    if (where.length) {
+      r.elsewhere = where;
+      r.statusMsg = `Already held in ${where.join(' and ')} — add as a second position?${rowsNote}`;
+    }
+  });
+}
+
+const importHeldBack = r => !!r.elsewhere && !r.addAnyway;
+
+// Labels that get a mapping line: every one that is not in HIS list. A label an
+// earlier "Keep" import turned into an account still gets its line — dropping
+// it left the next import of the same file with nothing but "Add anyway". So
+// does any label he has mapped, or whose rows are held elsewhere.
+function importMapLabels() {
+  const live = importRows.filter(r => r.status !== 'err' && r.csvAccount);
+  return [...new Set(live.map(r => r.csvAccount))].filter(l =>
+    !ACCOUNTS.some(a => sameAccount(a, l)) || importAccountMap.has(l) ||
+    live.some(r => r.csvAccount === l && r.elsewhere));
+}
+
+function setImportAccount(label, account, focusId) {
+  if (account) importAccountMap.set(label, account); else importAccountMap.delete(label);
+  // A tick said "add it to THAT account", and "reinvested dividend" described
+  // the update he was looking at; a re-map can change both, so he is asked again.
+  importRows.forEach(r => {
+    r.kind = null;
+    if (r.csvAccount === label) r.addAnyway = false;
+  });
+  refreshImportPreview(focusId);
+}
+
+function setImportAddAnyway(rowNo, on, focusId) {
+  const r = importRows.find(x => x._row === rowNo);
+  if (r) r.addAnyway = on;
+  refreshImportPreview(focusId);
+}
+
+// Kept on the row, not only in the DOM: every re-render replaces the control.
+function setImportKind(rowNo, kind) {
+  const r = importRows.find(x => x._row === rowNo);
+  if (r) r.kind = kind;
+}
+
+function refreshImportPreview(focusId) {
+  reconcileImportRows();
+  renderImportPreview();
+  // The re-render replaced the control he was on; give the keyboard back.
+  if (focusId) document.getElementById(focusId)?.focus();
 }
 
 function renderImportPreview() {
   const okRows   = importRows.filter(r => r.status === 'ok');
   const warnRows = importRows.filter(r => r.status === 'warn');
   const errRows  = importRows.filter(r => r.status === 'err');
-  const adds     = importRows.filter(r => r.mode === 'add' && r.status !== 'err');
+  const heldBack = importRows.filter(importHeldBack);
+  const adds     = importRows.filter(r => r.mode === 'add' && r.status !== 'err' && !importHeldBack(r));
   const updates  = importRows.filter(r => r.mode === 'update');
-  const sames    = importRows.filter(r => r.mode === 'same');
-  const importable = okRows.length + warnRows.length - sames.length;
+  const merged   = importRows.filter(r => r.countedWith);
+  const sames    = importRows.filter(r => r.mode === 'same' && !r.countedWith);
+  // A group of rows is ONE change, carried by its first row.
+  const importable = adds.length + updates.length;
 
   document.getElementById('importSummary').innerHTML =
     `Found <strong>${importRows.length}</strong> rows: ` +
     `<span style="color:#10b981">${adds.length} new</span>, ` +
     `<span style="color:#3b82f6">${updates.length} updating</span>, ` +
     `<span style="color:var(--text-muted)">${sames.length} unchanged</span>` +
+    (merged.length ? `, <span style="color:var(--text-muted)">${merged.length} counted with another row</span>` : '') +
+    (heldBack.length ? `, <span style="color:#d97706">${heldBack.length} already held elsewhere</span>` : '') +
     (warnRows.length ? `, <span style="color:#d97706">${warnRows.length} missing price</span>` : '') +
     (errRows.length ? `, <span style="color:#dc2626">${errRows.length} skipped</span>` : '') + '.';
 
@@ -994,32 +1125,72 @@ function renderImportPreview() {
                    : `Import ${importable} holding${importable !== 1 ? 's' : ''}`;
   document.getElementById('btnConfirmImport').disabled = importable === 0;
 
+  document.getElementById('importAccountMap').innerHTML = importAccountMapHTML();
+
   document.getElementById('importTableBody').innerHTML = importRows.map(r => {
     const sub = [r.ticker && r.ticker !== r.name ? r.ticker : '', r.account].filter(Boolean).join(' · ');
     // A quantity INCREASE on an existing holding may be a reinvested
     // distribution rather than new money — misclassifying it as a flow would
     // strip that income out of TWR, so the human decides here, one tap.
-    const kindPicker = r.mode === 'update' && r.quantity > r.oldQty
-      ? `<div style="margin-top:4px;"><select id="imp-kind-${r._row}" class="imp-kind">
+    const kindPicker = r.mode === 'update' && r.applyQty > r.oldQty
+      ? `<div style="margin-top:4px;"><select id="imp-kind-${r._row}" class="imp-kind"
+             onchange="setImportKind(${r._row}, this.value)">
            <option value="adjustment">New money / true-up</option>
-           <option value="dividend">Reinvested dividend</option>
+           <option value="dividend" ${r.kind === 'dividend' ? 'selected' : ''}>Reinvested dividend</option>
          </select></div>`
       : '';
-    return `<tr class="row-${r.status}">
+    const dupCheck = r.elsewhere
+      ? `<label class="imp-dup"><input type="checkbox" id="imp-dup-${r._row}" ${r.addAnyway ? 'checked' : ''}
+           onchange="setImportAddAnyway(${r._row}, this.checked, this.id)"> Add anyway</label>`
+      : '';
+    // Amber is "look before you import": no price, or held in another account.
+    const tone = r.elsewhere ? 'warn' : r.status;
+    return `<tr class="row-${tone}">
       <td style="color:var(--text-muted)">${r._row}</td>
       <td>
         <strong>${esc(r.name || '—')}</strong>
         ${sub ? `<div style="font-size:13px;color:var(--text-muted);margin-top:2px;">${esc(sub)}</div>` : ''}
       </td>
-      <td>${typeBadge(r.type)}</td>
-      <td class="num">${r.quantity > 0 ? fmtN(r.quantity) : '—'}</td>
-      <td class="num">${r.price > 0 ? fmt$(r.price) : '—'}</td>
-      <td class="status-${r.status}">${r.statusMsg}${kindPicker}</td>
+      <td data-label="Type">${typeBadge(r.type)}</td>
+      <td class="num" data-label="Shares">${r.quantity > 0 ? fmtN(r.quantity) : '—'}</td>
+      <td class="num" data-label="Price">${r.price > 0 ? fmt$(r.price) : '—'}</td>
+      <td class="status-${tone}">${esc(r.statusMsg)}${kindPicker}${dupCheck}</td>
     </tr>`;
   }).join('');
 
   document.getElementById('importPreview').style.display = '';
-  document.getElementById('importPreview').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// One line per label that may not be his account's name. "Keep" is always the
+// default: a merge into an existing account is his call, never a guess — the
+// hint only says where these positions already are, and what choosing it does.
+function importAccountMapHTML() {
+  const known = knownImportAccounts();
+  return importMapLabels().map((label, i) => {
+    const chosen = importAccountMap.get(label) || '';
+    // The label may already BE an account (his, or one an earlier import made):
+    // that is what "Keep" means then, and it is not offered a second time.
+    const own = known.find(a => sameAccount(a, label));
+    const options = known.filter(a => a !== own);
+    const rows = importRows.filter(r => r.status !== 'err' && r.csvAccount === label);
+    const hits = options.map(a => rows.filter(r =>
+      importHolders(r).some(h => sameAccount(h.account, a))).length);
+    const n = Math.max(...hits), best = options[hits.indexOf(n)];
+    const hint = n > 0 && chosen !== best
+      ? `<div class="imp-map-hint">${n} of ${rows.length} position${rows.length !== 1 ? 's' : ''} ` +
+        `${n === 1 ? 'is' : 'are'} already held in ${esc(best)} — choose it above to update ` +
+        `${n === 1 ? 'it' : 'them'} instead.</div>`
+      : '';
+    return `<div class="imp-map-row">
+      <span class="imp-map-label">${esc(label)}</span><span class="imp-map-arrow" aria-hidden="true">→</span>
+      <select id="imp-acct-${i}" class="imp-acct" data-csv-label="${esc(label)}" aria-label="Account for ${esc(label)}"
+        onchange="setImportAccount(this.dataset.csvLabel, this.value, this.id)">
+        <option value="">${own ? `Keep in "${esc(own)}"` : `Keep "${esc(label)}" as a new account`}</option>
+        ${options.map(a => `<option value="${esc(a)}" ${a === chosen ? 'selected' : ''}>${esc(a)}</option>`).join('')}
+      </select>
+      ${hint}
+    </div>`;
+  }).join('');
 }
 
 // Apply a new total quantity across one or more holding rows (a split pair
@@ -1061,26 +1232,26 @@ function applyQuantityUpdate(ids, newTotalQty, { price = null, source = 'manual'
 function confirmImport() {
   let added = 0, updated = 0;
   importRows.filter(r => r.status !== 'err').forEach(r => {
-    if (r.mode === 'same') return;
+    if (r.mode === 'same' || importHeldBack(r)) return;
     if (r.mode === 'update') {
       // Distributing across rows[] handles both a single match and a split
       // pair; keep the existing rows' account/type/sleeve — the CSV only
       // speaks for quantity and price.
       const kind = document.getElementById(`imp-kind-${r._row}`)?.value === 'dividend'
         ? 'dividend' : 'adjustment';
-      if (applyQuantityUpdate(r.matchIds, r.quantity, { price: r.price, source: 'import', kind })) updated++;
+      if (applyQuantityUpdate(r.matchIds, r.applyQty, { price: r.applyPrice, source: 'import', kind })) updated++;
       return;
     }
     holdings.push({
       id: uid(), name: r.name, type: r.type,
       ticker:  r.ticker  || '',
       account: r.account || '',
-      quantity: r.quantity, price: r.price,
+      quantity: r.applyQty, price: r.applyPrice,   // a group's sum rides on its first row
       updated: new Date().toISOString(),
     });
     added++;
   });
-  importRows = [];
+  importRows = []; importAccountMap = new Map();
   document.getElementById('importPreview').style.display = 'none';
   markUnsaved(); render();
   const parts = [];
@@ -1090,7 +1261,7 @@ function confirmImport() {
 }
 
 function cancelImport() {
-  importRows = [];
+  importRows = []; importAccountMap = new Map();
   document.getElementById('importPreview').style.display = 'none';
 }
 
