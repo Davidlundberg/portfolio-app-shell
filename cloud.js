@@ -452,15 +452,122 @@ function hideCloudMenu() { document.getElementById('cloudMenu').style.display = 
 // their original chains when this returns null.
 const CLOUD_FN = CLOUD_URL + '/functions/v1/portfolio-quotes';
 
+// ─── A fresh token on every call to the function ─────────────────────────────
+// Until 2026-10-04 proxyGet and proxyPost sent cloudSession.access_token as it
+// stood when the last auth event fired. supabase-js keeps that token fresh on a
+// 30 s timer and again when the page comes back to the front, but a phone PWA
+// resumed after more than the token's hour can send before either has run: the
+// timer froze with the page, and the resume refresh is async, so a question
+// sent in the first moments after resume races it. The function answers 401
+// "sign in required" and Ask said the session had expired when one refresh
+// would have done. (The /ask 401 at 2026-10-04 03:21 UTC that raised this was
+// the Drop 1 deploy's own curl gate check, not the phone — edge log user agent
+// curl/8.7.1, publishable key as bearer — so this closes a race; no phone
+// request has been seen to hit it.)
+//
+// getSession() is the library's own answer: it returns the stored session and
+// refreshes it first when it expires within 90 s (supabase-js 2.110.0
+// __loadSession: 3 ticks of 30 s), under the client's lock, so it waits for a
+// refresh already running instead of racing it. The 60 s floor after it is
+// ours, so a library whose margin shrinks, or a clock that disagrees, still
+// never sends a token with under a minute left. A token the function refuses
+// anyway gets one refresh and one retry (authedFetch), never a loop.
+const TOKEN_MIN_LIFE_S = 60;
+const tokenLife = s => (s && s.expires_at ? s.expires_at - Date.now() / 1000 : Infinity);
+
+// The session is gone for good: the auth server refused the refresh token, or
+// nothing is stored any more (signed out in another tab). A state of the app,
+// not a failed request — callers show the sign-in line, not an error.
+class SignedOutError extends Error {
+  constructor() { super('not signed in'); this.name = 'SignedOutError'; }
+}
+// A refresh that could not reach the auth server is a connection problem, not
+// a sign-out: it surfaces as the TypeError a failed fetch would.
+const authUnreachable = () => new TypeError('could not reach sign-in');
+const isRetryableAuthError = e => !!e && e.name === 'AuthRetryableFetchError';
+
+function cloudSignedOut() {
+  cloudSession = null;
+  renderCloudButton();     // header and Ask card both follow
+}
+
+let tokenRenewal = null;   // one refresh in flight, shared by every refused call
+
+// → a token other than `refused`, or null once the session is gone for good.
+async function renewAccessToken(refused) {
+  // A parallel call (the chart fan-out) already swapped the token: use that.
+  if (cloudSession && cloudSession.access_token && cloudSession.access_token !== refused) {
+    return cloudSession.access_token;
+  }
+  if (!tokenRenewal) {
+    tokenRenewal = (async () => {
+      let res;
+      // Throws only on a lock timeout or a client without auth: say "could not
+      // reach" rather than sign him out on something we cannot read.
+      try { res = await sb.auth.refreshSession(); } catch { throw authUnreachable(); }
+      const s = res && res.data && res.data.session;
+      if (s && s.access_token) { cloudSession = s; return s.access_token; }
+      if (isRetryableAuthError(res && res.error)) throw authUnreachable();
+      // Refused. Another tab may have rotated the refresh token first; then
+      // the library's store holds the winner, and that is not a sign-out.
+      try {
+        const got = await sb.auth.getSession();
+        const w = got && got.data && got.data.session;
+        if (w && w.access_token && w.access_token !== refused && tokenLife(w) > TOKEN_MIN_LIFE_S) {
+          cloudSession = w;
+          return w.access_token;
+        }
+      } catch { /* nothing better to send */ }
+      cloudSignedOut();
+      return null;
+    })().finally(() => { tokenRenewal = null; });
+  }
+  return tokenRenewal;
+}
+
+// → the token to send now, or null when signed out.
+async function accessToken() {
+  if (!cloudReady()) return null;
+  let s = cloudSession, error = null;
+  try {
+    const got = await sb.auth.getSession();
+    s = (got && got.data && got.data.session) || null;
+    error = (got && got.error) || null;
+  } catch {
+    // Lock timeout (5 s) or a stand-in client: send what we hold. A refusal
+    // still gets its one refresh below, exactly as before this existed.
+    s = cloudSession;
+  }
+  if (!s || !s.access_token) {
+    if (isRetryableAuthError(error)) throw authUnreachable();
+    cloudSignedOut();
+    return null;
+  }
+  cloudSession = s;
+  return tokenLife(s) > TOKEN_MIN_LIFE_S ? s.access_token : renewAccessToken(s.access_token);
+}
+
+// One call to the function with a fresh token. A 401 here is the gateway's or
+// requireUser's — both before any work is done (index.ts), so the retry costs
+// nothing upstream. The caller's signal spans both attempts.
+async function authedFetch(url, init) {
+  const token = await accessToken();
+  if (!token) throw new SignedOutError();
+  const send = t => fetch(url, { ...init,
+    headers: { ...init.headers, Authorization: 'Bearer ' + t, apikey: CLOUD_KEY } });
+  const res = await send(token);
+  if (res.status !== 401) return res;
+  const again = await renewAccessToken(token);
+  if (!again) throw new SignedOutError();
+  return send(again);
+}
+
 async function proxyGet(path, params) {
   if (!cloudReady()) return null;
   try {
     const qs = new URLSearchParams(params).toString();
-    const res = await fetch(`${CLOUD_FN}${path}?${qs}`, {
-      headers: {
-        Authorization: 'Bearer ' + cloudSession.access_token,
-        apikey: CLOUD_KEY,
-      },
+    const res = await authedFetch(`${CLOUD_FN}${path}?${qs}`, {
+      headers: {},
       signal: AbortSignal.timeout(9000),
     });
     if (!res.ok) return null;
@@ -476,16 +583,14 @@ async function proxyGet(path, params) {
 // Ask passes 90s, which deliberately outlives the function's own 85s upstream
 // budget. A caller that needs to cancel early (Ask's Clear) passes its own
 // signal; whichever fires first ends the request.
+// A session that cannot be renewed throws SignedOutError, which Ask shows as
+// its sign-in line rather than an error in the thread.
 async function proxyPost(path, body, timeoutMs = 60000, signal = null) {
-  if (!cloudReady()) throw new Error('not signed in');
+  if (!cloudReady()) throw new SignedOutError();
   const timeout = AbortSignal.timeout(timeoutMs);
-  const res = await fetch(`${CLOUD_FN}${path}`, {
+  const res = await authedFetch(`${CLOUD_FN}${path}`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'Bearer ' + cloudSession.access_token,
-      apikey: CLOUD_KEY,
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
     signal: signal && AbortSignal.any ? AbortSignal.any([signal, timeout]) : timeout,
   });

@@ -30,7 +30,7 @@
  * Chromium, shell sandbox — including the first hop from v1.10.5, whose page
  * has no offer to show).
  */
-const VERSION = 'v1.11.0';
+const VERSION = 'v1.12.0';
 const SHELL_CACHE = `portfolio-shell-${VERSION}`;
 const RUNTIME_CACHE = `portfolio-runtime-${VERSION}`;
 

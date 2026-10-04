@@ -71,7 +71,9 @@
   --accent-light: #2dd4bf;
   --navy: #3b6da0;
   --navy-muted: rgba(30,58,95,0.15);
-  --navy-text: #3b6da0;
+  /* #3b6da0 measured 3.24:1 on the dark card at 11-12px (the week card's
+     headings, the tile names); #6b9bd1 is ~6:1 (CPO, Drop 2 round 2). */
+  --navy-text: #6b9bd1;
   --shadow-card: 0 2px 8px rgba(13,148,136,0.06), 0 1px 2px rgba(0,0,0,0.2);
   --shadow-elevated: 0 8px 24px rgba(13,148,136,0.1), 0 2px 6px rgba(0,0,0,0.25);
   --shadow-toast: 0 8px 24px rgba(0,0,0,0.4), 0 2px 6px rgba(0,0,0,0.3);
@@ -104,7 +106,7 @@
     --border-hover: #2a3247;
     --navy: #3b6da0;
     --navy-muted: rgba(30,58,95,0.15);
-    --navy-text: #3b6da0;
+    --navy-text: #6b9bd1;
     --shadow-card: 0 2px 8px rgba(13,148,136,0.06), 0 1px 2px rgba(0,0,0,0.2);
     --shadow-elevated: 0 8px 24px rgba(13,148,136,0.1), 0 2px 6px rgba(0,0,0,0.25);
     --shadow-toast: 0 8px 24px rgba(0,0,0,0.4), 0 2px 6px rgba(0,0,0,0.3);
@@ -161,25 +163,42 @@ h2 {
   to   { box-shadow: 0 0 0 4px rgba(13,148,136,0.2); }
 }
 
-/* ── Header ── */
+/* ── Header ──
+   One flex row: the label shares its line with the buttons, and the total and
+   the two quiet lines run the full width beneath (flex-basis 100%). The text
+   block is display:contents so its children join that row. Drop 2
+   (2026-10-04): the buttons used to wrap onto a 44px row of their own under
+   five lines of text — 210px of header at 393. Where the cloud button is
+   long ("Set up phone access", local mode on a narrow window) the buttons
+   wrap below the label rather than squeeze it. */
 .header {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 32px; flex-wrap: wrap; gap: 16px;
+  display: flex; flex-wrap: wrap; align-items: center;
+  column-gap: 12px; row-gap: 2px; margin-bottom: 24px;
 }
-.header-left { display: flex; flex-direction: column; gap: 2px; }
+.header-left { display: contents; }
 .total-label {
+  order: 0; flex: 1 1 auto;
   font-size: 11px; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.03em; color: var(--text-muted);
 }
 .total-value {
+  order: 2; flex: 1 0 100%; margin-top: 2px;
   font-size: 48px; font-weight: 500; letter-spacing: -1.2px;
   color: var(--text-primary); line-height: 1.0;
   font-feature-settings: "cv01", "tnum";
 }
 .total-updated {
+  order: 3; flex: 1 0 100%;
   font-size: 13px; font-weight: 400; color: var(--text-muted); margin-top: 2px;
 }
-.header-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.total-updated:empty { display: none; }
+/* Saved · prices — one status line from two writers (render, the refresh). */
+#lastSavedLabel:not(:empty) + #lastRefreshedLabel:not(:empty)::before { content: ' · '; }
+.header-actions { order: 1; margin-left: auto; display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+/* Square 44px icon buttons (↻, ⋯) — the phone's minimum tap target. */
+.btn-icon { flex: none; width: 44px; min-height: 44px; padding: 0; justify-content: center; font-size: 18px; }
+.header-actions #btnCloud { padding: 8px 10px; }
+#btnRefreshAll[aria-busy="true"] { opacity: 0.55; }
 .hdr-more { position: relative; }
 .hdr-more > summary { list-style: none; cursor: pointer; }
 .hdr-more > summary::-webkit-details-marker { display: none; }
@@ -208,17 +227,6 @@ h2 {
 .shell-update-chip:hover { background: rgba(13,148,136,0.15); }
 [data-theme="dark"] .shell-update-chip { color: var(--accent-light); }
 
-/* ── Theme toggle ── */
-.theme-toggle {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 36px; height: 36px; border: 1px solid var(--border-default);
-  border-radius: 6px; background: transparent; cursor: pointer;
-  color: var(--text-secondary); font-size: 18px;
-  transition: all 120ms cubic-bezier(0.22, 1, 0.36, 1);
-}
-.theme-toggle:hover { background: var(--hover-bg); border-color: var(--border-hover); }
-.theme-toggle:focus-visible { outline: none; box-shadow: 0 0 0 4px rgba(13,148,136,0.2); }
-
 /* ── Cards ── */
 .card {
   background: var(--bg-card);
@@ -239,20 +247,26 @@ h2 {
   border-top: 1px solid rgba(255,255,255,0.08);
 }
 
-/* ── Account tiles ── */
+/* ── Account tiles ──
+   A grid, never a strip. They were a sideways scroller: 684px of tiles in a
+   361px column at 393, two of four visible, the 401K off-screen (Drop 2,
+   2026-10-04). Two columns on a phone (all four on the first screen), up to
+   four across on a wide one. minmax(0, …) so no tile's text can widen its
+   track past the column. */
 .account-tiles {
-  display: flex; gap: 12px; overflow-x: auto;
-  padding-bottom: 4px; margin-bottom: 24px;
-  scrollbar-width: none;
+  display: grid; gap: 10px; margin-bottom: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
 }
-.account-tiles::-webkit-scrollbar { display: none; }
+@media (max-width: 640px) {
+  .account-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .account-tile {
   background: var(--bg-card);
   border: 1px solid var(--border-default);
   border-radius: 10px;
-  padding: 14px 18px;
+  padding: 12px 14px;
   box-shadow: var(--shadow-card);
-  min-width: 150px; flex-shrink: 0;
+  min-width: 0;
   border-top: 3px solid transparent;
   transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
               box-shadow 200ms cubic-bezier(0.22, 1, 0.36, 1),
@@ -264,7 +278,7 @@ h2 {
 }
 .account-tile-name {
   font-size: 11px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: 0.03em; color: var(--navy-text);
+  letter-spacing: 0.03em; color: var(--navy-text); overflow-wrap: anywhere;
 }
 .account-tile-value {
   font-size: 1.25rem; font-weight: 600; color: var(--text-primary);
@@ -273,18 +287,13 @@ h2 {
 .account-tile-pct { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
 
 /* ── Form ── */
-.form-row {
-  display: grid;
-  grid-template-columns: 2.2fr 1fr 1fr 1fr auto auto;
-  gap: 10px; align-items: end;
-}
 .form-group { display: flex; flex-direction: column; gap: 4px; }
 .form-group label {
   font-size: 14px; font-weight: 500; color: var(--text-secondary);
   letter-spacing: -0.1px;
 }
 
-input[type="text"], input[type="number"], select {
+input[type="text"], input[type="number"], input[type="date"], select {
   border: 1px solid var(--border-default);
   border-radius: 6px;
   padding: 8px 12px;
@@ -302,7 +311,7 @@ input[type="text"], input[type="number"], select {
   background: var(--bg-input);
   appearance: none;
 }
-input[type="text"]:focus, input[type="number"]:focus, select:focus {
+input[type="text"]:focus, input[type="number"]:focus, input[type="date"]:focus, select:focus {
   border-color: var(--accent);
   animation: focus-glow 200ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
   outline: none;
@@ -412,13 +421,85 @@ tr:hover td { background: var(--row-hover); }
   margin-left: 4px; text-transform: uppercase; letter-spacing: 0.03em;
 }
 
-/* ── Performance chart ── */
-.perf-chart-container { position: relative; height: 220px; }
-.perf-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 12px; }
-.perf-legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary); }
-.perf-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-.perf-empty { font-size: 15px; color: var(--text-muted); padding: 40px 0; text-align: center; }
-.perf-note { font-size: 12px; color: var(--text-muted); margin: 10px 0 0; line-height: 1.45; }
+/* ── This week (Drop 2, 2026-10-04) ──
+   Two lines shut, one tap open. What he reads is 14–16px and nothing is under
+   12px; every row is a flex line that wraps its name before it widens, so
+   nothing in the card — strip, lines or chart — scrolls sideways at 375. The
+   Performance card it replaced was "impossible to read on a phone". */
+.week-card { padding: 16px 20px; }
+.week-head {
+  display: block; width: 100%; text-align: left; background: none; border: 0; padding: 0;
+  font: inherit; color: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.week-head:disabled { cursor: default; }
+/* Nothing to open yet (signed out with no cache, or loading): no chevron, so
+   the head does not look tappable. */
+.week-head:disabled .week-chev { visibility: hidden; }
+.week-head:focus-visible { outline: none; box-shadow: 0 0 0 4px rgba(13,148,136,0.2); border-radius: 6px; }
+.week-kick { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.week-title {
+  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--navy-text); white-space: nowrap;
+}
+.week-when { flex: 1; min-width: 0; font-size: 13px; color: var(--text-muted); }
+/* Drawn, not a glyph, and turned inside a fixed 22px box: a "›" turned 90°
+   carried its font's ink box past the card's edge (9px at 375, 2px even boxed). */
+.week-chev { position: relative; flex: 0 0 22px; width: 22px; height: 22px; color: var(--text-muted); }
+.week-chev::before {
+  content: ''; position: absolute; left: 6px; top: 7px; width: 8px; height: 8px;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg); transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.week-open .week-chev::before { transform: rotate(45deg); }
+.week-l1 { display: block; font-size: 16px; line-height: 1.4; }
+.week-l1 strong, .week-num, .week-key strong { font-feature-settings: "cv01", "tnum"; }
+.week-l1 strong { font-weight: 600; }
+/* "· net of $X added" moves to a second line whole, never word by word. */
+.week-nw { white-space: nowrap; }
+.week-l2 { display: block; margin-top: 2px; font-size: 14px; line-height: 1.45; color: var(--text-secondary); }
+.week-body { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-subtle); }
+.week-tabs { display: flex; gap: 4px; padding: 3px; margin-bottom: 4px; background: var(--bg-surface); border-radius: 8px; }
+.week-tab {
+  flex: 1 1 0; min-width: 0; min-height: 36px; border: 0; border-radius: 6px; cursor: pointer;
+  font: inherit; font-size: 14px; white-space: nowrap; background: transparent; color: var(--text-secondary);
+}
+.week-tab-on { background: var(--bg-card); color: var(--text-primary); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,0.1); }
+.week-tab:disabled { opacity: 0.45; cursor: default; }
+.week-tab:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(13,148,136,0.25); }
+.week-sec {
+  margin: 16px 0 2px; font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.03em; color: var(--navy-text);
+}
+.week-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  padding: 7px 0; font-size: 15px; border-bottom: 1px solid var(--border-subtle);
+}
+.week-row:last-child { border-bottom: 0; }
+.week-name { min-width: 0; overflow-wrap: anywhere; }
+.week-num { flex: 0 0 auto; text-align: right; white-space: nowrap; }
+.week-sub { font-size: 13px; color: var(--text-muted); }
+.week-note-line { display: block; margin-top: 1px; font-size: 13px; line-height: 1.35; color: var(--text-muted); }
+.week-plan { font-size: 15px; line-height: 1.45; }
+.week-legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 18px 0 6px; font-size: 14px; color: var(--text-secondary); }
+.week-key { display: inline-flex; align-items: center; gap: 7px; }
+.week-key strong { font-weight: 600; color: var(--text-primary); }
+.week-swatch { display: inline-block; width: 16px; height: 3px; border-radius: 2px; }
+.week-swatch-you { background: #0d9488; }
+.week-swatch-sp  { background: #4a3aa7; }
+[data-theme="dark"] .week-swatch-sp { background: #9085e9; }
+.week-chart { position: relative; width: 100%; min-width: 0; height: 220px; }
+.week-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px; }
+.week-chips > .week-sub { flex-basis: 100%; }
+.week-foot { margin-top: 10px; font-size: 12px; line-height: 1.45; color: var(--text-muted); }
+/* Midweek "So far": set apart from last week's money lines (CPO, round 2). */
+.week-since { margin-top: 12px; border-top: 1px solid var(--border-default); }
+.week-since > .week-sec { margin-top: 10px; }
+@media (max-width: 640px) {
+  .week-card { padding: 16px; }
+  /* 44px: the controls on the card he taps more than once a visit (40 until
+     Drop 2 round 1, CPO). */
+  .week-tab { min-height: 44px; }
+}
 .return-positive { color: #10b981; }
 .return-negative { color: #ef4444; }
 
@@ -479,30 +560,7 @@ td select { padding-right: 24px; }
 .import-note { font-size: 13px; color: var(--text-secondary); margin-top: 10px; }
 .import-note a { color: var(--accent); cursor: pointer; text-decoration: underline; }
 
-/* ── Bottom row ── */
-.bottom-row { display: grid; grid-template-columns: 1fr 280px; gap: 20px; align-items: start; }
-.chart-container { position: relative; width: 100%; max-width: 240px; margin: 0 auto; }
-.legend { list-style: none; display: flex; flex-direction: column; gap: 8px; }
-.legend li { display: flex; align-items: center; gap: 8px; font-size: 14px; }
-.legend-dot  { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-.legend-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-secondary); }
-.legend-pct  { font-weight: 600; color: var(--text-primary); font-feature-settings: "cv01", "tnum"; }
-.chart-toggle { display: flex; gap: 4px; }
-.chart-toggle .toggle-btn {
-  padding: 4px 12px; font-size: 13px; font-weight: 500;
-  border-radius: 9999px; border: 1px solid var(--border-default);
-  background: transparent; color: var(--text-secondary);
-  cursor: pointer;
-  transition: all 120ms cubic-bezier(0.22, 1, 0.36, 1);
-  font-family: inherit; font-feature-settings: "cv01";
-}
-.chart-toggle .toggle-btn:hover { background: var(--hover-bg); border-color: var(--border-hover); }
-.chart-toggle .toggle-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-
-/* ── Allocation Strategy ── */
-.alloc-grid {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 32px;
-}
+/* ── Targets (Plan & settings) ── */
 .subsection-label {
   font-size: 11px; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.03em; color: var(--navy-text); margin-bottom: 10px;
@@ -520,22 +578,6 @@ td select { padding-right: 24px; }
   font-feature-settings: "cv01", "tnum";
 }
 .target-warning { font-size: 13px; color: #f59e0b; margin-top: 6px; min-height: 18px; }
-
-.gap-table { width: 100%; border-collapse: collapse; }
-.gap-table th {
-  text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: 0.03em; color: var(--text-muted); padding: 0 0 10px; white-space: nowrap;
-}
-.gap-table th.r, .gap-table td.r { text-align: right; }
-.gap-table td {
-  padding: 10px 0; border-top: 1px solid var(--border-subtle); font-size: 15px;
-  font-feature-settings: "cv01", "tnum";
-}
-.gap-table tr:first-child td { border-top: none; }
-.gap-under { color: #ef4444; font-weight: 600; }
-.gap-over  { color: #10b981; font-weight: 600; }
-.gap-ok    { color: var(--text-muted); }
-.sleeve-label { display: flex; align-items: center; gap: 7px; }
 
 /* ── Investment Advisor ── */
 .adv-rec-box {
@@ -618,30 +660,19 @@ td select { padding-right: 24px; }
 
 input[type="file"] { display: none; }
 
-/* ── Advisor: market strip + drift vs policy ── */
+/* ── Where you stand: drift vs policy ──
+   The whole card since 2026-10-04 (Market and What moved went to This week),
+   so its Show/Hide sits beside the card title. */
+.adv-title-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.adv-title-row h2 { margin-bottom: 0; }
 .subsection-flex {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
 }
-.mkt-row {
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px;
-  font-size: 13px; padding: 6px 0;
-  border-bottom: 1px solid var(--border);
-}
-.mkt-row:last-of-type { border-bottom: none; }
-.mkt-tick { font-weight: 600; min-width: 104px; }
-.mkt-last { font-variant-numeric: tabular-nums; min-width: 84px; }
-.mkt-move { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--text-secondary); }
+/* Drift figures' signs (moveClass). */
 .mkt-up   { color: #15803d; }
 .mkt-down { color: #dc2626; }
 [data-theme="dark"] .mkt-up   { color: #4ade80; }
 [data-theme="dark"] .mkt-down { color: #f87171; }
-.mkt-off { font-size: 12px; color: var(--text-muted); margin-left: auto; }
-.mkt-na  { font-size: 12px; color: var(--text-muted); }
-/* Unloaded, the strip is one paragraph with no margin, and the next heading
-   ("What moved your money") sat flush under it (0px, measured at 390) as if
-   it captioned the market.
-   12px matches the gap the loaded strip leaves via its .risk-note. */
-.mkt-empty { margin-bottom: 12px; }
 
 .drift-head { font-size: 14px; margin: 4px 0 10px; }
 .drift-ok     { color: #15803d; }
@@ -659,17 +690,9 @@ input[type="file"] { display: none; }
 .drift-row .num { text-align: right; font-variant-numeric: tabular-nums; }
 .drift-row-breach { font-weight: 600; }
 .drift-sub { display: block; font-size: 11px; font-weight: 400; color: var(--text-muted); }
-/* Typed as input[type="number"] so it must out-specify the global field style
-   that stretches every input to 100% — these two sit inline inside a sentence. */
-input.band-input {
-  width: 52px; display: inline-block; vertical-align: baseline;
-  padding: 1px 5px; min-height: 0; font-size: 12px; text-align: center;
-}
+.drift-amt { white-space: nowrap; }
 @media (max-width: 640px) {
-  .mkt-tick { min-width: 100%; }
-  .mkt-off { margin-left: 0; }
   .drift-row { grid-template-columns: minmax(60px, 1.2fr) repeat(3, minmax(56px, 1fr)); gap: 6px; }
-  .band-input { font-size: 16px; }
 }
 
 /* ── Ask ──
@@ -685,6 +708,10 @@ input.band-input {
 .ask-link:focus-visible { outline: none; box-shadow: 0 0 0 4px rgba(13,148,136,0.2); border-radius: 4px; }
 [data-theme="dark"] .ask-link { color: var(--accent-light); }
 #askEarlier { display: block; margin-bottom: 12px; }
+/* A link inside a line of prose: the prose's own size, and a taller hit area
+   than the text without moving the lines around it. */
+/* 13px each side: "Change your bands" measured 42px tall at 12 (CPO, Drop 2 round 1). */
+.ask-link.inline-link { font-size: inherit; padding: 13px 0; margin: -13px 0; }
 /* A readable measure: on a wide screen the card is far wider than a paragraph should be. */
 #askThread, .ask-box, .ask-signin, .ask-chips, .risk-note.ask-note { max-width: 720px; }
 .ask-box { display: flex; gap: 8px; align-items: flex-end; }
@@ -744,6 +771,13 @@ input.band-input {
   .ask-box textarea::placeholder { font-size: 13px; }
   .ask-box .btn { height: 44px; padding: 0 12px; }
   .ask-chip { padding: 9px 14px; }
+  /* Starters are 37px tall and now sit under every thread: a 44px tap target
+     is laid over each (as for Clear below) rather than growing the rows. The
+     8px gap between rows leaves the two overlays 1px apart. */
+  .ask-chip { position: relative; }
+  .ask-chip::after {
+    content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 44px; transform: translateY(-50%);
+  }
   /* Clear / Show earlier are a line of 13px text: a 44px tap target is laid
      over each, so the finger gets its room and nothing on the card moves. */
   #askClear, #askEarlier { position: relative; }
@@ -769,33 +803,70 @@ input.band-input {
 .card-collapsible:not([open]) .collapse-hint::after { content: ' ＋'; }
 .adv-quiet { font-size: 13px; margin-bottom: 12px; }
 
-/* ── Advisor: attribution ── */
-.attrib-picker { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.attrib-on { border-color: var(--accent); color: var(--accent); font-weight: 600; }
-.attrib-head { font-size: 14px; margin: 4px 0 10px; }
-.attrib-rows { margin-bottom: 6px; max-width: 680px; }
-.attrib-row {
-  display: grid;
-  grid-template-columns: minmax(110px, 1.6fr) repeat(3, minmax(62px, 0.8fr)) 56px;
-  gap: 10px; align-items: baseline;
-  font-size: 13px; padding: 5px 0;
-  border-bottom: 1px solid var(--border-subtle);
+/* ── One-row cards: Holdings and Plan & settings (Drop 2, 2026-10-04) ──
+   Closed, each is a single tappable row: a title, one muted line of what is
+   inside, and a chevron that turns when open. The summary carries the
+   vertical padding so the whole row (≥56px) is the tap target. */
+.row-card { padding-top: 0; padding-bottom: 0; }
+.row-card[open] { padding-bottom: 12px; }
+.card-collapsible.row-card > summary { padding: 12px 0; min-height: 56px; }
+.card-collapsible.row-card[open] > summary { margin-bottom: 4px; }
+.row-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; min-width: 0; }
+.row-card > summary h2 { margin: 0; }
+.row-meta { font-size: 13px; color: var(--text-muted); font-weight: 400; }
+.row-chev {
+  flex: none; width: 24px; text-align: center; font-size: 22px; line-height: 1;
+  color: var(--text-muted); transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
 }
-.attrib-row:last-child { border-bottom: none; }
-.attrib-row .num { text-align: right; font-variant-numeric: tabular-nums; }
-.attrib-bar {
-  display: block; height: 6px; border-radius: 3px;
-  background: var(--bar-bg); overflow: hidden; align-self: center;
+details[open] > summary > .row-chev { transform: rotate(90deg); }
+.card-collapsible > summary:focus-visible, .plan-sec > summary:focus-visible {
+  outline: none; box-shadow: 0 0 0 4px rgba(13,148,136,0.2); border-radius: 6px;
 }
-.attrib-bar i { display: block; height: 100%; border-radius: 3px; }
-.bar-up   { background: #15803d; }
-.bar-down { background: #dc2626; }
-[data-theme="dark"] .bar-up   { background: #4ade80; }
-[data-theme="dark"] .bar-down { background: #f87171; }
+
+/* Plan & settings: one row per section, each opening in place. Two taps
+   reach any setting: the drawer, then its section. */
+.plan-body { border-top: 1px solid var(--border-subtle); }
+.plan-sec { border-bottom: 1px solid var(--border-subtle); }
+.plan-sec:last-child { border-bottom: none; }
+.plan-sec > summary {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  min-height: 52px; padding: 8px 0; cursor: pointer; list-style: none;
+}
+.plan-sec > summary::-webkit-details-marker { display: none; }
+.plan-sec > summary .row-head { flex-direction: column; align-items: flex-start; }
+.plan-sec-title { font-size: 15px; font-weight: 600; color: var(--text-primary); }
+.plan-sec-body { padding: 4px 0 16px; }
+.plan-note { font-size: 13px; color: var(--text-secondary); margin: 0 0 10px; }
+.plan-note:empty { display: none; }
+.plan-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.plan-field label { display: block; font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+.plan-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 4px; }
+.plan-check { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; font-size: 15px;
+  color: var(--text-secondary); cursor: pointer; }
+.plan-check input { width: 20px; height: 20px; min-height: 0; margin: 0; accent-color: var(--accent); }
+/* Every field in the drawer is a 44px target and 16px type on a phone — the
+   band and tax inputs used to be 22px-tall boxes inside a sentence. */
+#planCard input[type="number"], #planCard input[type="text"], #planCard input[type="date"],
+#planCard select { min-height: 44px; }
+/* Label | field | unit | dollars, on one grid so every field lines up
+   whatever the label or the dollar figure beside it. */
+#planCard .target-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) 72px 24px 76px;
+  align-items: center; column-gap: 8px;
+}
+#planTax .target-row { grid-template-columns: minmax(0, 1fr) 72px 24px; }
+#planCard .target-row label { min-width: 0; }
+#planCard .target-row input[type="number"] { width: 72px; height: 44px; }
+#planCard .target-dollar { min-width: 0; }
+#planCard .pct-label { white-space: nowrap; }
+.add-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; align-items: end; }
+.add-grid .add-wide { grid-column: span 2; }
+.add-grid .plan-actions { margin: 4px 0 0; }
 @media (max-width: 640px) {
-  .attrib-row { grid-template-columns: 1fr repeat(3, minmax(56px, auto)); gap: 6px; }
-  .attrib-bar { display: none; }   /* the numbers already carry it on mobile */
+  .add-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .add-grid .add-wide { grid-column: 1 / -1; }
 }
+.form-hint { font-weight: 400; color: var(--text-muted); }
 
 /* Tax-rate inputs (Allocation Strategy). The asset-location table they used
    to sit under left the Advisor card 2026-10-03; the inputs stayed. */
@@ -804,30 +875,10 @@ input.band-input {
 .band-check { white-space: nowrap; }
 .band-check input { width: auto; min-height: 0; margin-right: 3px; vertical-align: middle; }
 
-/* ── Risk & Exposure card ── */
-.risk-line { font-size: 14px; margin: 4px 0 2px; }
-.risk-line.risk-over { color: #dc2626; }
-[data-theme="dark"] .risk-line.risk-over { color: #f87171; }
+/* Small muted footnote. Named for the Risk & Exposure card it started in; that
+   card left the page in Drop 2 and the class lives on under Ask, the Advisor
+   and the tax rates. */
 .risk-note { font-size: 12px; color: var(--text-muted); margin: 2px 0 12px; }
-.risk-look { margin: 4px 0 2px; }
-.risk-row {
-  display: grid; grid-template-columns: minmax(90px, 1fr) 2fr 64px;
-  gap: 10px; align-items: center;
-  font-size: 13px; padding: 3px 0;
-}
-.risk-bar {
-  height: 8px; border-radius: 4px; background: var(--bar-bg);
-  overflow: hidden; display: block;
-}
-.risk-bar > span { display: block; height: 100%; background: var(--navy); border-radius: 4px; }
-.risk-row .num { text-align: right; font-variant-numeric: tabular-nums; }
-
-/* ── Dividend Income ── at phone width the table stacks like the holdings
-   list (the ≤640px block below), one labelled line per figure. The scroller
-   stays as a safety net: before the stacking, the five-column table was 461px
-   at 390 and pushed the whole page sideways. */
-#divBody { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-#divBody .div-pays { padding-left: 10px; }
 
 /* ── Import kind picker (true-up vs reinvested dividend) ── */
 /* background-color, not the shorthand: that reset the chevron's no-repeat and
@@ -880,7 +931,9 @@ input.band-input {
 .upd-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 .upd-header select {
   padding: 8px 10px; border: 1px solid var(--border-default); border-radius: 8px;
-  background: var(--bg-input); color: var(--text-primary); font-size: 14px;
+  /* background-color: the shorthand wiped the global select chevron, so the
+     account picker read as a text box (CPO, round 2; also in 8c257ce). */
+  background-color: var(--bg-input); color: var(--text-primary); font-size: 14px;
 }
 .upd-line {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -897,8 +950,10 @@ input.band-input {
   padding: 2px 6px; margin-left: 6px; white-space: nowrap;
 }
 .upd-line-inputs { display: flex; gap: 8px; flex-shrink: 0; }
+/* 124px: at 110 a four-digit share count to three places lost its last digit
+   at 375 and 393 (QA, Drop 2 round 1). */
 .upd-line-inputs input {
-  width: 110px; padding: 10px 10px; font-size: 16px; text-align: right;
+  width: 124px; padding: 10px 10px; font-size: 16px; text-align: right;
   border: 1px solid var(--border-default); border-radius: 8px;
   background: var(--bg-input); color: var(--text-primary);
 }
@@ -908,7 +963,7 @@ input.band-input {
 /* Account tiles are tap targets now */
 .account-tile { cursor: pointer; }
 .account-tile:hover, .account-tile:focus-visible { border-color: var(--border-hover); box-shadow: var(--shadow-elevated); }
-.account-tile-hint { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
+.account-tile-hint { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
 
 /* ── Cloud auth gate ── */
 .auth-gate {
@@ -948,17 +1003,129 @@ input.band-input {
 .auth-msg.auth-err { color: #ef4444; }
 #authStepEmail, #authStepCode { display: flex; flex-direction: column; }
 
+/* ── Holdings: positions, Edit, Split ──
+   One line per position (a split fund's two lots are one line, app.js
+   positionsIn). The phone line's second row (.h-meta) is phone-only; the
+   desktop table keeps its subtitle, account headers and buttons. */
+.holdings-table .h-meta { display: none; }
+.holdings-table .v-whole { display: none; }
+.holdings-table .h-pct {
+  font-size: 13px; color: var(--text-secondary); min-width: 42px; text-align: right;
+  font-feature-settings: "cv01", "tnum";
+}
+.holdings-table td.h-price input { width: 85px; text-align: right; }
+.holdings-table tr.hold-edit > td, .holdings-table tr.hold-edit:hover > td,
+.holdings-table tr.hold-split > td, .holdings-table tr.hold-split:hover > td {
+  background: var(--navy-muted); border-top: none; padding: 14px 16px;
+}
+.holdings-table .he-form { display: flex; flex-direction: column; gap: 12px; font-weight: 400; text-align: left; }
+.he-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 12px; }
+.he-wide { grid-column: span 2; }
+.he-f { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.he-f > span:first-child {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.03em; color: var(--text-muted);
+}
+.holdings-table .he-f input[type], .holdings-table .he-f select { height: 36px; font-size: 14px; }
+/* Share counts run to six decimal places; at 375 the spinner
+   and padding cut the last digits off a half-width field. */
+.holdings-table .he-f input[type="number"] { padding-left: 10px; padding-right: 10px; -moz-appearance: textfield; appearance: textfield; }
+.holdings-table .he-f input[type="number"]::-webkit-inner-spin-button,
+.holdings-table .he-f input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.he-split-note { font-size: 14px; color: var(--text-primary); line-height: 36px; }
+.he-hint { font-size: 13px; color: var(--text-muted); margin: 0; }
+.he-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.he-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+.holdings-table .sp-form { display: flex; flex-direction: column; gap: 10px; }
+.sp-title { font-size: 14px; font-weight: 600; color: var(--navy-text); overflow-wrap: anywhere; }
+.sp-line { display: grid; grid-template-columns: 90px minmax(0, 1fr) 130px; gap: 8px; align-items: center; }
+.sp-pct { display: flex; align-items: center; gap: 4px; padding-left: 4px; font-size: 14px; color: var(--text-secondary); }
+.holdings-table .sp-pct input[type] { width: 58px; text-align: right; }
+.sp-qty { font-size: 13px; color: var(--text-secondary); }
+.sp-btns { display: flex; gap: 8px; }
+
+@media (max-width: 640px) {
+  /* Holdings at phone width. Was the generic stacked table: six labelled
+     lines and four buttons per lot, over 3,000px for a dozen lots at 375
+     (2026-10-04). Now: name over "account · ticker", value over its share.
+     The tiles above already carry each account's total, so the account
+     headers give way to the account on each line. */
+  .holdings-table tr.acct-header { display: none; }
+  /* Said here, not left to the generic stacked-table rules below: Drop 2
+     scopes those (T10), and this list must not depend on them. */
+  .holdings-table thead { display: none; }
+  .holdings-table tbody tr.hold-row, .holdings-table tfoot tr {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 12px; align-items: start;
+    padding: 10px 0; border-bottom: 1px solid var(--border-subtle);
+  }
+  .holdings-table tfoot tr { border-bottom: none; }
+  .holdings-table tbody tr.hold-row { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .holdings-table tbody tr.hold-row:active { background: var(--row-hover); }
+  .holdings-table tr.hold-row > td, .holdings-table tfoot tr > td { display: none; padding: 0; }
+  .holdings-table tr.hold-row > td::before, .holdings-table tfoot tr > td::before { content: none; }
+  .holdings-table tr.hold-row > td.h-name, .holdings-table tfoot tr > td.h-name {
+    display: block; grid-column: 1; grid-row: 1 / span 2; min-width: 0; padding: 0; text-align: left;
+  }
+  .holdings-table tr.hold-row > td.h-val, .holdings-table tfoot tr > td.h-val {
+    display: block; grid-column: 2; grid-row: 1; text-align: right;
+    font-size: 15px; font-weight: 600; line-height: 20px; color: var(--text-primary);
+  }
+  .holdings-table tr.hold-row > td.h-alloc, .holdings-table tfoot tr > td.h-alloc {
+    display: block; grid-column: 2; grid-row: 2; text-align: right;
+    font-size: 13px; line-height: 18px; color: var(--text-secondary);
+  }
+  .holdings-table td.h-alloc .bar-bg { display: none; }
+  .holdings-table td.h-alloc .bar-wrap { display: block; }
+  .holdings-table .h-pct { min-width: 0; line-height: 18px; }
+  .holdings-table td.h-name .ticker-name {
+    font-size: 15px; line-height: 20px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .holdings-table td.h-name .ticker-sub { display: none; }
+  /* The sleeve dots: a long name's ellipsis clipped them, so some lines had
+     dots and some didn't. The line names the split in words instead. */
+  .holdings-table td.h-name .sleeve-dot { display: none; }
+  .holdings-table td.h-name .h-meta {
+    display: block; font-size: 13px; line-height: 18px; font-weight: 400; color: var(--text-muted);
+  }
+  .holdings-table td.h-name .h-meta > span { white-space: nowrap; }
+  .holdings-table .v-cents { display: none; }
+  .holdings-table .v-whole { display: inline; }
+  /* The Needs-attention chip opens the price on its line: a third row. */
+  .holdings-table tr.hold-row.qp-open > td.h-price {
+    display: flex; grid-column: 1 / -1; grid-row: 3;
+    justify-content: space-between; align-items: center; gap: 12px; padding-top: 8px;
+  }
+  .holdings-table tr.hold-row.qp-open > td.h-price::before {
+    content: attr(data-label); font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.03em; color: var(--text-muted);
+  }
+  /* 16px or iOS zooms the page on focus; the generic `td input` rule is 14px. */
+  .holdings-table td input[type], .holdings-table td select,
+  .holdings-table .he-f input[type], .holdings-table .he-f select { font-size: 16px; height: 44px; }
+  .holdings-table td.h-price input[type] { width: min(220px, 65%); }
+  /* "Mutual Fund" in a half-width picker at 375: less padding, not a smaller font. */
+  .holdings-table .he-f select { padding-left: 10px; padding-right: 24px; background-position: right 8px center; }
+  .holdings-table tbody tr.hold-edit, .holdings-table tbody tr.hold-split {
+    display: block; padding: 8px 0; border-bottom: 1px solid var(--border-subtle);
+  }
+  .holdings-table tbody tr.hold-edit > td, .holdings-table tbody tr.hold-split > td {
+    display: block; padding: 12px; text-align: left; border-radius: 8px;
+  }
+  .he-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .he-wide, .he-wide-m { grid-column: 1 / -1; }
+  .sp-line { grid-template-columns: 84px minmax(0, 1fr); }
+  .sp-qty { grid-column: 2; }
+  .holdings-table .sp-pct input[type] { width: 60px; }
+}
+
 /* ── Desktop column ──
    Tuning for cards that now sit inside .container instead of spanning the
    window. Desktop only: nothing here may change the phone layout. */
 @media (min-width: 641px) {
   /* Seven columns at 16px gutters spent 224px on air; the name column paid. */
   .table-wrap th, .table-wrap td { padding-left: 10px; padding-right: 10px; }
-  /* The left half is five short inputs; the right is a five-column table whose
-     cells have no side padding, so at half a column "TARGET" ran into
-     "CURRENT" and the gap text wrapped. */
-  .alloc-grid { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
-  .gap-table th + th, .gap-table td + td { padding-left: 12px; }
 }
 
 /* ── Responsive ── */
@@ -970,25 +1137,36 @@ input.band-input {
     padding-bottom: max(48px, env(safe-area-inset-bottom));
   }
   .total-value { font-size: 36px; letter-spacing: -0.9px; }
-  .form-row { grid-template-columns: 1fr 1fr; }
-  .bottom-row { grid-template-columns: 1fr; }
-  .header-actions { width: 100%; }
-  .alloc-grid { grid-template-columns: 1fr; }
   /* Phone-grade touch targets and readable inputs (16px stops iOS focus zoom) */
   .btn { min-height: 44px; }
-  .header-actions .btn, .theme-toggle { min-height: 40px; }
   input, select { font-size: 16px; min-height: 40px; }
+  /* The rule above is 0,0,1 and lost to every field rule that names a type
+     or a class: the base input[type=…] (0,1,1), .target-row's (0,2,1) and
+     .upd-header select. 22 fields in Plan & settings and Update positions
+     rendered at 14px, so iOS zoomed the page on focus and left it zoomed — he
+     had to pan sideways (QA + CPO, Drop 2 round 1). Every field on the page,
+     at a specificity that beats them all. */
+  .container input[type], .container select, .container textarea,
+  #planCard .target-row input[type="number"], .upd-header select { font-size: 16px; }
+  .upd-header select { min-height: 44px; }
+  /* Update positions' share and price fields: 40px tall until round 2 (CPO). */
+  .upd-line-inputs input { min-height: 44px; }
+  /* Attention chips get Ask's 44px tap overlay; at 36px with an 8px gap, two
+     rows' overlays meet without overlapping (CPO, round 2: 34px, none). */
+  .attn-chip { position: relative; min-height: 36px; }
+  .attn-chip::after {
+    content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 44px; transform: translateY(-50%);
+  }
   .imp-kind { font-size: 16px; }
   .imp-acct { flex: 1 1 100%; padding-left: 8px; }
   /* The whole label is the tap target, not the 20px box. */
   .imp-dup { min-height: 44px; font-size: 15px; }
   .imp-dup input { width: 20px; height: 20px; }
-  /* The ⋯ menu hangs from the right edge of the (full-width) actions row,
-     not from the ⋯ button. Anchored to the button with left:0 it was fine
-     where ⋯ wraps to a second row (local mode's long "Set up phone access"),
-     but on the phone shell ⋯ ends the first row, and the open menu ran 120px
-     off the right edge (scrollWidth 510 at 390, shell sandbox 2026-10-03) —
-     cutting off the shell version it now carries. */
+  /* The ⋯ menu hangs from the right edge of the actions group, not from
+     the ⋯ button. Anchored to the button with left:0, the open menu ran 120px
+     off the right edge on the phone shell (scrollWidth 510 at 390, shell
+     sandbox 2026-10-03) — cutting off the shell version it now carries. Since
+     Drop 2 the group ends the label row, so its right edge is the column's. */
   .header-actions { position: relative; }
   .hdr-more { position: static; }
   .hdr-more-menu { left: auto; right: 0; }
@@ -1003,28 +1181,34 @@ input.band-input {
   .split-form input, .split-form select { width: 100% !important; min-height: 40px; }
   .split-grid, .split-cols { grid-template-columns: 1fr !important; }
   /* Stacked list, not a sideways-scrolling table. A row per holding, each
-     cell labelled by the column it came from. */
+     cell labelled by the column it came from.
+     Scoped (Drop 2, 2026-10-04) to the two tables built for it — Holdings and
+     the import preview. Unscoped, it caught every <table> on the page: it is
+     how the Dividend card's five columns ended up 461px wide at 390, and any
+     table a new card or an Ask answer draws would be folded into this list.
+     :where() keeps the old specificity, so the import table's own rules below
+     still win where they did. */
   .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-  table { min-width: 0; width: 100%; }
-  thead { display: none; }
-  tbody tr, tfoot tr { display: block; padding: 10px 0; border-bottom: 1px solid var(--border-subtle); }
-  tbody tr.account-row { padding: 8px 0 4px; }
-  tbody td, tfoot td, tfoot th {
+  :where(#holdingsCard, .import-card) table { min-width: 0; width: 100%; }
+  :where(#holdingsCard, .import-card) thead { display: none; }
+  :where(#holdingsCard, .import-card) tbody tr, :where(#holdingsCard, .import-card) tfoot tr { display: block; padding: 10px 0; border-bottom: 1px solid var(--border-subtle); }
+  :where(#holdingsCard, .import-card) tbody tr.account-row { padding: 8px 0 4px; }
+  :where(#holdingsCard, .import-card) tbody td, :where(#holdingsCard, .import-card) tfoot td, :where(#holdingsCard, .import-card) tfoot th {
              display: flex; justify-content: space-between; align-items: baseline;
              gap: 12px; border: none; padding: 2px 0; text-align: right; }
-  tbody td::before, tfoot td::before {
+  :where(#holdingsCard, .import-card) tbody td::before, :where(#holdingsCard, .import-card) tfoot td::before {
     content: attr(data-label); text-align: left; flex: 0 0 auto;
     font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em;
     color: var(--text-muted); font-weight: 600;
   }
-  tbody td:first-child { display: block; text-align: left; font-weight: 600; padding-bottom: 6px; }
-  tbody td:first-child::before { content: none; }
+  :where(#holdingsCard, .import-card) tbody td:first-child { display: block; text-align: left; font-weight: 600; padding-bottom: 6px; }
+  :where(#holdingsCard, .import-card) tbody td:first-child::before { content: none; }
   /* The name cell has its own two-column layout for desktop; at 390px that
      crowds the fund name against its ticker. Stack them. */
-  tbody td:first-child > * { display: block; text-align: left; }
-  tbody td:first-child .num, tbody td:first-child .sub { text-align: left; }
+  :where(#holdingsCard, .import-card) tbody td:first-child > * { display: block; text-align: left; }
+  :where(#holdingsCard, .import-card) tbody td:first-child .num, :where(#holdingsCard, .import-card) tbody td:first-child .sub { text-align: left; }
   /* The account divider is a heading, not a boxed row. */
-  tbody tr.account-row td { display: block; text-align: left; }
+  :where(#holdingsCard, .import-card) tbody tr.account-row td { display: block; text-align: left; }
   /* The import preview stacks too, but its desktop cell padding and rules
      outranked the list's, so one row ran taller than its 340px scroller. The
      name and the status (a question and its checkbox) read as left-hand blocks. */
@@ -1037,12 +1221,4 @@ input.band-input {
   .import-table tr.row-warn { background: rgba(245,158,11,0.06); }
   .import-table tr.row-err  { background: rgba(239,68,68,0.06); }
   .import-table tr.row-warn td, .import-table tr.row-err td { background: none; }
-  /* Dividend Income stacks too. The Total row's blank spacer cell would print
-     an empty line, and the Pays column's desktop indent would push its label
-     off the left edge the other labels share. */
-  #divBody td:empty { display: none; }
-  #divBody .div-pays { padding-left: 0; }
-  /* Current vs Target stacks the same way; its desktop cell padding and rule
-     outrank the list's, and put a 10px gap and a line between every figure. */
-  .gap-table td { padding: 2px 0; border-top: none; }
 }

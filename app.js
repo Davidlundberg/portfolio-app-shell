@@ -112,8 +112,6 @@ let lastSaved  = null;
 let editingId     = null;
 let quickPriceId  = null;
 let splittingId   = null;
-let chartInst  = null;
-let chartView  = 'sleeve'; // 'sleeve' | 'ticker' | 'account'
 let unsaved    = false;
 let importRows = [];
 let importAccountMap = new Map(); // CSV account label → the account he chose for it; this import only
@@ -137,10 +135,10 @@ function isDark() { return document.documentElement.getAttribute('data-theme') =
 function applyTheme(theme) {
   document.documentElement.setAttribute('data-theme', theme);
   localStorage.setItem('portfolio_theme', theme);
+  // A labelled item in the ⋯ menu since Drop 2, so it names what a tap does.
   const btn = document.getElementById('themeToggle');
-  if (btn) btn.textContent = theme === 'dark' ? '🌙' : '☀️';
+  if (btn) btn.textContent = theme === 'dark' ? '☀️ Light mode' : '🌙 Dark mode';
   // Re-render charts with theme-aware colors
-  if (typeof renderChart === 'function') renderChart();
   if (typeof renderPerformanceChart === 'function') renderPerformanceChart();
 }
 
@@ -160,7 +158,6 @@ function initTheme() {
 }
 
 // Theme-aware color helpers for Chart.js
-function themeChartBorder() { return isDark() ? '#161922' : '#fff'; }
 function themeGridColor() { return isDark() ? '#1e2433' : '#eeece7'; }
 function themeTickColor() { return isDark() ? '#5a6478' : undefined; }
 
@@ -188,6 +185,22 @@ const fmtN  = (n, d=4) => new Intl.NumberFormat('en-US',{maximumFractionDigits:d
 const uid   = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
 const total = () => holdings.reduce((s,h) => s + h.quantity * h.price, 0);
 const esc   = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// Whole dollars, for the tiles: an account balance with its cents, at tile
+// size, did not fit half a 375px column; the cents are in the header total
+// and the Holdings rows.
+const fmt$0 = n => new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0}).format(n);
+// "Sep 21" — or "Sep 21, 2025" outside the current year. A bare YYYY-MM-DD is
+// a calendar date (ledger rows are dated in New York time), never parsed as
+// UTC midnight, which reads as the day before anywhere west of Greenwich.
+function shortDate(iso, now = new Date()) {
+  if (!iso) return '';
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso));
+  const d = m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(iso);
+  if (isNaN(d)) return '';
+  const opts = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+  return d.toLocaleDateString('en-US', opts);
+}
 
 function typeBadge(type) {
   const t = type || 'stock';
@@ -197,7 +210,6 @@ function typeBadge(type) {
 
 let autosaveTimer = null;
 let historyData   = null;   // { snapshots: [{ date, value, spyPrice }] }
-let perfChartInst = null;
 function markUnsaved() {
   unsaved = true;
   saveLocal();
@@ -536,129 +548,20 @@ function spanDays(snapshots) {
   return (new Date(snapshots[snapshots.length - 1].date) - new Date(snapshots[0].date)) / 86400000;
 }
 
+// History arrived or changed (cloud.js calls this after loadHistory, and the
+// theme toggle after a switch). It used to draw the Performance card: three
+// overlapping lines with a dot on every day under slanted dates, which David
+// called "impossible to read on a phone" (2026-10-04). The return now lives in
+// the This week card's "Since Aug 1" view, so new history redraws that card.
 function renderPerformanceChart() {
-  const card = document.getElementById('perfCard');
-  const snapshots = historyData?.snapshots ?? [];
-  // The chart starts at the ledger epoch: before it the record is incomplete,
-  // and drawing 07-31 → 08-01 showed the 401K and pension arriving as a gain.
-  const post = snapshots.filter(s => s.date >= LEDGER_EPOCH);
-  const flows = externalFlows(transactions);
-  // Guard over the WHOLE history, as the Ask brief runs it, so both name the
-  // same periods; only the ones inside the drawn span are left out here.
-  const health = performanceHealth(snapshots, flows);
-  const excluded = post.length >= 2 ? flagsWithin(health, post[0].date, post[post.length - 1].date) : [];
-  const idx = twrIndex(post, flows, excluded);
-  if (!idx) { card.style.display = 'none'; return; }
-  card.style.display = '';
-
-  // Portfolio is the flow-adjusted growth of 100 — the same chain as Ask's
-  // since-epoch figure, so the line ends where Ask's answer does. A raw value
-  // line counted money paid in as gain. SPY is price only, rebased alike.
-  const baseSpy   = post[0].spyPrice ?? null;
-  const labels    = post.map(s => s.date);
-  const portSerie = idx.map(x => +((x * 100).toFixed(2)));
-  const spySerie  = baseSpy
-    ? post.map(s => s.spyPrice != null ? +((s.spyPrice / baseSpy * 100).toFixed(2)) : null)
-    : null;
-  const left = new Set(excluded);
-  const isLeft = i => left.has(labels[i]);
-
-  const shortDay = d => new Date(d + 'T00:00:00Z')
-    .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
-  // The note names a left-out day and why in words, no figures: it sits on the
-  // default screen and the card cannot be closed, so the bookkeeping dollars
-  // and the diagnosis stay in performance.caveats for Ask and the MCP, which
-  // answer when asked (Drop 1 review, 2026-10-03 — quiet by default).
-  const note = document.getElementById('perfNote');
-  if (note) {
-    const days = excluded.map(shortDay);
-    note.textContent = `Portfolio is net of money paid in, since ${shortDay(post[0].date)}.` + (days.length
-      ? ` ${new Intl.ListFormat('en-US').format(days)} ${days.length > 1 ? 'are' : 'is'} left out: ` +
-        `the record there can't separate money paid in from the market's move.`
-      : '');
-  }
-
-  const canvas = document.getElementById('perfChart');
-  if (perfChartInst) { perfChartInst.destroy(); perfChartInst = null; }
-  // A fresh chart has no policy line until loadPolicyBenchmark adds it.
-  const policyLegend = document.getElementById('perfLegendPolicy');
-  if (policyLegend) policyLegend.style.display = 'none';
-
-  const datasets = [{
-    label: 'Portfolio',
-    data: portSerie,
-    borderColor: '#0d9488',
-    backgroundColor: 'rgba(13,148,136,0.08)',
-    fill: true,
-    tension: 0.3,
-    // A left-out period ends on an amber point (the stale-badge amber).
-    pointRadius: labels.map((_, i) => isLeft(i) ? 5 : 3),
-    pointBackgroundColor: labels.map((_, i) => isLeft(i) ? '#f59e0b' : '#0d9488'),
-    pointBorderColor: labels.map((_, i) => isLeft(i) ? '#f59e0b' : '#0d9488'),
-    pointHoverRadius: 5,
-  }];
-  if (spySerie) datasets.push({
-    label: 'SPY',
-    data: spySerie,
-    borderColor: '#a1a1aa',
-    backgroundColor: 'transparent',
-    fill: false,
-    tension: 0.3,
-    pointRadius: 3,
-    pointHoverRadius: 5,
-    borderDash: [4, 3],
-  });
-
-  perfChartInst = new Chart(canvas, {
-    type: 'line',
-    data: { labels, datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: { display: false },
-        tooltip: {
-          callbacks: {
-            label: ctx => {
-              const v = ctx.parsed.y;
-              const ret = (v - 100).toFixed(1);
-              const sign = ret >= 0 ? '+' : '';
-              return `${ctx.dataset.label}: ${sign}${ret}%`;
-            },
-            footer: items => items.some(it => isLeft(it.dataIndex)) ? 'Left out of the return — see below' : '',
-          },
-        },
-      },
-      scales: {
-        x: { grid: { display: false }, ticks: { maxTicksLimit: 8, font: { size: 11 }, color: themeTickColor() } },
-        y: {
-          ticks: {
-            font: { size: 11 },
-            color: themeTickColor(),
-            // Half-point steps once the line is a return (a few %), not the
-            // old triple-digit value line: whole-number labels read "+4%, +4%, +3%…".
-            callback: (v, i, ticks) => {
-              const step = ticks.length > 1 ? Math.abs(ticks[1].value - ticks[0].value) : 1;
-              return `${v >= 100 ? '+' : ''}${(v - 100).toFixed(step < 1 ? 1 : 0)}%`;
-            },
-          },
-          grid: { color: themeGridColor() },
-        },
-      },
-    },
-  });
-
-  perfChartGen++;
-  loadPolicyBenchmark(post, perfChartGen);
+  if (typeof renderWeekCard === 'function') renderWeekCard();
 }
 
-// Fetch VTI/VXUS/BND total-return series, blend by targets, and add the policy
-// line once ready. Failures skip silently — the chart is complete without it.
-// Cached per range+weights for the session (the Ask brief reads the cache for
-// its own "vs policy" figure; the header line that used to carry it is gone).
+// The blended policy series, cached per range+weights for the session. The Ask
+// brief reads it for its "vs policy" figure. The Performance card used to fill
+// it; the This week card does now, from the VTI/VXUS/BND charts it fetches
+// anyway (weekWarmPolicy). Empty until then, and the brief says so.
 let policyCache = null;
-let perfChartGen = 0;
 
 function policyRangeFor(firstDate) {
   const days = (Date.now() - new Date(firstDate + 'T00:00:00Z')) / 86400000;
@@ -667,47 +570,6 @@ function policyRangeFor(firstDate) {
   if (days <= 350) return '1y';
   if (days <= 700) return '2y';
   return '5y';
-}
-
-async function loadPolicyBenchmark(snapshots, gen) {
-  const weights = policyWeights(targets);
-  if (!weights || snapshots.length < 2) return;
-  const range = policyRangeFor(snapshots[0].date);
-  const key = range + ':' + JSON.stringify(weights);
-  if (!policyCache || policyCache.key !== key) {
-    const fetched = {};
-    for (const tick of Object.keys(weights)) {
-      const s = await fetchYahooChart(tick, range).catch(() => null);
-      if (!s) return; // offline or blocked — keep the chart as-is
-      fetched[tick] = s;
-    }
-    const series = computePolicySeries(fetched, weights);
-    if (!series) return;
-    policyCache = { key, series };
-  }
-  if (gen !== perfChartGen || !perfChartInst) return; // superseded render
-
-  const sampled = samplePolicyAt(policyCache.series, snapshots.map(s => s.date));
-  const firstIdx = sampled.findIndex(v => v != null);
-  if (firstIdx === -1) return;
-  const base = sampled[firstIdx];
-  const serie = sampled.map(v => v == null ? null : +((v / base * 100).toFixed(2)));
-  perfChartInst.data.datasets.push({
-    label: 'Policy (your targets)',
-    data: serie,
-    borderColor: '#3b6da0',
-    backgroundColor: 'transparent',
-    borderDash: [6, 4],
-    fill: false,
-    tension: 0.3,
-    pointRadius: 0,
-    pointHoverRadius: 4,
-  });
-  perfChartInst.update();
-  // Named in the legend: on the return's few-percent scale this dashed line is
-  // the card's second most prominent, and it was the only unnamed one.
-  const policyLegend = document.getElementById('perfLegendPolicy');
-  if (policyLegend) policyLegend.style.display = '';
 }
 
 function toast(msg, ms = 2800) {
@@ -1414,22 +1276,27 @@ function addHolding() {
 // later (2026-10-03). It now asks first, naming the value, and
 // keeps the holding for UNDO_DELETE_MS. Undo puts the same object back at the
 // same index. Delete writes no ledger row, so the ledger is untouched either way.
+// Since Drop 2 it takes the whole position: a split fund is one line and one
+// Delete, so both its lots go — and come back — together (positionLots).
 const UNDO_DELETE_MS = 10000;
-let pendingUndo = null; // { holding, index, timer }
+let pendingUndo = null; // { lots: [{ holding, index }], timer }
 
 function deleteHolding(id) {
-  const index = holdings.findIndex(x => x.id === id);
-  if (index < 0) return;
-  const h = holdings[index];
+  const lots = positionLots(id);
+  if (!lots.length) return;
+  const h = lots[0];
   const where = h.account ? ` (${h.account})` : '';
-  if (!confirm(`Delete ${h.name}${where}, worth ${fmt$(h.quantity * h.price)}?\n\n` +
+  if (!confirm(`Delete ${h.name}${where}, worth ${fmt$(lotsValue(lots))}?\n\n` +
                `You can undo this for 10 seconds.`)) return;
-  holdings.splice(index, 1);
-  if (editingId === id) editingId = null;
-  if (quickPriceId === id) quickPriceId = null;
-  if (splittingId === id) splittingId = null;
+  // Indices in the array as it was, ascending, so Undo re-inserts in order.
+  const removed = lots.map(x => ({ holding: x, index: holdings.indexOf(x) })).sort((a, b) => a.index - b.index);
+  for (const r of [...removed].reverse()) holdings.splice(r.index, 1);
+  const gone = x => lots.some(l => l.id === x);
+  if (gone(editingId)) editingId = null;
+  if (gone(quickPriceId)) quickPriceId = null;
+  if (gone(splittingId)) splittingId = null;
   markUnsaved(); render();
-  offerUndo(h, index);
+  offerUndo(removed);
 }
 
 // Which holding, in the fewest characters that still tell two lots apart:
@@ -1440,14 +1307,14 @@ function undoLabel(h) {
   return `${hasRealTicker(h) ? h.ticker.toUpperCase() : h.name}${h.account ? ` (${h.account})` : ''}`;
 }
 
-function offerUndo(holding, index) {
+function offerUndo(lots) {
   if (pendingUndo) clearTimeout(pendingUndo.timer); // a second delete replaces the first's undo
-  pendingUndo = { holding, index, timer: setTimeout(closeUndo, UNDO_DELETE_MS) };
+  pendingUndo = { lots, timer: setTimeout(closeUndo, UNDO_DELETE_MS) };
   // Name and value apart, so a long name truncates and the value never does.
   // No "Removed" in front: he has just confirmed the delete, Undo says the
   // rest, and the word cost the account its room ("Removed VOO (Bro…" at 390).
-  document.getElementById('undoToastMsg').textContent = undoLabel(holding);
-  document.getElementById('undoToastVal').textContent = `· ${fmt$(holding.quantity * holding.price)}`;
+  document.getElementById('undoToastMsg').textContent = undoLabel(lots[0].holding);
+  document.getElementById('undoToastVal').textContent = `· ${fmt$(lotsValue(lots.map(r => r.holding)))}`;
   document.getElementById('undoToast').classList.add('show');
 }
 
@@ -1462,36 +1329,67 @@ function undoDelete() {
   closeUndo();
   if (!u) return;
   // A cloud pull inside the window may already have brought it back.
-  if (holdings.some(x => x.id === u.holding.id)) return;
-  holdings.splice(Math.min(u.index, holdings.length), 0, u.holding);
+  const missing = u.lots.filter(r => !holdings.some(x => x.id === r.holding.id));
+  if (!missing.length) return;
+  for (const r of missing) holdings.splice(Math.min(r.index, holdings.length), 0, r.holding);
   markUnsaved(); render();
-  toast(`Restored ${undoLabel(u.holding)}`);
+  toast(`Restored ${undoLabel(u.lots[0].holding)}`);
 }
 
 // ─── Inline edit ──────────────────────────────────────────────────────────────
-function startEdit(id) { editingId = id; renderTable(); }
+// Edit opens on the position (a split fund's two lots edit as one), in place
+// of its line. On the phone the line is the only way in.
+function startEdit(id) {
+  editingId = positionKey(id); quickPriceId = null; splittingId = null;
+  renderTable();
+  document.getElementById(`he-row-${editingId}`)?.scrollIntoView?.({ block: 'nearest' });
+}
 function cancelEdit()  { editingId = null; renderTable(); }
 
 function saveEdit(id) {
-  const name    = document.getElementById(`en-${id}`).value.trim();
-  const ticker  = document.getElementById(`etick-${id}`).value.trim();
-  const type    = document.getElementById(`et-${id}`).value;
-  const account = document.getElementById(`eacc-${id}`).value;
-  const sleeve  = document.getElementById(`eslv-${id}`).value || null;
-  const qty     = parseFloat(document.getElementById(`eq-${id}`).value);
-  const price   = parseFloat(document.getElementById(`ep-${id}`).value);
+  const lots = positionLots(id);
+  if (!lots.length) { editingId = null; renderTable(); return; }
+  const h = lots[0], key = h.id, pair = lots.length > 1;
+  // A field he left alone keeps the LIVE value, not the form's copy: the form
+  // can be minutes old, and the boot refresh or a cloud pull may have moved
+  // the price (or the phone the shares) underneath it. Writing the copy back
+  // would undo that — and a stale price on a proxy fund would recalibrate it,
+  // and an account the picker doesn't list would fall to Unassigned.
+  const el = f => document.getElementById(`${f}-${key}`);
+  const touched = f => !!el(f)?.dataset.dirty;
+  const field = (f, live) => touched(f) ? el(f).value : live;
+  const name    = String(field('en', h.name)).trim();
+  const ticker  = String(field('etick', h.ticker || '')).trim();
+  const type    = field('et', h.type);
+  const account = field('eacc', h.account || '');
+  const sleeve  = field('eslv', h.sleeve || '') || null;
+  const qty     = parseFloat(field('eq', lotsQty(lots)));
+  const price   = parseFloat(field('ep', h.price));
 
   if (!name || isNaN(qty) || qty <= 0 || isNaN(price) || price < 0) {
     toast('Invalid values — check all fields.'); return;
   }
-  const h = holdings.find(x => x.id === id);
-  if (h) {
+  if (!['en', 'etick', 'et', 'eacc', 'eslv', 'eq', 'ep'].some(touched)) {
+    editingId = null; renderTable(); toast('No changes'); return;
+  }
+  const now = new Date().toISOString();
+  if (pair) {
+    // Both lots carry the shared fields, so they stay one position; the total
+    // goes through the Update panel's path (ratio kept, a ledger row per lot).
+    lots.forEach(x => Object.assign(x, { name, ticker, type, account }));
+    applyQuantityUpdate(lots.map(x => x.id), qty,
+      { price: touched('ep') && price > 0 ? price : null, source: 'manual' });
+    if (touched('ep')) lots.forEach(x => { x.updated = now; });
+  } else {
     const priceChanged = h.price !== price;
     const qtyDelta = qty - h.quantity;
-    Object.assign(h, { name, ticker, type, account, sleeve, quantity: qty, price, updated: new Date().toISOString() });
+    Object.assign(h, { name, ticker, type, account, sleeve, quantity: qty, price });
+    // The price's age is what the stale badge reads: only a price he typed,
+    // or a share count he changed, resets it — not a rename.
+    if (touched('ep') || qtyDelta !== 0) h.updated = now;
     // A manually entered price on a proxy-tracked fund is a real NAV — recalibrate.
     if (priceChanged && price > 0 && proxyEntryFor(h)) {
-      h.calibration = { date: new Date().toISOString(), nav: price };
+      h.calibration = { date: now, nav: price };
     }
     // Ledger: a manual unit change is a statement true-up (or a real trade) —
     // record it so estimated auto-contributions reconcile against reality.
@@ -1514,7 +1412,7 @@ function startSplit(id) {
   renderTable();
 }
 function cancelSplit() { splittingId = null; renderTable(); }
-function updateSplitPreview(id, totalQty) {
+function updateSplitPreview(id, totalQty = holdings.find(x => x.id === id)?.quantity ?? 0) {
   const pct  = parseFloat(document.getElementById(`sp-pct-${id}`)?.value) || 0;
   const pct2 = +(100 - pct).toFixed(4);
   const qty1 = totalQty * pct / 100;
@@ -1660,53 +1558,10 @@ function sekDecomposition() {
   return null;
 }
 
-function renderRiskCard() {
-  const card = document.getElementById('riskCard');
-  const body = document.getElementById('riskBody');
-  if (!card || !body) return;
-  const emp = employerExposure();
-  const look = lookThroughExposure().slice(0, 8);
-  const sek = sekDecomposition();
-  if (!emp && !look.length && !sek) { card.style.display = 'none'; return; }
-  card.style.display = '';
-  const pctFmt = (x, signed = false) =>
-    `${signed && x >= 0 ? '+' : ''}${(x * 100).toFixed(1)}%`;
-  let html = '';
-
-  if (emp) {
-    const over = emp.pct > EMPLOYER_CAP_PCT;
-    html += `<div class="subsection-label">Employer concentration — ${esc(emp.name)}</div>
-      <p class="risk-line ${over ? 'risk-over' : ''}">
-        ${fmt$(emp.value)} · <strong>${emp.pct.toFixed(1)}%</strong> of portfolio
-        ${over ? `— above the ${EMPLOYER_CAP_PCT}% concentration guideline` : `(guideline: keep under ${EMPLOYER_CAP_PCT}%)`}
-      </p>
-      <p class="risk-note">Counts ${esc(emp.parts.join(', '))} — the same single bet as your salary.</p>`;
-  }
-
-  if (look.length) {
-    html += `<div class="subsection-label">Top companies across all funds (look-through)</div>
-      <div class="risk-look">` +
-      look.map(r => `<div class="risk-row">
-          <span>${esc(r.company)}</span>
-          <span class="risk-bar"><span style="width:${Math.min(100, r.pct * 8)}%"></span></span>
-          <span class="num">≥ ${r.pct.toFixed(1)}%</span>
-        </div>`).join('') +
-      `</div>
-      <p class="risk-note">Lower bounds — computed from top-10 fund weights (approx., as of ${FUND_TOP_HOLDINGS.asOf}) plus direct positions.</p>`;
-  }
-
-  if (sek) {
-    // Named for the one fund it decomposes. "Swedish pension" claimed the whole
-    // pension for LF Global's split, and its net move overstated the whole
-    // pension's once the short-bond fund is weighed in (2026-10-03 audit).
-    html += `<div class="subsection-label">${esc(sek.name)} — fund vs krona (${esc(sek.from)} → ${esc(sek.to)})</div>
-      <p class="risk-line">
-        Fund ${pctFmt(sek.local, true)} in SEK · krona ${pctFmt(sek.fx, true)} vs USD
-        → net <strong>${pctFmt(sek.net, true)}</strong> in USD
-      </p>`;
-  }
-  body.innerHTML = html;
-}
+// The Risk & Exposure card that drew these left the page in Drop 2
+// (2026-10-04). The engines stay: Ask's brief carries all three
+// (concentration.employer and .lookThrough, fx), the attention strip raises
+// the employer chip, and the MCP answers concentration on its own.
 
 // ─── "Since you last looked" ─────────────────────────────────────────────────
 // The first question of every visit, answered as a RETURN-like number:
@@ -1785,14 +1640,19 @@ function updateLinesFor(acct) {
       const totalQty = pair.reduce((s, x) => s + x.quantity, 0);
       const usH = pair.find(x => x.sleeve === 'us_stock');
       lines.push({
-        ids: pair.map(x => x.id), name: h.name, ticker: '',
+        ids: pair.map(x => x.id), name: h.name, ticker: '', label: '',
         qty: totalQty, price: h.price, manual: isManualPrice(h),
         splitPct: totalQty > 0 ? Math.round(usH.quantity / totalQty * 100) : 50,
       });
     } else {
       used.add(h.id);
+      // "N/A · $<price>" on the 401K's lines: the stored placeholder ticker,
+      // printed. Said as the Holdings line says it — the ticker, or the
+      // ETF a fund is priced from (CPO, Drop 2 round 1).
+      const px = !hasRealTicker(h) && proxyEntryFor(h);
       lines.push({
         ids: [h.id], name: h.name, ticker: h.ticker || '',
+        label: hasRealTicker(h) ? h.ticker : px ? `via ${px.proxy}` : '',
         qty: h.quantity, price: h.price, manual: isManualPrice(h),
         splitPct: null,
       });
@@ -1835,14 +1695,14 @@ function renderUpdatePanel() {
           ${l.splitPct != null ? `<span class="upd-split-badge">split ${l.splitPct}% US / ${100 - l.splitPct}% Intl</span>` : ''}
         </div>
         <div class="upd-line-sub">
-          ${l.ticker ? esc(l.ticker) + ' · ' : ''}${fmt$(l.price)}${l.manual ? ` · manual price${ageDays != null && ageDays > 0 ? `, ${ageDays}d old` : ''}` : ''}
+          ${l.label ? esc(l.label) + ' · ' : ''}${fmt$(l.price)}${l.manual ? ` · manual price${ageDays != null && ageDays > 0 ? `, ${ageDays}d old` : ''}` : ''}
         </div>
       </div>
       <div class="upd-line-inputs">
-        <input id="upd-q-${key}" type="number" inputmode="decimal" step="any" min="0"
-               value="${l.qty}" aria-label="Shares for ${esc(l.name)}">
-        ${l.manual ? `<input id="upd-p-${key}" type="number" inputmode="decimal" step="any" min="0"
-               value="${l.price}" aria-label="Price for ${esc(l.name)}" class="upd-price">` : ''}
+        <input id="upd-q-${esc(key)}" type="number" inputmode="decimal" step="any" min="0"
+               value="${esc(l.qty)}" aria-label="Shares for ${esc(l.name)}">
+        ${l.manual ? `<input id="upd-p-${esc(key)}" type="number" inputmode="decimal" step="any" min="0"
+               value="${esc(l.price)}" aria-label="Price for ${esc(l.name)}" class="upd-price">` : ''}
       </div>
     </div>`;
   }).join('') : '<p style="color:var(--text-muted);font-size:14px;">No holdings in this account.</p>';
@@ -1870,6 +1730,21 @@ function saveUpdatePanel() {
   }
 }
 
+// Put a question in the Ask box — filled, never sent — and take him to it.
+// For chips that live OUTSIDE the Ask card (the attention strip, This week's
+// "Ask about this"): whatever he has already typed there wins, because he
+// cannot see the box from where he tapped. The starters inside the card
+// replace (askFill) — he is looking at the box. Both go through askFill so the
+// function's log tags the question `src=insight`, not `typed` (Drop 2
+// integration, 2026-10-04: the week card had its own copy that skipped it).
+function askPrefill(question, src = 'insight') {
+  const box = document.getElementById('askInput');
+  if (!box) return;
+  if (box.value.trim()) box.focus({ preventScroll: true });
+  else askFill(question, src);
+  document.getElementById('askCard')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 // ─── Needs attention strip ───────────────────────────────────────────────────
 // Everything that requires a human: manual-price holdings gone stale, zero
 // prices, failed refreshes, and overdue proxy calibrations — each one tap
@@ -1879,17 +1754,31 @@ let lastRefreshFailures = new Set(); // holding ids, set by refreshAllPrices
 function attentionItems() {
   const items = [];
   const now = Date.now();
+  // One chip per position, keyed by its first lot — the key the holdings line
+  // and the quick-price box use. A split fund's two lots share a name and a
+  // price, so a failed refresh used to raise the same chip twice ("LF Global
+  // Index: refresh failed" ×2 in the Drop 2 integration sandbox) above a list
+  // that shows the fund once.
+  const keyOf = new Map();
+  for (const lots of positionsIn(holdings)) for (const x of lots) keyOf.set(x.id, lots[0].id);
+  const raised = new Set();
+  const raise = (h, label) => {
+    const id = keyOf.get(h.id) ?? h.id;
+    if (raised.has(id)) return;
+    raised.add(id);
+    items.push({ id, label: `${h.name}: ${label}`, kind: 'price' });
+  };
   for (const h of holdings) {
     const age = h.updated ? Math.floor((now - new Date(h.updated)) / 86400000) : null;
     if (!(h.price > 0)) {
-      items.push({ id: h.id, label: `${h.name}: no price`, kind: 'price' });
+      raise(h, 'no price');
     } else if (lastRefreshFailures.has(h.id)) {
-      items.push({ id: h.id, label: `${h.name}: refresh failed`, kind: 'price' });
+      raise(h, 'refresh failed');
     } else if (isManualPrice(h) && age != null && age >= 7) {
-      items.push({ id: h.id, label: `${h.name}: manual price ${age}d old`, kind: 'price' });
+      raise(h, `manual price ${age}d old`);
     } else if (proxyEntryFor(h) && h.calibration?.date &&
                (now - new Date(h.calibration.date)) / 86400000 > PROXY_RECAL_NUDGE_DAYS) {
-      items.push({ id: h.id, label: `${h.name}: recalibrate NAV`, kind: 'price' });
+      raise(h, 'recalibrate NAV');
     }
   }
   const emp = employerExposure();
@@ -1911,12 +1800,16 @@ function renderAttentionStrip() {
   if (!items.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
   el.style.display = '';
   el.innerHTML = `<div class="attn-title">Needs attention</div>` + items.map(it =>
-    `<button class="attn-chip" data-hid="${it.id}">⚠ ${esc(it.label)}</button>`).join('');
+    `<button class="attn-chip" data-hid="${esc(it.id)}">⚠ ${esc(it.label)}</button>`).join('');
   el.querySelectorAll('.attn-chip').forEach(btn => {
     btn.onclick = () => {
       const id = btn.dataset.hid;
+      // The card this used to scroll to left the page in Drop 2. The chip
+      // already says the figure; a tap puts the question in Ask — filled, not
+      // sent — where the brief carries the employer aggregate and the
+      // look-through.
       if (id === '__risk') {
-        document.getElementById('riskCard')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        askPrefill('How concentrated am I in my employer, counting what my funds hold?');
         return;
       }
       if (id === '__sync') {
@@ -1924,6 +1817,10 @@ function renderAttentionStrip() {
               (typeof cloudSyncIssue === 'function' ? (cloudSyncIssue() || '') : ''), 8000);
         return;
       }
+      // Holdings is one closed row since Drop 2: open it, or the price box
+      // the chip promises is drawn inside a collapsed card.
+      const hc = document.getElementById('holdingsCard');
+      if (hc) hc.open = true;
       startQuickPrice(id);
       document.getElementById(`qp-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       document.getElementById(`qp-${id}`)?.focus();
@@ -1932,9 +1829,11 @@ function renderAttentionStrip() {
 }
 
 // ─── Quick inline price edit ──────────────────────────────────────────────────
+// Keyed by the position: a price typed for a split fund lands on both lots,
+// or they would stop matching and the fund would show as two lines again.
 function startQuickPrice(id) {
   if (editingId) cancelEdit();
-  quickPriceId = id;
+  quickPriceId = positionKey(id);
   renderTable();
 }
 function saveQuickPrice(id) {
@@ -1943,13 +1842,14 @@ function saveQuickPrice(id) {
   if (!inp) { quickPriceId = null; return; }
   const val = parseFloat(inp.value);
   if (!isNaN(val) && val >= 0) {
-    const h = holdings.find(x => x.id === id);
-    if (h) {
-      h.price = val; h.updated = new Date().toISOString();
+    const lots = positionLots(id);
+    const now = new Date().toISOString();
+    for (const h of lots) {
+      h.price = val; h.updated = now;
       // Explicitly typed price on a proxy-tracked fund = real NAV — recalibrate.
-      if (val > 0 && proxyEntryFor(h)) h.calibration = { date: new Date().toISOString(), nav: val };
-      markUnsaved();
+      if (val > 0 && proxyEntryFor(h)) h.calibration = { date: now, nav: val };
     }
+    if (lots.length) markUnsaved();
   }
   quickPriceId = null;
   render();
@@ -1991,7 +1891,11 @@ async function autoFetchPrice() {
 async function fetchYahoo(ticker) {
   // Signed in → private edge proxy first (no third party sees the ticker).
   const viaProxy = await proxyGet('/quote', { ticker });
-  if (viaProxy && viaProxy.price > 0) return viaProxy.price;
+  // A price is a finite positive number or nothing. A string from a public
+  // proxy's JSON used to be stored as-is and written into the page's HTML
+  // (CISO, Drop 2 round 1).
+  const num = p => (typeof p === 'number' && Number.isFinite(p) && p > 0 ? p : null);
+  if (num(viaProxy?.price)) return viaProxy.price;
 
   const v8q1 = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`;
   const v8q2 = `https://query2.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`;
@@ -2027,9 +1931,9 @@ async function fetchYahoo(ticker) {
         if (isNaN(price)) price = null;
       } else {
         const data = await res.json();
-        price = parser === 'v7'
+        price = num(parser === 'v7'
           ? data?.quoteResponse?.result?.[0]?.regularMarketPrice
-          : data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+          : data?.chart?.result?.[0]?.meta?.regularMarketPrice);
       }
       if (price) { console.log(`[portfolio] ${ticker}: $${price} via ${url}`); return price; }
       console.warn(`[portfolio] ${ticker}: no price in response from ${url}`);
@@ -2053,7 +1957,12 @@ function proxyEntryFor(h) {
 
 // Fetch daily dividend-adjusted closes for a ticker (same fallback chain as fetchYahoo).
 // Returns { timestamps, adjcloses } or null.
-async function fetchYahooChart(ticker, range, { events = false, interval = '1d' } = {}) {
+// `publicFallback: false` stops at the edge: a caller that must not hand his
+// tickers to public CORS proxies gets null instead (CISO, Drop 2 round 1 — the
+// This week card fell through to query1/query2/corsproxy.io/allorigins for any
+// symbol the edge answered with a 502, or for all twelve when a token refresh
+// was refused mid-fan-out, while signed in).
+async function fetchYahooChart(ticker, range, { events = false, interval = '1d', publicFallback = true } = {}) {
   // Signed in → private edge proxy first.
   const viaProxy = await proxyGet('/chart', { ticker, range, interval, events: events ? '1' : '0' });
   if (viaProxy && viaProxy.timestamps?.length && viaProxy.adjcloses?.length) {
@@ -2061,6 +1970,7 @@ async function fetchYahooChart(ticker, range, { events = false, interval = '1d' 
              closes: viaProxy.closes || viaProxy.adjcloses,
              dividends: viaProxy.events || {} };
   }
+  if (!publicFallback) return null;
 
   const qs = `interval=${interval}&range=${range}${events ? '&events=div' : ''}`;
   // Index tickers carry a caret (^TNX). It must be percent-encoded in the URL
@@ -2336,46 +2246,26 @@ function renderFireDefaults() {
   if (sigmaEl && !sigmaEl.dataset.touched) sigmaEl.value = (sigma * 100).toFixed(1);
 }
 
-function renderDividends() {
-  const card = document.getElementById('divCard');
-  if (!card) return;
-  card.style.display = holdings.length > 0 ? '' : 'none';
-  if (holdings.length === 0) return;
-  const body = document.getElementById('divBody');
-  const inc = dividendIncome(holdings);
-  if (!inc.rows.length) {
-    body.innerHTML = '<p style="font-size:13px;color:var(--text-secondary);margin:6px 0;">No dividend data yet — hit "Update dividends" to fetch trailing-12-month payments for your tickered holdings.</p>';
-    return;
-  }
-  // All interpolated values esc()-escaped or app-computed.
-  // The header is a real <thead> and every figure carries its column's
-  // data-label, so at phone width the shared stacked-table layout (style.css,
-  // ≤640px) hides the header and labels each line. A bare header <tr> landed
-  // in <tbody>, which the layout cannot hide: its five headings held the
-  // table at 461px inside a 308px card, and every figure sat off to the right
-  // of an inner scroller with no cue that it was there (Drop 1 review, round 2).
-  // Rules use the theme tokens: --border was never defined, so the #eee
-  // fallback drew bright white lines in dark mode, full width once stacked.
-  let html = `<table style="width:100%;font-size:13px;border-collapse:collapse;margin-top:6px;">
-    <thead><tr style="text-align:left;color:var(--text-secondary);"><th style="padding:4px 6px;">Holding</th><th style="text-align:right;">$/share (T12M)</th><th style="text-align:right;">Est. annual</th><th style="text-align:right;">Yield</th><th class="div-pays">Pays</th></tr></thead><tbody>`;
-  for (const r of inc.rows) {
-    html += `<tr style="border-top:1px solid var(--border-subtle);">
-      <td style="padding:4px 6px;">${esc(r.ticker)} <span style="color:var(--text-secondary);font-size:12px;">${esc(r.account)}</span></td>
-      <td data-label="$/share (T12M)" style="text-align:right;">${fmt$(r.perShare)}</td>
-      <td data-label="Est. annual" style="text-align:right;font-weight:600;">${fmt$(r.annualIncome)}</td>
-      <td data-label="Yield" style="text-align:right;">${r.yieldPct === null ? '—' : r.yieldPct.toFixed(2) + '%'}</td>
-      <td data-label="Pays" class="div-pays" style="font-size:12px;color:var(--text-secondary);">${esc(r.months.join(', '))}</td>
-    </tr>`;
-  }
-  html += `<tr style="border-top:2px solid var(--border-default);font-weight:700;">
-    <td style="padding:6px;">Total</td><td></td>
-    <td data-label="Est. annual" style="text-align:right;">${fmt$(inc.totalAnnual)}/yr</td>
-    <td data-label="Monthly" colspan="2" class="div-pays" style="font-size:12px;color:var(--text-secondary);">≈ ${fmt$(inc.monthlyAvg)}/month</td>
-  </tr></tbody></table>`;
-  if (inc.accumulatingExcluded > 0) {
-    html += `<p style="font-size:12px;color:var(--text-secondary);margin:8px 0 0;">${inc.accumulatingExcluded} accumulating holding${inc.accumulatingExcluded === 1 ? '' : 's'} excluded (401K CITs / pension funds reinvest dividends inside the NAV — no cash distributions).</p>`;
-  }
-  body.innerHTML = html;
+// Pure: what the dividend cache holds — how many tickered holdings carry
+// T12M data, and when the newest of them was fetched. The income table that
+// read it left with the Dividend Income card in Drop 2: Ask answers income
+// by account from this cache (brief.income), and the MCP from the file.
+function dividendCacheStatus(holdingsArr = holdings) {
+  const tickered = holdingsArr.filter(hasRealTicker);
+  const cached = tickered.filter(h => h.dividends && h.dividends.updated);
+  const newest = cached.map(h => String(h.dividends.updated)).sort().at(-1) || null;
+  return { tickered: tickered.length, cached: cached.length, newest };
+}
+
+function renderDividendSection() {
+  const sec = document.getElementById('divSec');
+  if (!sec) return;
+  const st = dividendCacheStatus();
+  sec.style.display = st.tickered ? '' : 'none';
+  const meta = document.getElementById('planDivMeta');
+  if (meta) meta.textContent = st.newest
+    ? `Fetched ${shortDate(st.newest)} · ${st.cached} of ${st.tickered} holdings`
+    : 'Not fetched yet';
 }
 
 // Pure: estimated NAV from a calibration point and an adjclose series.
@@ -2420,6 +2310,17 @@ async function fetchProxyNav(h) {
 }
 
 // ─── Avanza price fetch (Swedish pension funds, SEK→USD) ─────────────────────
+// The day the NAV is FOR, which is not the day it was fetched. The stamp's
+// `date` is when the app saw it; Avanza publishes LF Global a day or more
+// behind (2026-10-04, a Sunday: navDate 2026-10-01 — the very NAV stamped
+// "2026-10-03"). Without it the pension's weekly move compared
+// mismatched days and read as currency (insights-content.md §13). Avanza's
+// guide sends "2026-10-01T00:00:00"; the edge /avanza passes it through.
+function avanzaNavDate(d) {
+  const m = typeof d?.navDate === 'string' && d.navDate.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : null;
+}
+
 // Returns price in USD, or null on failure.
 // Side-effect: if the fund has splitByCountry, also rebalances the us_stock/intl_stock
 // quantity split across same-named holdings using live Avanza country allocation data.
@@ -2463,8 +2364,15 @@ async function fetchAvanza(name) {
   // Convert SEK → USD: private edge proxy first, then two public sources.
   // Return null on total failure to avoid storing SEK as USD.
   const viaFxProxy = await proxyGet('/fx', { from: 'SEK', to: 'USD' });
+  // Frankfurter moved to api.frankfurter.dev/v1. The old host answers with a
+  // 301 that carries no CORS header, so in the browser this source had been
+  // failing outright and every signed-out krona rate came from the second
+  // one (checked 2026-10-04 in Chromium: "blocked by CORS policy"; the new
+  // host returns the same { rates: { USD } }). The CSP's connect-src names
+  // the new host. v1 is the ECB reference rate every stored stamp was taken
+  // at; its successor, /v2/rates, quoted a different rate for the same day.
   const fxSources = [
-    'https://api.frankfurter.app/latest?from=SEK&to=USD',
+    'https://api.frankfurter.dev/v1/latest?from=SEK&to=USD',
     'https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/sek.json',
   ];
   for (const url of viaFxProxy?.rate ? ['proxy'] : fxSources) {
@@ -2483,9 +2391,11 @@ async function fetchAvanza(name) {
         // decomposed into fund-vs-krona once two stamps exist. Same
         // accrue-from-now philosophy as the ledger epoch.
         const today = nyToday();
+        const navDate = avanzaNavDate(fundData);
         for (const h of holdings.filter(x => x.name === name)) {
           if (!Array.isArray(h.fxHistory)) h.fxHistory = [];
           const row = { date: today, nav: fundData.nav, rate: sekToUsd, currency: 'SEK' };
+          if (navDate) row.navDate = navDate;
           const i = h.fxHistory.findIndex(r => r.date === today);
           if (i >= 0) h.fxHistory[i] = row; else h.fxHistory.push(row);
           if (h.fxHistory.length > 400) h.fxHistory = h.fxHistory.slice(-400);
@@ -2527,7 +2437,9 @@ function matchesNavTable(h) {
 }
 
 async function refreshHoldingPrice(id) {
-  const h = holdings.find(x => x.id === id);
+  // One fetch for the position; the price lands on every lot (positionLots).
+  const lots = positionLots(id);
+  const h = lots[0];
   if (!h) return;
   const hasTicker = h.ticker && h.ticker.toUpperCase() !== 'N/A';
   const label  = h.type === 'mutual_fund' ? 'NAV' : 'price';
@@ -2538,7 +2450,12 @@ async function refreshHoldingPrice(id) {
     : (proxyEntryFor(h) ? await fetchProxyNav(h)
        : (fetchFromNavTable(h.name) ?? await fetchAvanza(h.name)));
   if (price !== null) {
-    h.price = price; h.updated = new Date().toISOString();
+    const now = new Date().toISOString();
+    // The live copies: a cloud pull during the fetch replaces the objects.
+    for (const l of lots) {
+      const x = holdings.includes(l) ? l : holdings.find(y => y.id === l.id);
+      if (x) { x.price = price; x.updated = now; }
+    }
     render();
     toast(`${h.name} ${label} → ${fmt$(price)}`);
     await persistMarketData();   // a fetched price is not an edit — see persistMarketData
@@ -2555,7 +2472,11 @@ async function refreshAllPrices({ silent = false } = {}) {
   const useAvanza = h =>
     /swedish|pension/i.test(h.account || '') ||
     (noTicker(h) && /^lf\b|länsförsäkring/i.test(h.name));
-  const fetchable = holdings.filter(h => {
+  // One fetch per position: a split fund's lots take the same price, or they
+  // stop matching and the fund shows as two lines (positionsIn). When the
+  // second of two separate fetches failed, that is exactly what happened.
+  const lotsOf = new Map(positionsIn(holdings).map(lots => [lots[0], lots.map(x => x.id)]));
+  const fetchable = [...lotsOf.keys()].filter(h => {
     const key = (h.ticker || '').toUpperCase().trim();
     return (key && key !== 'N/A') || useAvanza(h) || matchesNavTable(h) || !!proxyEntryFor(h);
   });
@@ -2565,9 +2486,12 @@ async function refreshAllPrices({ silent = false } = {}) {
     return;
   }
 
+  // The button is a bare ↻ since Drop 2; progress goes to the status line
+  // under the total, and aria-busy says it to a screen reader (and a test).
   const btn = document.getElementById('btnRefreshAll');
   if (!silent) { btn.disabled = true; }
-  btn.textContent = '↻ Fetching…';
+  btn.setAttribute('aria-busy', 'true');
+  setRefreshProgress(`updating prices 0/${fetchable.length}…`);
 
   let updated = 0, failed = 0;
   const failedTickers = [];
@@ -2585,21 +2509,23 @@ async function refreshAllPrices({ silent = false } = {}) {
     // with would strand it, and the pulled copy — whose prices are only as
     // fresh as the other device's last edit (persistMarketData) — would stay
     // on screen until the next refresh.
-    const h = holdings.includes(f) ? f : holdings.find(x => f.id != null && x.id === f.id);
-    if (price !== null && h) {
-      h.price   = price;
-      h.updated = new Date().toISOString();
+    const ids = lotsOf.get(f);
+    const live = ids.map(id => id === f.id && holdings.includes(f) ? f
+      : holdings.find(x => id != null && x.id === id)).filter(Boolean);
+    if (price !== null && live.length) {
+      const now = new Date().toISOString();
+      for (const h of live) { h.price = price; h.updated = now; }
       updated++;
     } else if (price === null) {
       failed++;
       failedTickers.push(lookup);
-      failedIds.add(f.id);
+      ids.forEach(id => failedIds.add(id));
     }
-    btn.textContent = `↻ ${updated + failed}/${fetchable.length}…`;
+    setRefreshProgress(`updating prices ${updated + failed}/${fetchable.length}…`);
     render();
   }
 
-  btn.disabled = false; btn.textContent = '↻ Refresh All';
+  btn.disabled = false; btn.removeAttribute('aria-busy');
 
   lastRefreshFailures = failedIds;
   renderAttentionStrip();
@@ -2622,14 +2548,25 @@ async function refreshAllPrices({ silent = false } = {}) {
   }
 
   refreshing = false;
+  // The week card held its cache write while prices were landing (a NAV
+  // stamped mid-refresh changes the pension's line); write it now, with the
+  // prices this refresh ended on (Drop 2 round 2).
+  if (weekCharts) renderWeekCard();
 }
 
-// ─── Refresh label ("Prices updated just now / X min ago") ───────────────────
+// ─── Refresh label ("prices just now / X min ago") ───────────────────────────
+// The second half of the header's one status line ("Saved 11:48 AM · prices
+// 2 min ago"); lower case because it follows the saved time.
 function updateRefreshLabel() {
   const el = document.getElementById('lastRefreshedLabel');
-  if (!el || !lastRefreshed) return;
+  // Mid-refresh the line shows progress; the minute timer must not cover it.
+  if (!el || !lastRefreshed || document.getElementById('btnRefreshAll')?.getAttribute('aria-busy') === 'true') return;
   const mins = Math.round((Date.now() - lastRefreshed) / 60000);
-  el.textContent = mins < 1 ? 'Prices updated just now' : `Prices updated ${mins} min ago`;
+  el.textContent = mins < 1 ? 'prices just now' : `prices ${mins} min ago`;
+}
+function setRefreshProgress(text) {
+  const el = document.getElementById('lastRefreshedLabel');
+  if (el) el.textContent = text;
 }
 
 // ─── Export CSV ───────────────────────────────────────────────────────────────
@@ -2655,6 +2592,25 @@ function exportCSV() {
 }
 
 // ─── Render: Account Tiles ────────────────────────────────────────────────────
+// Pure: the date an account's share counts were last set by hand — a
+// statement typed into Update positions, an Edit, a CSV import. Accruals a
+// contribution rule estimated are not a statement, so they don't count. A row
+// whose holding was since deleted (the Sep 13 pension lot) still belongs to
+// the account through its holdingName.
+function lastPositionsUpdate(acct, holdingsArr = holdings, txns = transactions) {
+  const inAcct = holdingsArr.filter(h => (h.account || 'Unassigned') === acct);
+  const ids = new Set(inAcct.map(h => h.id));
+  const names = new Set(inAcct.map(h => h.name));
+  const live = new Set(holdingsArr.map(h => h.id));
+  let newest = null;
+  for (const t of txns || []) {
+    if (!t || !t.date || t.source === 'auto-rule' || t.estimated) continue;
+    const mine = ids.has(t.holdingId) || (!live.has(t.holdingId) && names.has(t.holdingName));
+    if (mine && (!newest || t.date > newest)) newest = t.date;
+  }
+  return newest;
+}
+
 function renderAccountTiles() {
   const tot = total();
   const el  = document.getElementById('accountTiles');
@@ -2665,15 +2621,21 @@ function renderAccountTiles() {
   const acctTotals = getAccountTotals();
   const sorted = Object.entries(acctTotals).sort(([,a],[,b]) => b - a);
 
+  // The fourth line was "✎ update positions" on every tile. It is now the
+  // date his share counts were last set, so a stale account (one not updated
+  // in weeks) shows itself without a tap; the tile is still the button.
   el.innerHTML = sorted.map(([acct, val], i) => {
     const pct   = tot > 0 ? (val / tot * 100).toFixed(1) : '0.0';
     const color = ACCT_COLORS[i % ACCT_COLORS.length];
+    const asOf  = lastPositionsUpdate(acct);
+    const asOfText = asOf ? `Updated ${shortDate(asOf)}` : '✎ Update positions';
     return `<div class="account-tile" style="border-top-color:${color}" role="button" tabindex="0"
-      data-acct="${esc(acct)}" title="Update positions in ${esc(acct)}">
+      data-acct="${esc(acct)}" aria-label="${esc(acct)}, ${esc(fmt$0(val))}, ${pct}% of portfolio. ${esc(asOfText)}. Update positions."
+      title="Update positions in ${esc(acct)}">
       <div class="account-tile-name">${esc(acct)}</div>
-      <div class="account-tile-value">${fmt$(val)}</div>
-      <div class="account-tile-pct">${pct}% of portfolio</div>
-      <div class="account-tile-hint">✎ update positions</div>
+      <div class="account-tile-value">${fmt$0(val)}</div>
+      <div class="account-tile-pct">${pct}%</div>
+      <div class="account-tile-hint">${esc(asOfText)}</div>
     </div>`;
   }).join('');
   el.querySelectorAll('.account-tile').forEach(tile => {
@@ -2786,6 +2748,9 @@ function addContributionRule() {
   contributionRules.push(rule);
   const appliedNow = applyContributionRules();
   if (appliedNow === 0) markUnsaved();
+  // The form survives render() now, so clear what was just added.
+  document.getElementById('crAmount').value = '';
+  document.getElementById('crAnchor').value = '';
   render();
   // One toast for the whole add. The accrual's own "Applied N…" toast was
   // replaced by this one at once, so a back-dated start never said what it
@@ -2831,53 +2796,93 @@ function ruleNextDate(rule) {
   return upcoming[0] || '—';
 }
 
+let ruleFormOpts = null;   // the holding list the rule form was last given
 function renderContributions() {
   const card = document.getElementById('contribCard');
   if (!card) return;
   card.style.display = holdings.length > 0 ? '' : 'none';
+  const meta = document.getElementById('planContribMeta');
+  if (meta) {
+    const perMonth = monthlyContribFromRules();
+    meta.textContent = contributionRules.length
+      ? `${contributionRules.length} rule${contributionRules.length === 1 ? '' : 's'} · about ${fmt$0(perMonth)} a month`
+      : 'None set up';
+  }
   if (holdings.length === 0) return;
 
+  // Each rule names its account: "Vanguard S&P 500 ETF" is held in two.
   const list = document.getElementById('contribList');
+  // Delete by delegation: the id rides in an escaped data attribute, never
+  // inside an inline handler's JavaScript string (CISO, Drop 2 round 1 — a
+  // restored doc's rule id with a quote in it was code).
+  if (!list.dataset.wired) {
+    list.dataset.wired = '1';
+    list.addEventListener('click', e => {
+      const b = e.target.closest('[data-rule-del]');
+      if (b) deleteContributionRule(b.dataset.ruleDel);
+    });
+  }
   if (contributionRules.length === 0) {
     list.innerHTML = '<p style="font-size:13px;color:var(--text-secondary);margin:6px 0 10px;">No rules yet. Add one to auto-accrue payroll contributions (e.g. 401K) between statements.</p>';
   } else {
     list.innerHTML = contributionRules.map(r => {
-      const orphan = !holdings.some(h => h.id === r.holdingId || h.name === r.holdingName);
-      return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--border,#eee);">
+      const h = holdings.find(x => x.id === r.holdingId);
+      const orphan = !h && !holdings.some(x => x.name === r.holdingName);
+      return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0;border-bottom:1px solid var(--border-subtle);">
         <div style="min-width:0;">
           <div style="font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(r.holdingName)}</div>
           <div style="font-size:12px;color:var(--text-secondary);">
-            ${fmt$(r.amount)} ${esc(CADENCE_LABELS[r.cadence] || r.cadence)} · next ${esc(ruleNextDate(r))}
+            ${fmt$(r.amount)} ${esc(CADENCE_LABELS[r.cadence] || r.cadence)} · next ${esc(ruleNextDate(r))}${h?.account ? ` · ${esc(h.account)}` : ''}
             ${orphan ? ' · <span style="color:var(--danger,#dc2626);">holding missing — rule inactive</span>' : ''}
           </div>
         </div>
-        <button class="btn btn-ghost btn-sm" onclick="deleteContributionRule('${r.id}')" title="Delete rule">✕</button>
+        <button class="btn btn-ghost btn-icon" data-rule-del="${esc(r.id)}" title="Delete rule" aria-label="Delete rule for ${esc(r.holdingName)}">✕</button>
       </div>`;
     }).join('');
   }
 
+  // The form is built once and then only its holding list is refreshed.
+  // render() runs once per fetched price during a refresh, and rebuilding the
+  // whole form wiped an amount or date he was half-way through typing (Drop 1
+  // carry-over) — worse now that the form sits in a drawer he opens to edit.
   const opts = holdings
-    .map(h => `<option value="${h.id}">${esc(h.name.slice(0, 60))}${h.account ? ` (${esc(h.account)})` : ''}</option>`)
+    .map(h => `<option value="${esc(h.id)}">${esc(h.name.slice(0, 60))}${h.account ? ` (${esc(h.account)})` : ''}</option>`)
     .join('');
-  document.getElementById('contribForm').innerHTML = `
-    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin-top:10px;">
-      <div style="flex:2;min-width:220px;"><label style="font-size:12px;">Holding</label><select id="crHolding">${opts}</select></div>
-      <div style="flex:1;min-width:90px;"><label style="font-size:12px;">$ per period</label><input id="crAmount" type="number" min="0" step="any" placeholder="500"></div>
-      <div style="flex:1;min-width:120px;"><label style="font-size:12px;">Cadence</label><select id="crCadence">
+  const form = document.getElementById('contribForm');
+  const sel = document.getElementById('crHolding');
+  if (sel && form.contains(sel)) {
+    if (ruleFormOpts !== opts && document.activeElement !== sel) {
+      const keep = sel.value;
+      sel.innerHTML = opts;
+      ruleFormOpts = opts;
+      if (holdings.some(h => h.id === keep)) sel.value = keep;
+    }
+    return;
+  }
+  form.innerHTML = `
+    <div class="plan-fields" style="margin-top:12px;">
+      <div class="plan-field" style="grid-column:1 / -1;"><label for="crHolding">Holding</label><select id="crHolding">${opts}</select></div>
+      <div class="plan-field" style="grid-column:1 / -1;"><label for="crCadence">Cadence</label><select id="crCadence">
         <option value="biweekly">Every 2 weeks</option><option value="semimonthly">1st &amp; 15th</option><option value="monthly">Monthly</option>
       </select></div>
-      <div style="flex:1;min-width:140px;"><label style="font-size:12px;">First pay date</label><input id="crAnchor" type="date"></div>
-      <button class="btn btn-primary btn-sm" onclick="addContributionRule()" style="height:34px;">+ Add rule</button>
-    </div>`;
+      <div class="plan-field"><label for="crAmount">$ per period</label><input id="crAmount" type="number" min="0" step="any" placeholder="500"></div>
+      <div class="plan-field"><label for="crAnchor">First pay date</label><input id="crAnchor" type="date"></div>
+    </div>
+    <div class="plan-actions"><button class="btn btn-primary" onclick="addContributionRule()">+ Add rule</button></div>`;
+  ruleFormOpts = opts;
 }
 
 function render() {
   document.getElementById('totalValue').textContent = fmt$(total());
 
+  // One status line with the price label (#lastRefreshedLabel). "Last saved:
+  // 10/3/2026 11:48 AM" became "Saved 11:48 AM" — the date only when it isn't
+  // today (Drop 2).
   const el = document.getElementById('lastSavedLabel');
   if (lastSaved) {
     const d = new Date(lastSaved);
-    el.textContent = `Last saved: ${d.toLocaleDateString()} ${d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}` +
+    const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    el.textContent = `Saved ${d.toDateString() === new Date().toDateString() ? time : `${shortDate(lastSaved)}, ${time}`}` +
       (unsaved ? ' · unsaved changes' : '');
   } else {
     el.textContent = unsaved ? 'Saving…' : '';
@@ -2886,25 +2891,119 @@ function render() {
   renderAccountTiles();
   renderAttentionStrip();
   renderLastLookChip();
-  renderRiskCard();
   renderTable();
-  renderChart();
+  renderHoldingsCount();
   renderContributions();
-  renderDividends();
+  renderDividendSection();
   renderFireDefaults();
 
   const hasHoldings = holdings.length > 0;
-  document.getElementById('allocStratCard').style.display = hasHoldings ? '' : 'none';
   document.getElementById('advisorCard').style.display    = hasHoldings ? '' : 'none';
   document.getElementById('askCard').style.display        = hasHoldings ? '' : 'none';
   renderAskState();
+  renderPlan();
   if (hasHoldings) {
-    renderGapTable();
-    renderTaxRates();
     renderAdvisorContext();
   }
-  renderPerformanceChart();
+  // Paints from the last facts at once (cache or this session's charts), then
+  // fetches when signed in and the charts are missing or half an hour old.
+  renderWeekCard();
+  maybeRefreshWeek();
 }
+
+// "Holdings · 10 positions": a split fund's US/Intl pair is one position, the
+// same grouping Update positions uses.
+function positionCount() {
+  return [...new Set(holdings.map(h => h.account || ''))]
+    .reduce((n, a) => n + updateLinesFor(a).length, 0);
+}
+
+function renderHoldingsCount() {
+  const el = document.getElementById('holdingsCount');
+  if (!el) return;
+  const n = positionCount();
+  el.textContent = n ? `${n} position${n === 1 ? '' : 's'}` : 'None yet — add one in Plan & settings';
+}
+
+// ─── Plan & settings ─────────────────────────────────────────────────────────
+// The drawer's sections and the one line each shows closed: his current
+// figure, so the row answers "what is it set to?" without a tap.
+function renderPlan() {
+  const hasHoldings = holdings.length > 0;
+  for (const id of ['planTargets', 'planTax']) {
+    const sec = document.getElementById(id);
+    if (sec) sec.style.display = hasHoldings ? '' : 'none';
+  }
+  if (!hasHoldings) return;
+  const tgt = getSleeveTargetPcts();
+  const bandAbs = +targets.bandAbsPp || 5, bandRel = +targets.bandRelPct || 25;
+  const short = { us_stock: 'US', intl_stock: 'Intl', tilt: 'Tilts', bond: 'Bonds', other: 'Other' };
+  const mix = Object.keys(SLEEVE_CONFIG).filter(k => tgt[k] > 0)
+    .map(k => `${short[k]} ${+tgt[k].toFixed(1)}%`).join(' · ');
+  const set = (id, text) => { const e = document.getElementById(id); if (e) e.textContent = text; };
+  set('planTargetsMeta', `${mix} · bands ${bandAbs}pp / ${bandRel}%`);
+  // The same defaults effectiveRates applies, so the row shows what Ask uses.
+  const marg = targets.taxMarginal == null ? DEFAULT_TAX_MARGINAL : +targets.taxMarginal || 0;
+  const ltcg = targets.taxLtcg == null ? DEFAULT_TAX_LTCG : +targets.taxLtcg || 0;
+  set('planTaxMeta', `${marg}% marginal · ${ltcg}% long-term gains · ${+targets.taxStateLocal || 0}% state + local` +
+    (targets.taxNiit ? ' · NIIT' : ''));
+  set('planFireMeta', +targets.fireAnnualSpend > 0 ? `${fmt$0(+targets.fireAnnualSpend)} a year · simulate` : 'Not set · simulate');
+  renderTargetInputs();
+  renderPlanBands();
+  renderTaxRates();
+}
+
+// The rebalancing bands, his 5/25 rule. Until Drop 2 they could only be set
+// in two 22px boxes inside a sentence at the foot of Where you stand; the
+// drawer gives them labels and phone-sized fields. Where you stand reads the
+// same two figures.
+function setBand(key, value) {
+  const v = +value;
+  // 0 too: every reader takes `|| 5` / `|| 25`, so a stored 0 showed and ran
+  // as the default while the doc said 0 (CIO, round 2; predates Drop 2).
+  if (!(v > 0)) { renderPlanBands(true); return; }
+  targets[key] = v;
+  markUnsaved();
+  render();
+}
+
+function renderPlanBands(force = false) {
+  const el = document.getElementById('planBands');
+  if (!el) return;
+  const abs = +targets.bandAbsPp || 5, rel = +targets.bandRelPct || 25;
+  const a = document.getElementById('planBandAbs'), b = document.getElementById('planBandRel');
+  if (a && b && !force) {
+    // Synced in place, never rebuilt: a render mid-typing must not eat it.
+    if (document.activeElement !== a) a.value = abs;
+    if (document.activeElement !== b) b.value = rel;
+    const note = document.getElementById('planBandNote');
+    if (note) note.textContent = planBandNote(abs, rel);
+    return;
+  }
+  el.innerHTML = `
+    <div class="target-inputs">
+      <div class="target-row"><label for="planBandAbs">Absolute band</label>
+        <input id="planBandAbs" type="number" min="0" max="50" step="0.5" value="${esc(abs)}"
+          onchange="setBand('bandAbsPp', this.value)"><span class="pct-label">pp</span></div>
+      <div class="target-row"><label for="planBandRel">Relative band</label>
+        <input id="planBandRel" type="number" min="0" max="100" step="5" value="${esc(rel)}"
+          onchange="setBand('bandRelPct', this.value)"><span class="pct-label">%</span><span class="pct-label">of target</span></div>
+    </div>
+    <p class="plan-note" id="planBandNote">${esc(planBandNote(abs, rel))}</p>`;
+}
+// From his figures: "your 5/25 rule" was fixed text, wrong the moment he
+// changed a band (CPO, Drop 2 round 1).
+function planBandNote(abs, rel) {
+  return `A sleeve is outside your bands when it is off its target by either amount — ` +
+    `your ${abs}pp / ${rel}% rule. Where you stand reports against it; nothing here trades.`;
+}
+
+// Opening the drawer or a section re-reads his figures, so it never shows a
+// stale one until the next price refresh. (Until the Drop 2 integration a band
+// typed into Where you stand changed targets without a full render(); the
+// bands are now set only here.)
+document.querySelectorAll('#planCard, #planCard .plan-sec').forEach(d =>
+  d.addEventListener('toggle', () => { if (d.open && holdings.length) renderPlan(); }));
 
 function typeOptions(selected) {
   return Object.entries(TYPE_CONFIG).map(([val, cfg]) =>
@@ -2912,25 +3011,85 @@ function typeOptions(selected) {
   ).join('');
 }
 
+// ─── Positions: one line per fund he holds ───────────────────────────────────
+// confirmSplit turns one fund into two lots — same name, account and price,
+// one per sleeve — so the allocation can count LF Global as US and Intl. It
+// is still one fund he owns: the phone list showed it twice, and the
+// 2026-09-13 statement incident began with one half edited on its own.
+// Everything a person touches (the line, Edit, ↻, quick price, Delete) works
+// on the position; only the sleeve maths sees the lots. The account is part
+// of the rule: VOO in Brokerage and VOO in the Roth share a name and a price
+// and are two positions. Two lots in the SAME sleeve are not a split — that
+// is a duplicate, and folding it into one line would hide it.
+function splitMateOf(h, list = holdings) {
+  const mates = list.filter(x => x !== h && x.name === h.name &&
+    (x.account || '') === (h.account || '') && x.price === h.price);
+  return mates.length === 1 && getSleeve(mates[0]) !== getSleeve(h) ? mates[0] : null;
+}
+
+// Every position in `list`, each the array of its lots in list order.
+function positionsIn(list = holdings) {
+  const seen = new Set(), out = [];
+  for (const h of list) {
+    if (seen.has(h)) continue;
+    const mate = splitMateOf(h, list);
+    const lots = mate ? [h, mate] : [h]; // the mate comes later, or it would be seen
+    lots.forEach(x => seen.add(x));
+    out.push(lots);
+  }
+  return out;
+}
+
+// The lots of the position a holding id belongs to, in holdings order. The
+// first lot's id is the position's key everywhere in the DOM.
+function positionLots(id) {
+  return positionsIn(holdings).find(lots => lots.some(x => x.id === id)) || [];
+}
+const positionKey = id => positionLots(id)[0]?.id ?? id;
+const lotsQty   = lots => lots.reduce((s, x) => s + x.quantity, 0);
+const lotsValue = lots => lots.reduce((s, x) => s + x.quantity * x.price, 0);
+
+// "split 70% US / 30% Intl" (the Update panel's words; illustrative ratio), US first when one is.
+// Short form for the phone line, where the ratio would push the account off.
+function splitLabel(lots, short = false) {
+  const word = h => ({ us_stock: 'US', intl_stock: 'Intl' })[getSleeve(h)] || SLEEVE_CONFIG[getSleeve(h)]?.label || 'Other';
+  const [a, b] = [...lots].sort((x, y) => (getSleeve(y) === 'us_stock') - (getSleeve(x) === 'us_stock'));
+  if (short) return `split ${word(a)}/${word(b)}`;
+  const tot = lotsQty(lots);
+  const pa = tot > 0 ? Math.round(a.quantity / tot * 100) : 50;
+  return `split ${pa}% ${word(a)} / ${100 - pa}% ${word(b)}`;
+}
+
+// The phone layout's breakpoint, the one style.css stacks the page at.
+const PHONE_MQ = '(max-width: 640px)';
+const isPhoneLayout = () => window.matchMedia(PHONE_MQ).matches;
+
+// A position's value: cents on the desktop table, whole dollars on the phone
+// line — the number he came for, and the cents cost the account its room.
+// Both are in the DOM; CSS shows one (display:none keeps the other unread).
+const fmtWhole$ = n => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(n);
+const holdValueHtml = n => `<span class="v-cents">${fmt$(n)}</span><span class="v-whole">${fmtWhole$(n)}</span>`;
+
 function renderTable() {
   const tot   = total();
   const tbody = document.getElementById('tableBody');
   const tfoot = document.getElementById('tableFoot');
 
   if (!holdings.length) {
+    editingId = null;
     tbody.innerHTML = `<tr><td colspan="7">
-      <div class="empty-state"><p>No holdings yet — add one above or import a CSV.</p></div>
+      <div class="empty-state"><p>No holdings yet — add one in Plan &amp; settings below, or import a CSV from ⋯.</p></div>
     </td></tr>`;
     tfoot.innerHTML = '';
     return;
   }
 
-  // Group by account
+  // Group positions by account
   const groups = {};
-  for (const h of holdings) {
-    const acct = h.account || 'Unassigned';
+  for (const lots of positionsIn(holdings)) {
+    const acct = lots[0].account || 'Unassigned';
     if (!groups[acct]) groups[acct] = [];
-    groups[acct].push(h);
+    groups[acct].push(lots);
   }
 
   // Order: fixed ACCOUNTS list first, then any unknowns, then Unassigned last
@@ -2945,15 +3104,21 @@ function renderTable() {
   const colorMap = {};
   allByValue.forEach((h, i) => { colorMap[h.id] = PALETTE[i % PALETTE.length]; });
 
-  let html = '';
+  // Edit is keyed by the position; a pull can reorder its lots, so follow it.
+  const editLots = editingId ? positionLots(editingId) : [];
+  editingId = editLots[0]?.id ?? null;
+
+  // Rows before the open Edit form, the form, and rows after it — so a
+  // background render can leave the form's own node alone (keepEditRow).
+  let before = '', html = '', editHtml = '';
 
   acctOrder.forEach((acct, acctIdx) => {
-    const acctHoldings = [...groups[acct]].sort((a,b) => (b.quantity*b.price) - (a.quantity*a.price));
-    const acctTotal    = acctHoldings.reduce((s,h) => s + h.quantity*h.price, 0);
-    const acctPct      = tot > 0 ? (acctTotal / tot * 100).toFixed(1) : '0.0';
-    const acctColor    = ACCT_COLORS[acctIdx % ACCT_COLORS.length];
+    const positions = [...groups[acct]].sort((a, b) => lotsValue(b) - lotsValue(a));
+    const acctTotal = positions.reduce((s, lots) => s + lotsValue(lots), 0);
+    const acctPct   = tot > 0 ? (acctTotal / tot * 100).toFixed(1) : '0.0';
+    const acctColor = ACCT_COLORS[acctIdx % ACCT_COLORS.length];
 
-    // Account header row
+    // Account header row (desktop; the phone line names its account instead)
     html += `<tr class="acct-header">
       <td colspan="7">
         <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -2963,118 +3128,18 @@ function renderTable() {
       </td>
     </tr>`;
 
-    for (const h of acctHoldings) {
-      const val    = h.quantity * h.price;
-      const pct    = tot > 0 ? (val / tot) * 100 : 0;
-      const color  = colorMap[h.id];
-      const upd    = h.updated ? new Date(h.updated).toLocaleDateString() : '—';
-      const isMF   = h.type === 'mutual_fund';
-      const sleeve = getSleeve(h);
-      const slvCfg = SLEEVE_CONFIG[sleeve];
-      const fetchKey = (h.ticker || h.name).toUpperCase();
-
-      // Subtitle: ticker + updated (omit account — shown in header)
-      const subParts = [];
-      if (h.ticker && h.ticker.toUpperCase() !== h.name.toUpperCase() && h.ticker !== 'N/A') subParts.push(h.ticker.toUpperCase());
-      const proxyEntry = proxyEntryFor(h);
-      const navEntry = matchesNavTable(h) ? Object.entries(FUND_NAV_TABLE).find(([k]) => h.name.includes(k))?.[1] : null;
-      const navTag = proxyEntry && h.calibration
-        ? ` · est. via ${proxyEntry.proxy} (calibrated ${new Date(h.calibration.date).toLocaleDateString()})`
-        : navEntry ? ` · manual NAV ${navEntry.updated}` : (isMF ? ' · NAV' : '');
-      subParts.push(`updated ${upd}${navTag}`);
-      const subtitle = subParts.join(' · ');
-      const daysOld = h.updated ? Math.floor((Date.now() - new Date(h.updated)) / 86400000) : null;
-      // Proxy-tracked funds refresh automatically, so the price-age badge doesn't apply;
-      // nudge instead when the real-NAV calibration is getting old.
-      const calDays = proxyEntry && h.calibration ? Math.floor((Date.now() - new Date(h.calibration.date)) / 86400000) : null;
-      const staleTag = proxyEntry
-        ? (calDays !== null && calDays > PROXY_RECAL_NUDGE_DAYS ? ` <span class="stale-badge">⚠ recalibrate — ${calDays}d since real NAV</span>` : '')
-        : (daysOld !== null && daysOld > 7 ? ` <span class="stale-badge">⚠ ${daysOld}d old</span>` : '');
-
-      if (editingId === h.id) {
-        html += `<tr>
-          <td colspan="2">
-            <div style="display:flex;flex-direction:column;gap:5px;">
-              <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;">
-                <input id="en-${h.id}" type="text" value="${esc(h.name)}" placeholder="Name">
-                <input id="etick-${h.id}" type="text" value="${esc(h.ticker||'')}" placeholder="Ticker (optional)">
-              </div>
-              <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;">
-                <select id="et-${h.id}">${typeOptions(h.type)}</select>
-                <select id="eacc-${h.id}">${accountOptions(h.account||'')}</select>
-                <select id="eslv-${h.id}" title="Sleeve">${sleeveOptions(h.sleeve||'')}</select>
-              </div>
-            </div>
-          </td>
-          <td class="num"><input id="eq-${h.id}" type="number" step="any" value="${h.quantity}" style="width:90px;text-align:right;"></td>
-          <td class="num"><input id="ep-${h.id}" type="number" step="any" value="${h.price}" style="width:90px;text-align:right;"></td>
-          <td class="num" colspan="2"></td>
-          <td class="num"><div class="actions">
-            <button class="btn btn-primary btn-sm" onclick="saveEdit('${h.id}')">Save</button>
-            <button class="btn btn-ghost btn-sm" onclick="cancelEdit()">Cancel</button>
-          </div></td>
-        </tr>`;
+    for (const lots of positions) {
+      if (lots[0].id === editingId) {
+        before = html; html = '';
+        editHtml = holdEditRowHtml(lots);
         continue;
       }
-
-      html += `<tr>
-        <td>
-          <div class="ticker-name">
-            ${esc(h.name)}
-            <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${slvCfg.color};margin-left:6px;vertical-align:middle;" title="${slvCfg.label}"></span>
-          </div>
-          <div class="ticker-sub">${esc(subtitle)}${staleTag}</div>
-        </td>
-        <td data-label="Type">${typeBadge(h.type)}</td>
-        <td class="num" data-label="Shares">${fmtN(h.quantity)}</td>
-        <td class="num" data-label="Price" style="cursor:pointer;" onclick="startQuickPrice('${h.id}')" title="Click to edit price">
-          ${quickPriceId === h.id
-            ? `<input id="qp-${h.id}" type="number" step="any" value="${h.price}" style="width:85px;text-align:right;" onkeydown="if(event.key==='Enter')saveQuickPrice('${h.id}');if(event.key==='Escape')cancelQuickPrice();" onblur="saveQuickPrice('${h.id}')">`
-            : fmt$(h.price)}
-        </td>
-        <td class="num" data-label="Value">${fmt$(val)}</td>
-        <td>
-          <div class="bar-wrap">
-            <div class="bar-bg"><div class="bar-fill" style="width:${pct}%;background:${color};"></div></div>
-            <span style="font-size:13px;color:var(--text-secondary);min-width:42px;text-align:right;">${pct.toFixed(1)}%</span>
-          </div>
-        </td>
-        <td class="num"><div class="actions">
-          <button class="btn btn-ghost btn-sm" title="Fetch ${isMF ? 'NAV' : 'price'} for ${esc(fetchKey)}" onclick="refreshHoldingPrice('${h.id}')">↻</button>
-          <button class="btn btn-ghost btn-sm" onclick="startEdit('${h.id}')">Edit</button>
-          <button class="btn btn-ghost btn-sm" title="Split into two sleeve allocations" onclick="startSplit('${h.id}')">Split</button>
-          <button class="btn btn-danger btn-sm" title="Delete ${esc(h.name)}" aria-label="Delete ${esc(h.name)}" onclick="deleteHolding('${h.id}')">✕</button>
-        </div></td>
-      </tr>
-      ${splittingId === h.id ? `<tr>
-        <td colspan="7" style="background:var(--navy-muted);border-top:none;padding:12px 16px;">
-          <div style="display:flex;flex-direction:column;gap:10px;">
-            <div style="font-size:14px;font-weight:600;color:var(--navy-text);">✂ Split "${esc(h.name)}" (${fmtN(h.quantity)} total units)</div>
-            <div style="display:grid;grid-template-columns:90px 1fr 130px;gap:8px;align-items:center;">
-              <div style="display:flex;align-items:center;gap:4px;">
-                <input id="sp-pct-${h.id}" type="number" min="1" max="99" step="0.1" value="72"
-                  style="width:58px;text-align:right;"
-                  oninput="updateSplitPreview('${h.id}',${h.quantity})"> %
-              </div>
-              <select id="sp-slv1-${h.id}">${sleeveOptions('us_stock')}</select>
-              <span id="sp-qty1-${h.id}" style="font-size:13px;color:var(--text-secondary);">${fmtN(h.quantity * 0.72)} units</span>
-            </div>
-            <div style="display:grid;grid-template-columns:90px 1fr 130px;gap:8px;align-items:center;">
-              <div style="color:var(--text-secondary);font-size:14px;padding-left:4px;"><span id="sp-pct2-${h.id}">28%</span></div>
-              <select id="sp-slv2-${h.id}">${sleeveOptions('intl_stock')}</select>
-              <span id="sp-qty2-${h.id}" style="font-size:13px;color:var(--text-secondary);">${fmtN(h.quantity * 0.28)} units</span>
-            </div>
-            <div style="display:flex;gap:8px;">
-              <button class="btn btn-primary btn-sm" onclick="confirmSplit('${h.id}')">✓ Confirm Split</button>
-              <button class="btn btn-ghost btn-sm" onclick="cancelSplit()">Cancel</button>
-            </div>
-          </div>
-        </td>
-      </tr>` : ''}`;
+      html += holdRowHtml(lots, tot, colorMap[lots[0].id]);
+      if (splittingId === lots[0].id && lots.length === 1) html += holdSplitRowHtml(lots[0]);
     }
   });
 
-  tbody.innerHTML = html;
+  if (!keepEditRow(tbody, editLots, before, html)) tbody.innerHTML = before + editHtml + html;
 
   if (quickPriceId) {
     const inp = document.getElementById(`qp-${quickPriceId}`);
@@ -3086,127 +3151,291 @@ function renderTable() {
   }
 
   tfoot.innerHTML = `<tr>
-    <td>Total</td><td></td><td class="num">—</td><td class="num">—</td>
-    <td class="num">${fmt$(tot)}</td>
-    <td>100%</td><td></td>
+    <td class="h-name">Total</td><td></td><td class="num">—</td><td class="num">—</td>
+    <td class="num h-val">${holdValueHtml(tot)}</td>
+    <td class="h-alloc">100%</td><td></td>
   </tr>`;
 }
 
-// ─── Render: Chart ────────────────────────────────────────────────────────────
-function setChartView(view) {
-  chartView = view;
-  document.querySelectorAll('.chart-toggle .toggle-btn').forEach((btn, i) => {
-    btn.classList.toggle('active', ['sleeve','ticker','account'][i] === view);
-  });
-  renderChart();
+// One position's line. Desktop: the seven-column row with its buttons. Phone
+// (≤640, style.css): name over "account · ticker", value over its share — one
+// line per position, and the line itself opens Edit (David, 2026-10-04: the
+// four-button row and the six-line cards made the list four screens long).
+function holdRowHtml(lots, tot, color) {
+  const h      = lots[0];
+  const key    = esc(h.id);
+  const pair   = lots.length > 1;
+  const qty    = lotsQty(lots);
+  const val    = lotsValue(lots);
+  const pct    = tot > 0 ? (val / tot) * 100 : 0;
+  const upd    = h.updated ? new Date(h.updated).toLocaleDateString() : '—';
+  const isMF   = h.type === 'mutual_fund';
+  const fetchKey = (h.ticker || h.name).toUpperCase();
+  const realTicker = h.ticker && h.ticker.toUpperCase() !== h.name.toUpperCase() && h.ticker !== 'N/A' ? h.ticker.toUpperCase() : '';
+
+  // Subtitle: ticker + updated (omit account — shown in header)
+  const subParts = [];
+  if (pair) subParts.push(splitLabel(lots));
+  if (realTicker) subParts.push(realTicker);
+  const proxyEntry = proxyEntryFor(h);
+  const navEntry = matchesNavTable(h) ? Object.entries(FUND_NAV_TABLE).find(([k]) => h.name.includes(k))?.[1] : null;
+  const navTag = proxyEntry && h.calibration
+    ? ` · est. via ${proxyEntry.proxy} (calibrated ${new Date(h.calibration.date).toLocaleDateString()})`
+    : navEntry ? ` · manual NAV ${navEntry.updated}` : (isMF ? ' · NAV' : '');
+  subParts.push(`updated ${upd}${navTag}`);
+  const subtitle = subParts.join(' · ');
+  const daysOld = h.updated ? Math.floor((Date.now() - new Date(h.updated)) / 86400000) : null;
+  // Proxy-tracked funds refresh automatically, so the price-age badge doesn't apply;
+  // nudge instead when the real-NAV calibration is getting old.
+  const calDays = proxyEntry && h.calibration ? Math.floor((Date.now() - new Date(h.calibration.date)) / 86400000) : null;
+  const recal = proxyEntry && calDays !== null && calDays > PROXY_RECAL_NUDGE_DAYS;
+  const old = !proxyEntry && daysOld !== null && daysOld > 7;
+  const staleTag = recal ? ` <span class="stale-badge">⚠ recalibrate — ${calDays}d since real NAV</span>`
+    : old ? ` <span class="stale-badge">⚠ ${daysOld}d old</span>` : '';
+
+  // The phone's second line: what tells this line from its neighbours, in the
+  // fewest characters, warning first. Each part is unbreakable, so on a
+  // narrow phone the line wraps between parts, never inside "Swedish pension".
+  const meta = [
+    recal ? '⚠ recalibrate' : old ? `⚠ ${daysOld}d old` : '',
+    h.account || 'Unassigned',
+    pair ? splitLabel(lots, true) : realTicker || (proxyEntry ? `via ${proxyEntry.proxy}` : ''),
+  ].filter(Boolean).map(s => `<span>${esc(s)}</span>`).join(' · ');
+
+  const dots = lots.map(x => {
+    const s = SLEEVE_CONFIG[getSleeve(x)];
+    return `<span class="sleeve-dot" style="width:7px;height:7px;background:${s.color};margin-left:6px;vertical-align:middle;" title="${s.label}"></span>`;
+  }).join('');
+
+  return `<tr class="hold-row${quickPriceId === h.id ? ' qp-open' : ''}" data-key="${key}">
+    <td class="h-name">
+      <div class="ticker-name">${esc(h.name)}${dots}</div>
+      <div class="ticker-sub">${esc(subtitle)}${staleTag}</div>
+      <div class="h-meta">${meta}</div>
+    </td>
+    <td class="h-type" data-label="Type">${typeBadge(h.type)}</td>
+    <td class="num h-qty" data-label="Shares">${fmtN(qty)}</td>
+    <td class="num h-price" data-label="Price" style="cursor:pointer;" data-act="qp" data-key="${key}" title="Click to edit price">
+      ${quickPriceId === h.id
+        ? `<input id="qp-${key}" data-key="${key}" type="number" inputmode="decimal" step="any" value="${esc(h.price)}" aria-label="Price for ${esc(h.name)}">`
+        : fmt$(h.price)}
+    </td>
+    <td class="num h-val" data-label="Value">${holdValueHtml(val)}</td>
+    <td class="h-alloc">
+      <div class="bar-wrap">
+        <div class="bar-bg"><div class="bar-fill" style="width:${pct}%;background:${color};"></div></div>
+        <span class="h-pct">${pct.toFixed(1)}%</span>
+      </div>
+    </td>
+    <td class="num h-actions"><div class="actions">
+      <button class="btn btn-ghost btn-sm" title="Fetch ${isMF ? 'NAV' : 'price'} for ${esc(fetchKey)}" data-act="refresh" data-key="${key}">↻</button>
+      <button class="btn btn-ghost btn-sm" data-act="edit" data-key="${key}">Edit</button>
+      ${pair ? '' : `<button class="btn btn-ghost btn-sm" title="Split into two sleeve allocations" data-act="split" data-key="${key}">Split</button>`}
+      <button class="btn btn-danger btn-sm" title="Delete ${esc(h.name)}" aria-label="Delete ${esc(h.name)}" data-act="delete" data-key="${key}">✕</button>
+    </div></td>
+  </tr>`;
 }
 
-function chartGroups() {
-  if (chartView === 'sleeve') {
-    return ['us_stock','intl_stock','tilt','bond','other'].map(s => ({
-      label: SLEEVE_CONFIG[s].label,
-      value: holdings.reduce((sum, h) => sum + (getSleeve(h) === s ? h.quantity * h.price : 0), 0),
-      color: SLEEVE_CONFIG[s].color,
-    })).filter(g => g.value > 0);
+// A fetched price is a raw float (a dozen or more decimal places), which ran
+// past the field at 375. Four places show what matters (six significant
+// digits below $1), and showing less is safe: a field he doesn't touch
+// saves the live price, not this (saveEdit).
+const editPriceStr = p => String(+p >= 1 ? +(+p).toFixed(4) : +(+p).toPrecision(6));
+
+// Edit, at every width: labelled fields, then Save, and the rarer actions
+// that used to sit on every line — ↻ price, Split, Delete (Drop 1's confirm
+// and 10 s Undo, unchanged). A split fund edits as one: its total shares
+// (the ratio is kept, as in Update positions) and one price for both lots.
+function holdEditRowHtml(lots) {
+  const h    = lots[0];
+  const key  = esc(h.id);
+  const pair = lots.length > 1;
+  const priceLabel = (TYPE_CONFIG[h.type] || TYPE_CONFIG.other).priceLabel;
+  return `<tr class="hold-edit" id="he-row-${key}" data-lots="${esc(lots.map(x => x.id).join(','))}">
+    <td colspan="7"><div class="he-form">
+      <div class="he-grid">
+        <label class="he-f he-wide"><span>Name</span>
+          <input id="en-${key}" type="text" value="${esc(h.name)}" autocomplete="off"></label>
+        <label class="he-f"><span>Ticker</span>
+          <input id="etick-${key}" type="text" value="${esc(h.ticker || '')}" placeholder="optional" autocomplete="off" spellcheck="false"></label>
+        <label class="he-f"><span>Type</span><select id="et-${key}">${typeOptions(h.type)}</select></label>
+        <label class="he-f he-wide-m"><span>Account</span><select id="eacc-${key}">${accountOptions(h.account || '')}</select></label>
+        ${pair
+          ? `<div class="he-f he-wide-m"><span>Sleeve</span><div class="he-split-note">${esc(splitLabel(lots))}</div></div>`
+          : `<label class="he-f he-wide-m"><span>Sleeve</span><select id="eslv-${key}">${sleeveOptions(h.sleeve || '')}</select></label>`}
+        <label class="he-f"><span>${pair ? 'Total shares' : 'Shares'}</span>
+          <input id="eq-${key}" type="number" inputmode="decimal" step="any" min="0" value="${+lotsQty(lots).toFixed(6)}"></label>
+        <label class="he-f"><span>${priceLabel}</span>
+          <input id="ep-${key}" type="number" inputmode="decimal" step="any" min="0" value="${editPriceStr(h.price)}"></label>
+      </div>
+      ${pair ? `<p class="he-hint">One fund held as two sleeves. A new total keeps the split.</p>` : ''}
+      <div class="he-actions">
+        <button class="btn btn-primary btn-sm" data-act="save" data-key="${key}">Save</button>
+        <button class="btn btn-ghost btn-sm" data-act="cancel">Cancel</button>
+        <span class="he-tools">
+          <button class="btn btn-ghost btn-sm" data-act="refresh" data-key="${key}" aria-label="Fetch the latest ${h.type === 'mutual_fund' ? 'NAV' : 'price'}">↻ Price</button>
+          ${pair ? '' : `<button class="btn btn-ghost btn-sm" data-act="split" data-key="${key}">Split</button>`}
+          <button class="btn btn-danger btn-sm" data-act="delete" data-key="${key}" aria-label="Delete ${esc(h.name)}">Delete</button>
+        </span>
+      </div>
+    </div></td>
+  </tr>`;
+}
+
+// A render while Edit is open — the boot price refresh renders once per
+// holding, for the first ten seconds or so of every visit — rebuilt the form
+// from the stored values and threw away what he had typed, focus included.
+// When the same position is still being edited, keep the form's node and
+// rebuild only the rows around it; fields he has not touched take the fresh
+// values (a refreshed price shows up), fields he has touched keep his.
+function keepEditRow(tbody, lots, before, after) {
+  if (!lots.length) return false;
+  const row = document.getElementById(`he-row-${lots[0].id}`);
+  if (!row || row.parentNode !== tbody || row.dataset.lots !== lots.map(x => x.id).join(',')) return false;
+  for (const el of [...tbody.children]) if (el !== row) el.remove();
+  row.insertAdjacentHTML('beforebegin', before);
+  row.insertAdjacentHTML('afterend', after);
+  const h = lots[0], key = h.id;
+  const live = {
+    [`en-${key}`]: h.name, [`etick-${key}`]: h.ticker || '', [`et-${key}`]: h.type,
+    [`eacc-${key}`]: h.account || '', [`eslv-${key}`]: h.sleeve || '',
+    [`eq-${key}`]: String(+lotsQty(lots).toFixed(6)), [`ep-${key}`]: editPriceStr(h.price),
+  };
+  for (const [id, v] of Object.entries(live)) {
+    const el = document.getElementById(id);
+    if (el && !el.dataset.dirty && el.value !== v) el.value = v;
   }
-  const map = new Map();
-  holdings.forEach(h => {
-    const key   = chartView === 'account'
-      ? (h.account || 'Unknown')
-      : ((h.ticker && h.ticker !== 'N/A') ? h.ticker : h.name);
-    const val   = h.quantity * h.price;
-    if (map.has(key)) map.get(key).value += val;
-    else map.set(key, { label: key, value: val });
-  });
-  const palette = chartView === 'account' ? ACCT_COLORS : PALETTE;
-  return [...map.values()]
-    .sort((a, b) => b.value - a.value)
-    .map((g, i) => ({ ...g, color: palette[i % palette.length] }));
+  const note = row.querySelector('.he-split-note');
+  if (note && lots.length > 1) note.textContent = splitLabel(lots);
+  return true;
 }
 
-function renderChart() {
-  const tot    = total();
-  const groups = chartGroups();
+function holdSplitRowHtml(h) {
+  const key = esc(h.id);
+  return `<tr class="hold-split">
+    <td colspan="7"><div class="sp-form">
+      <div class="sp-title">✂ Split "${esc(h.name)}" (${fmtN(h.quantity)} total units)</div>
+      <div class="sp-line">
+        <span class="sp-pct"><input id="sp-pct-${key}" data-act="sp-pct" data-key="${key}" type="number" inputmode="decimal"
+          min="1" max="99" step="0.1" value="72" aria-label="Percent in the first sleeve"> %</span>
+        <select id="sp-slv1-${key}" aria-label="First sleeve">${sleeveOptions('us_stock')}</select>
+        <span class="sp-qty" id="sp-qty1-${key}">${fmtN(h.quantity * 0.72)} units</span>
+      </div>
+      <div class="sp-line">
+        <span class="sp-pct"><span id="sp-pct2-${key}">28%</span></span>
+        <select id="sp-slv2-${key}" aria-label="Second sleeve">${sleeveOptions('intl_stock')}</select>
+        <span class="sp-qty" id="sp-qty2-${key}">${fmtN(h.quantity * 0.28)} units</span>
+      </div>
+      <div class="sp-btns">
+        <button class="btn btn-primary btn-sm" data-act="split-ok" data-key="${key}">✓ Confirm Split</button>
+        <button class="btn btn-ghost btn-sm" data-act="split-cancel">Cancel</button>
+      </div>
+    </div></td>
+  </tr>`;
+}
 
-  document.getElementById('legend').innerHTML = groups.length === 0
-    ? '<li style="color:var(--text-muted);font-size:14px;">No holdings yet</li>'
-    : groups.map(g => {
-        const pct = tot > 0 ? (g.value / tot * 100).toFixed(1) : '0.0';
-        return `<li>
-          <span class="legend-dot" style="background:${g.color}"></span>
-          <span class="legend-name" title="${esc(g.label)}">${esc(g.label)}</span>
-          <span class="legend-pct">${pct}%</span>
-        </li>`;
-      }).join('');
-
-  const canvas = document.getElementById('allocChart');
-  if (chartInst) { chartInst.destroy(); chartInst = null; }
-  if (!groups.length) { canvas.style.display = 'none'; return; }
-  canvas.style.display = '';
-
-  chartInst = new Chart(canvas, {
-    type: 'doughnut',
-    data: {
-      labels: groups.map(g => g.label),
-      datasets: [{ data: groups.map(g => g.value), backgroundColor: groups.map(g => g.color), borderWidth: 2, borderColor: themeChartBorder(), hoverOffset: 6 }]
-    },
-    options: {
-      cutout: '60%',
-      plugins: {
-        legend: { display: false },
-        tooltip: { callbacks: { label: ctx => {
-          const pct = tot > 0 ? (ctx.parsed / tot * 100).toFixed(1) : '0.0';
-          return `  ${fmt$(ctx.parsed)}  (${pct}%)`;
-        }}}
+// One listener per kind for the whole table. Every control carries
+// data-act and its position's key as data-key: no id is spliced into an
+// onclick string any more (Drop 1 CISO-4 — an id from an imported file is
+// arbitrary text, and a quote in it broke out of the handler).
+(function wireHoldingsTable() {
+  const tbody = document.getElementById('tableBody');
+  if (!tbody) return;
+  tbody.addEventListener('click', e => {
+    const t = e.target;
+    if (t.closest('input, select, label')) return; // typing, not tapping
+    const el = t.closest('[data-act]');
+    if (el) {
+      const key = el.dataset.key;
+      switch (el.dataset.act) {
+        case 'refresh':      return refreshHoldingPrice(key);
+        case 'edit':         return startEdit(key);
+        case 'split':        return startSplit(key);
+        case 'delete':       return deleteHolding(key);
+        case 'save':         return saveEdit(key);
+        case 'cancel':       return cancelEdit();
+        case 'qp':           return startQuickPrice(key);
+        case 'split-ok':     return confirmSplit(key);
+        case 'split-cancel': return cancelSplit();
       }
     }
+    // At phone width the line is the way in: there are no buttons on it.
+    const row = t.closest('tr.hold-row');
+    if (row && isPhoneLayout()) startEdit(row.dataset.key);
   });
-}
+  tbody.addEventListener('keydown', e => {
+    const t = e.target;
+    if (t.id && t.id.startsWith('qp-')) {
+      if (e.key === 'Enter') saveQuickPrice(t.dataset.key);
+      if (e.key === 'Escape') cancelQuickPrice();
+    }
+  });
+  tbody.addEventListener('focusout', e => {
+    const t = e.target;
+    if (t.id && t.id.startsWith('qp-')) saveQuickPrice(t.dataset.key);
+  });
+  // What he has touched in Edit: saveEdit applies only these, and a
+  // background render keeps them (keepEditRow).
+  const touched = e => {
+    const t = e.target;
+    if (t.closest('.he-form')) t.dataset.dirty = '1';
+    if (t.dataset.act === 'sp-pct') updateSplitPreview(t.dataset.key);
+  };
+  tbody.addEventListener('input', touched);
+  tbody.addEventListener('change', touched);
+})();
 
 // ─── Render: Target Inputs ────────────────────────────────────────────────────
-function renderTargetInputs() {
-  const tot = total();
-
-  // Total mix inputs
-  document.getElementById('targetInputsTot').innerHTML = [
+const TARGET_ROWS = {
+  targetInputsTot: [
     { key: 'stocks', label: 'Stocks', color: '#0d9488' },
     { key: 'bonds',  label: 'Bonds',  color: '#8b5cf6' },
     { key: 'other',  label: 'Other',  color: '#52525b' },
-  ].map(row => {
-    const dollarVal = tot * targets[row.key] / 100;
-    return `
-    <div class="target-row">
-      <label>
-        <span class="sleeve-dot" style="background:${row.color}"></span>
-        ${row.label}
-      </label>
-      <input type="number" min="0" max="100" step="1" value="${esc(targets[row.key])}"
-             oninput="previewTarget('${row.key}', this.value)" onchange="commitTarget('${row.key}', this.value)">
-      <span class="pct-label">%</span>
-      <span class="target-dollar">${fmt$(dollarVal)}</span>
-    </div>`;
-  }).join('');
-
-  // Within-stocks split inputs
-  const stockVal = tot * targets.stocks / 100;
-  document.getElementById('targetInputsStk').innerHTML = [
+  ],
+  targetInputsStk: [
     { key: 'us',    label: 'US',            color: SLEEVE_CONFIG.us_stock.color },
     { key: 'intl',  label: 'International', color: SLEEVE_CONFIG.intl_stock.color },
     { key: 'tilts', label: 'Tilts',         color: SLEEVE_CONFIG.tilt.color },
-  ].map(row => {
-    const dollarVal = stockVal * targets[row.key] / 100;
-    return `
+  ],
+};
+
+// Built once, then synced in place. render() calls this since Drop 2 (the
+// dollar figures follow prices), a price refresh renders once per fetched
+// holding, and committing one field (blur) renders while the finger is
+// already on the next: a rebuild there replaced the field he had just tapped
+// and dropped the keyboard (layout.spec.js), or wiped a half-typed figure.
+function renderTargetInputs() {
+  const tot = total();
+  const stockVal = tot * targets.stocks / 100;
+  const dollarsFor = (box, key) => (box === 'targetInputsTot' ? tot : stockVal) * targets[key] / 100;
+  let typing = null;
+  for (const [box, rows] of Object.entries(TARGET_ROWS)) {
+    const el = document.getElementById(box);
+    if (!el) continue;
+    if (el.querySelectorAll('input[data-key]').length !== rows.length) {
+      el.innerHTML = rows.map(row => `
     <div class="target-row">
       <label>
         <span class="sleeve-dot" style="background:${row.color}"></span>
         ${row.label}
       </label>
-      <input type="number" min="0" max="100" step="1" value="${esc(targets[row.key])}"
+      <input type="number" min="0" max="100" step="1" data-key="${row.key}" value="${esc(targets[row.key])}" aria-label="${row.label} target %"
              oninput="previewTarget('${row.key}', this.value)" onchange="commitTarget('${row.key}', this.value)">
       <span class="pct-label">%</span>
-      <span class="target-dollar">${fmt$(dollarVal)}</span>
-    </div>`;
-  }).join('');
+      <span class="target-dollar">${fmt$0(dollarsFor(box, row.key))}</span>
+    </div>`).join('');
+      continue;
+    }
+    for (const row of rows) {
+      const inp = el.querySelector(`input[data-key="${row.key}"]`);
+      // A value with markup in it lands in .value, which is inert.
+      if (document.activeElement !== inp) inp.value = targets[row.key];
+      else typing = { key: row.key, value: inp.value };
+      inp.parentElement.querySelector('.target-dollar').textContent = fmt$0(dollarsFor(box, row.key));
+    }
+  }
+  // The sum check keeps previewing what is in the field he is typing in.
+  renderTargetWarning(typing ? { ...targets, [typing.key]: +typing.value } : targets);
 }
 
 // Target edits used to call only saveLocal() on every keystroke: nothing
@@ -3214,85 +3443,59 @@ function renderTargetInputs() {
 // cloud, and the next boot adopted the file's old targets (audit 2026-10-03,
 // sandbox: a target edit sent 0 POSTs and was back to the old split after
 // reload). Each keystroke
-// also rebuilt the inputs, dropping focus after the first digit. Now typing
-// only previews the gap table; committing (change: blur or Enter) saves once
-// and re-renders everything that reads targets: the Advisor's drift against
-// the bands, the attention strip, and the policy line on the chart.
+// also rebuilt the inputs, dropping focus after the first digit. Committing
+// (change: blur or Enter) saves once and re-renders everything that reads
+// targets: the Advisor's drift against the bands, the attention strip, and
+// the policy line on the chart.
+//
+// Typing only previews the sum check, on a copy. Until Drop 2 the preview
+// wrote the half-typed figure into the live targets (Drop 1 carry-over): any
+// render or save that ran mid-typing — the 15-minute price refresh, a cloud
+// pull — read or pushed a target he had not committed.
 function previewTarget(key, value) {
-  targets[key] = +value;
-  renderGapTable();
+  renderTargetWarning({ ...targets, [key]: +value });
 }
 
 function commitTarget(key, value) {
   targets[key] = +value;
   markUnsaved();
-  render();
-  renderTargetInputs();
+  render();     // renderPlan → renderTargetInputs syncs the fields in place
 }
 
-// ─── Render: Gap Table ────────────────────────────────────────────────────────
-function renderGapTable() {
-  const tot      = total();
-  const slvVals  = getSleeveTotals();
-  const tgtPcts  = getSleeveTargetPcts();
-
-  // Validate targets sum
-  const allTotal = targets.stocks + targets.bonds + targets.other;
-  const stkTotal = targets.us + targets.intl + targets.tilts;
+// Pure: the sum checks on a set of targets. The Current-vs-Target table that
+// used to carry them left the page in Drop 2 (its ±0.5pp verdicts disagreed
+// with his 5/25 bands — Where you stand is the band check), so the sums now
+// sit under the inputs they police.
+function targetSumWarnings(t = targets) {
+  const allTotal = +t.stocks + +t.bonds + +t.other;
+  const stkTotal = +t.us + +t.intl + +t.tilts;
   const warnings = [];
   if (Math.abs(allTotal - 100) > 0.5) warnings.push(`Stocks + Bonds + Other = ${allTotal}% (should be 100%)`);
   if (Math.abs(stkTotal - 100) > 0.5) warnings.push(`US + Intl + Tilts = ${stkTotal}% (should be 100%)`);
-  const warnEl = document.getElementById('targetWarning');
-  warnEl.textContent = warnings.length ? '⚠ ' + warnings.join(' · ') : '';
-
-  // data-label: at phone width the row stacks (style.css ≤640px), and with no
-  // labels a sleeve read as four bare lines (target % / current % / $… / ✓), target
-  // and current impossible to tell apart (Drop 1 review, round 2).
-  document.getElementById('gapTableBody').innerHTML = Object.entries(SLEEVE_CONFIG).map(([sleeve, cfg]) => {
-    const curVal = slvVals[sleeve] || 0;
-    const curPct = tot > 0 ? curVal / tot * 100 : 0;
-    const tgtPct = tgtPcts[sleeve] || 0;
-    const gap    = curPct - tgtPct; // positive = overweight
-
-    let gapCls, gapStr;
-    if (Math.abs(gap) < 0.5) {
-      gapCls = 'gap-ok'; gapStr = '✓';
-    } else if (gap < 0) {
-      gapCls = 'gap-under';
-      const shortAmt = Math.abs(gap / 100 * tot);
-      gapStr = `${gap.toFixed(1)}% (${fmt$(shortAmt)} short)`;
-    } else {
-      gapCls = 'gap-over';
-      const overAmt = Math.abs(gap / 100 * tot);
-      gapStr = `+${gap.toFixed(1)}% (${fmt$(overAmt)} over)`;
-    }
-
-    return `<tr>
-      <td>
-        <span class="sleeve-label">
-          <span class="sleeve-dot" style="background:${cfg.color}"></span>
-          ${cfg.label}
-        </span>
-      </td>
-      <td class="r" data-label="Target">${tgtPct.toFixed(1)}%</td>
-      <td class="r" data-label="Current">${curPct.toFixed(1)}%</td>
-      <td class="r" data-label="Value">${fmt$(curVal)}</td>
-      <td class="r ${gapCls}" data-label="Gap">${gapStr}</td>
-    </tr>`;
-  }).join('');
+  return warnings;
 }
 
-// ─── Advisor: market context ─────────────────────────────────────────────────
-// External data in, decision out — the card reports what moved and where the
-// portfolio stands against its own policy. It never says buy or sell, and it
-// never reads a market level as a signal: "VOO is 2% off its high" is a fact,
+function renderTargetWarning(t = targets) {
+  const warnEl = document.getElementById('targetWarning');
+  if (!warnEl) return;
+  const warnings = targetSumWarnings(t);
+  warnEl.textContent = warnings.length ? '⚠ ' + warnings.join(' · ') : '';
+}
+
+// ─── Market context ──────────────────────────────────────────────────────────
+// External data in, decision out. Nothing here says buy or sell, and nothing
+// reads a market level as a signal: "VOO is 2% off its high" is a fact,
 // "therefore buy" is not one this app is entitled to make.
+//
+// The Advisor's Market panel (a tap-to-load list of 1d/30d/YTD moves per
+// ticker, "no view on what they mean") left on 2026-10-04 — David: it "doesn't
+// do anything, and it doesn't tell you anything". The This week card's market
+// strip replaced it. marketSnapshot stays as a tested pure engine.
 //
 // The macro row is the CBOE 10-year Treasury yield index. It is quoted in
 // percent, not dollars, so its moves are shown in basis points — a percent
 // change of a yield would read as a price move and mean nothing.
 const MACRO_TICKER = '^TNX';
-const MACRO_LABEL  = '10-yr Treasury';
 
 // Pure: reduce a daily adjusted-close series to the numbers worth showing.
 // `asOf` is injectable so tests can pin the YTD boundary. Returns null when
@@ -3331,50 +3534,6 @@ function marketSnapshot(timestamps, closes, asOf = Date.now()) {
     high52,
     offHighPct: high52 > 0 ? (last.c / high52 - 1) * 100 : 0,
   };
-}
-
-// The instruments actually worth watching: every distinct real ticker held,
-// plus the macro row. Sorted by position size so the biggest bet reads first.
-function marketWatchlist(holdingsArr = holdings) {
-  const byTicker = new Map();
-  for (const h of holdingsArr) {
-    if (!hasRealTicker(h)) continue;
-    const t = h.ticker.toUpperCase();
-    byTicker.set(t, (byTicker.get(t) || 0) + h.quantity * h.price);
-  }
-  return [...byTicker.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([ticker, value]) => ({ ticker, value, macro: false }));
-}
-
-let marketData = null;      // { rows: [{ticker, label, macro, snap}], fetched }
-let marketBusy = false;
-
-async function refreshMarket() {
-  if (marketBusy) return;
-  marketBusy = true;
-  const btn = document.getElementById('btnMarketRefresh');
-  if (btn) { btn.disabled = true; btn.textContent = '↻ Fetching…'; }
-
-  const targetsList = [
-    ...marketWatchlist(),
-    { ticker: MACRO_TICKER, label: MACRO_LABEL, macro: true, value: 0 },
-  ];
-  const rows = [];
-  for (const item of targetsList) {
-    const chart = await fetchYahooChart(item.ticker, '1y');
-    const snap = chart ? marketSnapshot(chart.timestamps, chart.adjcloses) : null;
-    rows.push({ ...item, label: item.label || item.ticker, snap });
-  }
-  marketData = { rows, fetched: new Date().toISOString() };
-
-  marketBusy = false;
-  if (btn) { btn.disabled = false; btn.textContent = '↻ Refresh market'; }
-  renderAdvisorContext();
-  const ok = rows.filter(r => r.snap).length;
-  toast(ok === rows.length
-    ? `Market updated — ${ok} instruments`
-    : `Market updated — ${ok} of ${rows.length} (some feeds unavailable)`);
 }
 
 // ─── Advisor: drift vs policy ────────────────────────────────────────────────
@@ -3430,7 +3589,13 @@ function monthsToCloseGap(gapDollars, monthlyIn) {
   return gapDollars / monthlyIn;
 }
 
-// ─── Advisor: attribution ────────────────────────────────────────────────────
+// ─── Attribution ─────────────────────────────────────────────────────────────
+// The engine behind the Advisor's old "What moved your money" panel, which left
+// with it on 2026-10-04 (its window buttons opened a second, per-ticker table
+// under the Market panel — "why is there one and then another one"). The This
+// week card answers the same question on trading-date closes (weekMoney);
+// this stays as the tested reference for the rules both follow.
+//
 // "What moved my money" — the decomposition the header cannot give you. A
 // change in total value is two different things wearing one number: money you
 // PUT IN, and money the market gave or took. Splitting them is the difference
@@ -3447,12 +3612,6 @@ function monthsToCloseGap(gapDollars, monthlyIn) {
 // unattributable rather than folded in at zero, because a silent zero would
 // understate the market's contribution and quietly break the identity
 // (flows + market = total).
-const ATTRIB_WINDOWS = [
-  { key: '1w',  label: '1 week',   days: 7 },
-  { key: '1m',  label: '1 month',  days: 30 },
-  { key: '3m',  label: '3 months', days: 91 },
-  { key: 'ytd', label: 'YTD',      days: null },
-];
 
 // Windows are anchored in New York, not UTC. On UTC the evening of 31 December
 // already belongs to the next year, so a YTD run after ~7pm ET resolved to
@@ -3462,10 +3621,15 @@ const ATTRIB_WINDOWS = [
 // accruals, history snapshots, fx stamps, the last look): the server keys its
 // rows by the New York date, and the UTC day runs ahead every evening after
 // 8pm ET, so an evening edit was booked to tomorrow (audit 2026-10-03).
+// One formatter, made on first use (a property of the hoisted function, so
+// it works before this line runs). A new one per call cost the week card
+// ~27 ms of its ~29 ms per render: ~1,500 bars, ~11 renders in the boot
+// refresh (CIO, Drop 2 round 2).
 function nyToday(now = Date.now()) {
-  return new Intl.DateTimeFormat('en-CA', {
+  nyToday.fmt ||= new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
-  }).format(new Date(now));
+  });
+  return nyToday.fmt.format(new Date(now));
 }
 
 function windowStartDate(win, now = Date.now()) {
@@ -3621,36 +3785,1022 @@ function attribution(holdingsArr, charts, sinceDate, txns = transactions) {
   };
 }
 
-let attribData = null;    // { win, sinceDate, result, fetched }
-let attribBusy = false;
+// ─── This week (Insights v1 — Drop 2, 2026-10-04) ────────────────────────────
+// David, the morning after a day with v1.11.0 on his phone: the Advisor's
+// Market panel "doesn't do anything, and it doesn't tell you anything — and why
+// is there one and then another one when you select week/month", and the
+// Performance chart was "impossible to read on a phone". Both are replaced by
+// ONE card under Ask. Collapsed it is two lines: his money for the window net
+// of money added, then one market clause and one plan clause. One tap opens
+// the market strip, what moved his money, his plan against his own bands, and
+// a two-line chart. Deterministic — no model; every number can be checked
+// against closes (PLAN.md §3, research/insights-content.md).
+//
+// The rules it keeps:
+// - Windows END on the latest FINAL close (a live bar during market hours is
+//   not a close: no intraday noise) and START on a trading-date close. Week =
+//   the last complete week, Friday close to Friday close, with one "Since
+//   Fri" row added midweek; Month = the close a calendar month back; Since
+//   Aug 1 = LEDGER_EPOCH. Never on history-row labels: from 09-02 to 10-02
+//   each row carried the previous day's close.
+// - Week and Month value his holdings at those closes — tickers at their raw
+//   close, 401K CITs through their proxy's total return, the pension at its own
+//   NAV × krona stamps — with units backed out through the ledger and money
+//   added netted out: attribution()'s rules, pinned to the window's closes.
+// - Since Aug 1 is the performance engine's guard-aware return, the figure Ask
+//   gives, with the periods it leaves out named.
+// - "The S&P" is SPY's price: the series the snapshots, the brief and Ask
+//   already use. ^GSPC put a second S&P figure on the same screen, a tenth
+//   of a point off the first since Aug 1 (2026-10-02 closes).
+// - The pension is never the lead line and never "krona": its price dates are
+//   its own (Avanza NAVs stamped when the app happened to run), said on its line.
+// - It loads by itself only when signed in. Signed out it paints the last
+//   facts it computed and fetches nothing: the fallback chain would hand his
+//   tickers to public CORS proxies on every boot.
+const WEEK_CACHE_KEY  = 'portfolio_week_v1';
+// Sandbox and test switch: '1' lets a signed-out page fetch through
+// fetchYahooChart's public chain, so QA can render the card with real closes.
+// Nothing in the app sets it, and it only works on a local server: on the
+// published github.io shell it is inert (CISO, Drop 2 round 1).
+const WEEK_PUBLIC_KEY = 'portfolio_week_public';
+const WEEK_PUBLIC_HOSTS = ['localhost', '127.0.0.1'];
+const WEEK_REFRESH_MS = 30 * 60 * 1000;     // weekly cadence: half-hourly is plenty
+const WEEK_RETRY_MS   = 60 * 1000;          // after a failed fetch, not on every render
+const WEEK_FINAL_MIN  = 16 * 60 + 15;       // NY minutes after which today's bar is the close
+// A Yahoo bar is stamped at its session's open in the exchange's own zone:
+// 09:30 New York for funds, 07:20 Chicago for ^TNX, but 00:00 London for the
+// krona — 23:00 UTC the evening BEFORE. A plain UTC or New York date put every
+// krona close a day early. Six hours on lands all of them inside their own
+// date in New York.
+const WEEK_BAR_SHIFT_S = 6 * 3600;
+const WEEK_ANCHOR = 'SPY';                  // its trading dates are the windows'
+const WEEK_POLICY = ['VTI', 'VXUS', 'BND']; // policyWeights' three
+const WEEK_STRIP = [
+  { key: 'sp',    ticker: WEEK_ANCHOR,  label: 'S&P 500',        sub: 'price' },
+  { key: 'intl',  ticker: 'VXUS',       label: 'International',  sub: 'VXUS' },
+  { key: 'bonds', ticker: 'VGIT',       label: 'US bonds',       sub: 'VGIT' },
+  { key: 'tenYr', ticker: MACRO_TICKER, label: '10-yr Treasury', yield: true },
+  // SEK=X is kronor per dollar; the krona's own move is its inverse.
+  { key: 'krona', ticker: 'SEK=X',      label: 'Krona vs $',     perUsd: true },
+];
 
-async function runAttribution(winKey) {
-  if (attribBusy) return;
-  attribBusy = true;
-  const win = ATTRIB_WINDOWS.find(w => w.key === winKey) || ATTRIB_WINDOWS[1];
-  const btn = document.getElementById('btnAttrib');
-  if (btn) { btn.disabled = true; btn.textContent = 'Working…'; }
+const weekDayOf = d => new Date(d + 'T00:00:00Z').getUTCDay();
+const weekAddDays = (d, n) => new Date(Date.parse(d + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
+const weekShort = d => new Date(d + 'T00:00:00Z')
+  .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+const weekDow = d => new Date(d + 'T00:00:00Z').toLocaleDateString('en-US', { weekday: 'short', timeZone: 'UTC' });
+function weekNextWeekday(d) {
+  let x = weekAddDays(d, 1);
+  while (weekDayOf(x) === 0 || weekDayOf(x) === 6) x = weekAddDays(x, 1);
+  return x;
+}
+function nyMinutes(now = Date.now()) {
+  nyMinutes.fmt ||= new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit',
+    minute: '2-digit', hourCycle: 'h23' });
+  const p = nyMinutes.fmt.formatToParts(new Date(now));
+  return +p.find(x => x.type === 'hour').value * 60 + +p.find(x => x.type === 'minute').value;
+}
+// One figure, one rendering everywhere on the card: two decimals under one
+// percent (a typical week), one above it (a quarter), so the legend, the strip
+// and the headline never show the same number two ways.
+const weekPct = n => signed(n, Math.abs(n) < 1 ? 2 : 1, '%');
+const weekUsd = n => Math.abs(n) < 0.5 ? '$0'
+  : `${n > 0 ? '+' : '−'}$${Math.round(Math.abs(n)).toLocaleString('en-US')}`;
+const weekUsdPlain = n => '$' + Math.round(Math.abs(n)).toLocaleString('en-US');
 
-  // One chart per distinct symbol: real tickers plus the proxies that price
-  // the 401K CITs. The pension needs no fetch — its stamps are already local.
-  const symbols = new Set();
-  for (const h of holdings) {
-    const t = (h.ticker || '').toUpperCase();
-    if (t && t !== 'N/A') { symbols.add(t); continue; }
-    const key = Object.keys(PROXY_TRACKED_FUNDS).find(k => (h.name || '').includes(k));
-    if (key) symbols.add(PROXY_TRACKED_FUNDS[key].proxy);
+// A chart as [{date, c}] by trading date, the last bar of a date winning.
+function weekSeries(chart, which = 'closes') {
+  const vals = chart?.[which] || chart?.adjcloses;
+  if (!chart?.timestamps?.length || !vals) return [];
+  const byDate = new Map();
+  chart.timestamps.forEach((ts, i) => {
+    const c = vals[i];
+    if (c == null || !Number.isFinite(c) || !(c > 0)) return;
+    byDate.set(nyToday((ts + WEEK_BAR_SHIFT_S) * 1000), c);
+  });
+  return [...byDate].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([date, c]) => ({ date, c }));
+}
+// Ex-dates as trading dates, same shift as the bars.
+function weekDivs(chart) {
+  return Object.values(chart?.dividends || {})
+    .filter(d => d && d.amount > 0 && d.date > 0)
+    .map(d => ({ date: nyToday((d.date + WEEK_BAR_SHIFT_S) * 1000), amount: +d.amount }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+}
+// Today's bar is the live price until the session has closed.
+function weekFinal(points, now = Date.now()) {
+  const last = points[points.length - 1];
+  return last && last.date === nyToday(now) && nyMinutes(now) < WEEK_FINAL_MIN ? points.slice(0, -1) : points;
+}
+function weekAt(points, date) {
+  let found = null;
+  for (const p of points || []) { if (p.date <= date) found = p; else break; }
+  return found;
+}
+
+// The three windows on the anchor's trading dates. Pure; `now` injectable.
+//
+// The week is always the last COMPLETE week, Friday close to Friday close.
+// Until Drop 2 round 1 (2026-10-04) one session after Friday turned it into
+// "Since Fri": from Monday evening to Tuesday afternoon the headline, the
+// collapsed line, the Week tab and a two-point chart were all ONE day's move
+// (CPO: a synthetic Monday close on his doc became the card's headline). That broke "No 1-day figure appears" (Appendix C) and David's
+// weekly cadence; every QA screenshot until then was taken on a Sunday.
+// Midweek the card ADDS one "Since Fri" row (PLAN §3) — only once at least
+// two sessions have closed after that Friday, so Monday's single session
+// never gets one — and it is never a tab, never the headline, never in the
+// collapsed card. Month and Since Aug 1 still end on the latest close; each
+// states its own span.
+const WEEK_SINCE_FRI_MIN_SESSIONS = 2;
+// The Friday whose close ends the last complete week, by the clock alone.
+function weekLastFriday(now = Date.now()) {
+  const t = nyToday(now), dow = weekDayOf(t), fri = weekAddDays(t, -((dow + 2) % 7));
+  return dow === 5 && nyMinutes(now) < WEEK_FINAL_MIN ? weekAddDays(fri, -7) : fri;
+}
+// Facts whose week reaches it (a Friday market holiday ends it Thursday). A
+// cache from an earlier week is history, not "this week" (CIO, round 2).
+const weekIsCurrent = (f, now = Date.now()) =>
+  !!f?.windows?.week && f.windows.week.to >= weekAddDays(weekLastFriday(now), -1);
+function weekWindows(anchorDates, now = Date.now()) {
+  if (!anchorDates || anchorDates.length < 2) return null;
+  const end = anchorDates[anchorDates.length - 1];
+  const at = d => { let f = null; for (const x of anchorDates) { if (x <= d) f = x; else break; } return f; };
+  // The Friday that closes end's week. That week is complete once the Friday
+  // has closed — or has passed with no bar (a Friday market holiday ends the
+  // week at Thursday's close). Otherwise the last complete week is the one
+  // before it.
+  const fri = weekAddDays(end, (5 - weekDayOf(end) + 7) % 7);
+  const thisDone = end === fri || nyToday(now) > fri;
+  const wFri = thisDone ? fri : weekAddDays(fri, -7);
+  const wEnd = thisDone ? end : at(wFri);
+  const wStart = at(weekAddDays(wFri, -7));
+  // Sessions that have closed since the week's last close.
+  const after = wEnd ? anchorDates.filter(d => d > wEnd).length : 0;
+  const [y, m, d] = end.split('-').map(Number);
+  const pm = m === 1 ? 12 : m - 1, py = m === 1 ? y - 1 : y;
+  const dim = new Date(Date.UTC(py, pm, 0)).getUTCDate();
+  const mStart = at(`${py}-${String(pm).padStart(2, '0')}-${String(Math.min(d, dim)).padStart(2, '0')}`);
+  return {
+    end,
+    week: wStart && wEnd && wStart < wEnd ? { start: wStart, end: wEnd, complete: true,
+      label: `Week to ${weekDow(wEnd)} ${weekShort(wEnd)}`,
+      // Once a session has closed after it, it is last week.
+      words: after ? 'last week' : 'this week', sessionsAfter: after } : null,
+    sinceFri: wEnd && after >= WEEK_SINCE_FRI_MIN_SESSIONS
+      ? { start: wEnd, end, sessions: after, label: `Since ${weekDow(wEnd)} ${weekShort(wEnd)}`,
+          words: `since ${weekDow(wEnd)}` } : null,
+    month: mStart && { start: mStart, end, label: `${weekShort(mStart)} → ${weekShort(end)}`, words: 'this month' },
+    epoch: { start: at(LEDGER_EPOCH), end },
+  };
+}
+
+// A holding's price at a trading date's close, by the same three routes as
+// attribution(). The pension takes its last stamp before the next session
+// opens: a Saturday stamp carries Friday's NAV and Friday's krona.
+function weekPriceAt(h, date, ctx) {
+  if (hasRealTicker(h)) {
+    const p = weekAt(ctx.closes[h.ticker.toUpperCase()], date);
+    return p ? { price: p.c } : null;
   }
-  const charts = {};
-  for (const s of symbols) {
-    const c = await fetchYahooChart(s, '1y');
-    if (c) charts[s] = c;
+  const proxy = proxyEntryFor(h)?.proxy;
+  if (proxy) {
+    // Scaled from the proxy's latest bar, the reference fetchProxyNav priced
+    // h.price against — an accumulating CIT moves on total return.
+    const s = ctx.adj[proxy] || [], p = weekAt(s, date), last = s[s.length - 1];
+    return p && last && h.price > 0 ? { price: h.price * p.c / last.c } : null;
   }
-  const sinceDate = windowStartDate(win);
-  attribData = { win, sinceDate, result: attribution(holdings, charts, sinceDate), fetched: new Date().toISOString() };
+  if (Array.isArray(h.fxHistory) && h.fxHistory.length) {
+    const before = weekNextWeekday(date);
+    let st = null;
+    for (const r of h.fxHistory) {
+      if (r && r.date < before && r.nav > 0 && r.rate > 0 && (!st || r.date >= st.date)) st = r;
+    }
+    return st ? { price: st.nav * st.rate, stamp: st.date } : null;
+  }
+  return null;
+}
 
-  attribBusy = false;
-  if (btn) { btn.disabled = false; btn.textContent = '↻ Recompute'; }
-  renderAdvisorContext();
+const WEEK_FLOW_KINDS = ['contribution', 'adjustment'];
+// Units the ledger added after a date (dividend units too: not held then).
+function weekUnitsAfter(h, date, txns) {
+  return (txns || []).filter(t => t.holdingId === h.id && String(t.date).slice(0, 10) > date &&
+    (WEEK_FLOW_KINDS.includes(t.kind) || t.kind === 'dividend')).reduce((s, t) => s + (+t.units || 0), 0);
+}
+// Money added in (a, b] — externalFlows' kinds; a reinvested dividend is income.
+function weekFlowIn(h, a, b, txns) {
+  return (txns || []).filter(t => t.holdingId === h.id && WEEK_FLOW_KINDS.includes(t.kind) &&
+    String(t.date).slice(0, 10) > a && String(t.date).slice(0, 10) <= b).reduce((s, t) => s + (+t.amount || 0), 0);
+}
+
+// His money over one window's trading dates: value at each close, money added
+// between closes, and the chained growth net of it. A holding with no price at
+// a close it was held for is left out of every date and named — never zeroed.
+//
+// So is a stamp-priced fund (the pension) whose last stamp in the window is no
+// newer than its first (CPO, Drop 2 round 2): one stamp at both ends priced
+// the whole pension flat, and the week read well under the S&P with no word
+// why. That happens on every weekly open whose closes land before the
+// boot's Avanza refresh stamps a new NAV, and stays if that refresh fails. It
+// is named as not in the figure and kept out of the percentage's base.
+function weekMoney(holdingsArr, txns, ctx, dates) {
+  const n = dates.length, priced = [], left = [], noNewPrice = [];
+  for (const h of holdingsArr) {
+    const qNow = +h.quantity || 0;
+    const qty = dates.map(d => qNow - weekUnitsAfter(h, d, txns));
+    if (qty.every(q => Math.abs(q) < 1e-9)) continue;                 // never held in the window
+    if (qty.some(q => q < -1e-9)) { left.push(h); continue; }         // ledger exceeds the position
+    const px = dates.map((d, i) => (qty[i] > 1e-9 ? weekPriceAt(h, d, ctx) : { price: 0 }));
+    if (px.some(p => !p)) { left.push(h); continue; }
+    if (qty[0] > 1e-9 && px[0].stamp && px[n - 1].stamp && px[n - 1].stamp <= px[0].stamp) {
+      noNewPrice.push({ h, since: px[n - 1].stamp });
+      continue;
+    }
+    priced.push({ h, vals: dates.map((_, i) => qty[i] * px[i].price),
+      flows: dates.map((d, i) => (i ? weekFlowIn(h, dates[i - 1], d, txns) : 0)),
+      qty, stampFrom: px[0].stamp || null, stampTo: px[n - 1].stamp || null });
+  }
+  const V = i => priced.reduce((s, r) => s + r.vals[i], 0);
+  const F = i => priced.reduce((s, r) => s + r.flows[i], 0);
+  const index = [0];
+  let g = 1;
+  for (let i = 1; i < n; i++) {
+    const v0 = V(i - 1);
+    g *= v0 > 0 ? (V(i) - F(i)) / v0 : 1;
+    index.push((g - 1) * 100);
+  }
+  const added = priced.reduce((s, r) => s + r.flows.reduce((a, b) => a + b, 0), 0);
+  return { startValue: V(0), endValue: V(n - 1), added, gain: V(n - 1) - V(0) - added,
+    pct: index[n - 1], index, priced, left, noNewPrice };
+}
+
+// What moved his money: one line per position, a fund split across two
+// sleeves as ONE line, the pension (stamp-priced) as one line for the account.
+function weekFundName(h) {
+  const name = String(h.name || '').replace(/^Länsförsäkringar\b/, 'LF');
+  return `${name.length > 26 ? name.slice(0, 25) + '…' : name} (${h.account || 'Unassigned'})`;
+}
+function weekLineName(h) {
+  if (hasRealTicker(h)) return `${h.ticker.toUpperCase()} (${h.account || 'Unassigned'})`;
+  const px = proxyEntryFor(h);
+  if (px) return `${px.index} fund (${h.account || 'Unassigned'})`;
+  if (Array.isArray(h.fxHistory) && h.fxHistory.length) return h.account || h.name;
+  return weekFundName(h);
+}
+// The funds a window could not reprice, one entry per line name. When the
+// same account also has a fund that WAS repriced (one Avanza fetch failed,
+// the other did not), the stale one goes by its own name, so "Swedish
+// pension" never names both a moved line and a fund left out.
+function weekNoNewPrice(m) {
+  const pricedNames = new Set(m.priced.map(r => weekLineName(r.h)));
+  const groups = new Map();
+  for (const { h, since } of m.noNewPrice) {
+    const name = pricedNames.has(weekLineName(h)) ? weekFundName(h) : weekLineName(h);
+    const g = groups.get(name);
+    if (!g) groups.set(name, { name, since });
+    else if (since > g.since) g.since = since;
+  }
+  return [...groups.values()];
+}
+function weekLines(money, ctx, dates) {
+  const start = dates[0], end = dates[dates.length - 1], n = dates.length;
+  const groups = new Map();
+  for (const r of money.priced) {
+    const stamped = !!r.stampTo;
+    const key = stamped ? 'acct\n' + (r.h.account || r.h.name) : r.h.name + '\n' + (r.h.account || '');
+    const g = groups.get(key) || { name: weekLineName(r.h), account: r.h.account || null, gain: 0, added: 0,
+      payout: 0, exDate: null, from: null, to: null };
+    const added = r.flows.reduce((a, b) => a + b, 0);
+    g.gain += r.vals[n - 1] - r.vals[0] - added;
+    g.added += added;
+    if (stamped) {
+      if (!g.from || r.stampFrom < g.from) g.from = r.stampFrom;
+      if (!g.to || r.stampTo > g.to) g.to = r.stampTo;
+    }
+    // A payout that went ex inside the window left the price, not his pocket:
+    // named on the line, never read as a loss (PLAN §3). Units held the day before.
+    if (hasRealTicker(r.h)) {
+      for (const dv of ctx.divs[r.h.ticker.toUpperCase()] || []) {
+        if (dv.date <= start || dv.date > end) continue;
+        const i = dates.findIndex(d => d >= dv.date);
+        const units = i > 0 ? r.qty[i - 1] : r.qty[0];
+        g.payout += dv.amount * units;
+        if (!g.exDate || dv.date > g.exDate) g.exDate = dv.date;
+      }
+    }
+    groups.set(key, g);
+  }
+  const all = [...groups.values()].map(g => ({ ...g,
+    // Priced on its own dates: said on the line, and never the lead line.
+    offWindow: g.from != null && (g.from !== start || g.to !== end) }));
+  const top = all.slice().sort((a, b) => Math.abs(b.gain) - Math.abs(a.gain)).slice(0, 3)
+    .sort((a, b) => (a.offWindow - b.offWindow) || Math.abs(b.gain) - Math.abs(a.gain));
+  const rest = all.filter(g => !top.includes(g));
+  return {
+    lines: top.map(g => ({ name: g.name, account: g.account, gain: g.gain, added: g.added,
+      payout: g.payout > 0.005 ? { amount: g.payout, exDate: g.exDate } : null,
+      pricedFrom: g.offWindow ? g.from : null, pricedTo: g.offWindow ? g.to : null })),
+    // Its money added too: on Month the three lines said "net of $X added"
+    // and Everything else did not, so the lines did not add up to the
+    // headline's figure (QA, Drop 2 round 1).
+    rest: rest.length ? { gain: rest.reduce((s, g) => s + g.gain, 0), count: rest.length,
+      added: rest.reduce((s, g) => s + g.added, 0), payout: rest.reduce((s, g) => s + g.payout, 0) } : null,
+  };
+}
+
+// The market strip for a window: each series' close-to-close move.
+function weekStrip(ctx, start, end) {
+  return WEEK_STRIP.map(s => {
+    const a = weekAt(ctx.closes[s.ticker], start), b = weekAt(ctx.closes[s.ticker], end);
+    const base = { key: s.key, label: s.label, sub: s.sub || null };
+    if (!a || !b || a === b) return { ...base, na: true };
+    if (s.yield) return { ...base, level: b.c, bp: (b.c - a.c) * 100 };
+    return { ...base, pct: s.perUsd ? (a.c / b.c - 1) * 100 : (b.c / a.c - 1) * 100 };
+  });
+}
+
+// His plan in one line, from the SAME driftCheck as Where you stand. Inside
+// the bands it also says how far stocks would have to fall before one trips —
+// distance to his own rule, not an adjective (Appendix C: "A band trips only
+// if stocks fall N%").
+const WEEK_STOCK_SLEEVES = ['us_stock', 'intl_stock', 'tilt'];
+function weekPlan(sleeveVals, tgtPcts, totalValue, bandAbs, bandRel) {
+  const d = driftCheck(sleeveVals, tgtPcts, totalValue, bandAbs, bandRel);
+  if (!d.rows.length) return null;
+  const limit = r => Math.min(bandAbs, r.tgtPct > 0 ? r.tgtPct * bandRel / 100 : Infinity);
+  const sleeves = d.rows.map(r => ({ sleeve: r.sleeve, label: r.label, nowPct: r.curPct, targetPct: r.tgtPct,
+    driftPp: r.driftPp, limitPp: limit(r), outOfBand: r.outOfBand }));
+  const tripsAt = dir => {
+    for (let x = dir * 0.001; Math.abs(x) <= 0.9; x += dir * 0.001) {
+      const s = {};
+      let tot = 0;
+      for (const [k, v] of Object.entries(sleeveVals)) {
+        s[k] = WEEK_STOCK_SLEEVES.includes(k) ? v * (1 + x) : v;
+        tot += s[k];
+      }
+      if (driftCheck(s, tgtPcts, tot, bandAbs, bandRel).anyOutOfBand) return +(x * 100).toFixed(1);
+    }
+    return null;
+  };
+  const near = d.anyOutOfBand ? [] : sleeves.filter(r => Math.abs(r.driftPp) >= 0.9 * r.limitPp);
+  const state = d.anyOutOfBand ? 'out' : near.length ? 'near' : 'in';
+  const fall = state === 'out' ? null : tripsAt(-1);
+  const names = list => list.map(r => r.label).join(' and ');
+  const out = sleeves.filter(r => r.outOfBand);
+  const pct1 = n => n.toFixed(1) + '%';
+  // One sleeve: "Bond is outside your bands: N%, target T%." Several are each
+  // named with their figures. (The old form said the sleeve's name twice, and
+  // "against a 8x% target" misread — CPO, round 2.)
+  const figs = list => (list.length > 1
+    ? list.map(r => `${r.label} ${pct1(r.nowPct)} (target ${pct1(r.targetPct)})`).join(', ')
+    : `${pct1(list[0].nowPct)}, target ${pct1(list[0].targetPct)}`);
+  const line = state === 'out'
+    ? `${names(out)} ${out.length > 1 ? 'are' : 'is'} outside your bands: ${figs(out)}.`
+    : state === 'near'
+      ? `Inside your bands, with ${names(near)} near ${near.length > 1 ? 'their edges' : 'its edge'}: ${figs(near)}.`
+      : 'Inside all your bands.' + (fall != null ? ` A band trips only if stocks fall about ${Math.abs(fall).toFixed(0)}%.` : '');
+  // Short: it shares line 2 with the market clause, one line at 375px. Two
+  // sleeves by name ran line 2 to three lines at 375 (QA, Drop 2 round 1);
+  // the expanded plan line names them.
+  const clause = state === 'out' ? (out.length > 1 ? `${out.length} sleeves outside your bands` : `${names(out)} outside its band`)
+    : state === 'near' ? (near.length > 1 ? `${near.length} sleeves near your bands` : `${names(near)} near its band`)
+    : 'inside your bands';
+  return { state, line, clause, stocksFallPct: fall, sleeves };
+}
+
+// Since Aug 1: the performance engine's own chain, over snapshots up to the
+// window's end (a row dated after it is today's live value, not a close), with
+// the guard's left-out periods named. S&P from the same rows, so the two lines
+// can never be a day apart.
+function weekEpoch(snapshots, txns, end) {
+  const flows = externalFlows(txns);
+  const cutoff = weekNextWeekday(end);
+  const snaps = (snapshots || []).filter(s => s.date < cutoff);
+  const post = snaps.filter(s => s.date >= LEDGER_EPOCH);
+  if (post.length < 2) return null;
+  const last = post[post.length - 1];
+  const excluded = flagsWithin(performanceHealth(snaps, flows), post[0].date, last.date);
+  const idx = twrIndex(post, flows, excluded);
+  if (!idx) return null;
+  const spy0 = post[0].spyPrice;
+  const spy = s => (spy0 > 0 && s.spyPrice > 0 ? (s.spyPrice / spy0 - 1) * 100 : null);
+  // Drawn by the close each row holds: a Saturday or Sunday row is Friday's
+  // close (the first row, Sat Aug 1, is Jul 31's), so it is labelled Friday
+  // and only the weekend's last row is kept. The chain itself runs over every
+  // row, so the end point is the headline figure exactly.
+  const marketDate = d => (weekDayOf(d) === 6 ? weekAddDays(d, -1) : weekDayOf(d) === 0 ? weekAddDays(d, -2) : d);
+  const keep = new Map();
+  post.forEach((s, i) => keep.set(marketDate(s.date), i));
+  const pick = [...keep.values()];
+  return { from: post[0].date, to: last.date, pct: (idx[idx.length - 1] - 1) * 100, excluded,
+    spPct: spy(last), chart: { dates: [...keep.keys()], you: pick.map(i => (idx[i] - 1) * 100),
+      sp: pick.map(i => spy(post[i])) } };
+}
+
+// Every symbol the card reads: the strip, his tickers, the CITs' proxies, and
+// the policy mix's three.
+function weekSymbols(holdingsArr) {
+  const s = new Set(WEEK_STRIP.map(x => x.ticker));
+  for (const h of holdingsArr) {
+    if (hasRealTicker(h)) s.add(h.ticker.toUpperCase());
+    else if (proxyEntryFor(h)) s.add(proxyEntryFor(h).proxy);
+  }
+  WEEK_POLICY.forEach(t => s.add(t));
+  return [...s];
+}
+
+// The card's facts for all three windows. Pure: plain JSON out (it is cached
+// and it rides in the Ask brief), no holding objects, no ids.
+function weekCompute({ holdingsArr, txns, charts, snapshots, tgt, now = Date.now(), fetchedAt = null }) {
+  const ctx = { closes: {}, adj: {}, divs: {} };
+  for (const [t, c] of Object.entries(charts || {})) {
+    ctx.closes[t] = weekSeries(c, 'closes');
+    ctx.adj[t] = weekSeries(c, 'adjcloses');
+    ctx.divs[t] = weekDivs(c);
+  }
+  const anchor = weekFinal(ctx.closes[WEEK_ANCHOR] || [], now);
+  const W = weekWindows(anchor.map(p => p.date), now);
+  if (!W) return null;
+  const spAt = (d, d0) => { const a = weekAt(anchor, d0), b = weekAt(anchor, d); return a && b ? (b.c / a.c - 1) * 100 : null; };
+  const out = { v: 1, asOf: W.end, fetchedAt, windows: {} };
+  // The performance guard, once, for every window (Drop 2 round 1, CIO): the
+  // Month tab quoted a percentage "net of money added" straight across the
+  // flagged 2026-09-13 period that the Since Aug 1 tab, on the same card,
+  // leaves out and names. weekMoney's index is a chained return net of flows —
+  // a TWR — and CLAUDE.md: never quote one across a flagged period. Such a
+  // window keeps its dollars and says the money added is what the record
+  // says; it shows no percentage, and the chart draws the S&P alone.
+  const health = performanceHealth(snapshots || [], externalFlows(txns));
+  // Ledger money booked to an id the app no longer has: weekFlowIn matches by
+  // id, so it silently counted as neither added nor held. Named instead — by
+  // the row's own holdingName (CPO, Drop 2 round 2). His 2026-09-13 LF Global
+  // Index row points at the fund's id from BEFORE its split, and the card
+  // called it "a holding no longer in the app" two lines under the fund
+  // itself. A name held as a split position is the split; any other current
+  // lot of that name is an earlier record of a fund he still holds; none is a
+  // true orphan.
+  const ids = new Set((holdingsArr || []).map(h => h.id));
+  // "Split" only for a name held as ONE split position (positionsIn: same
+  // name, account and price, two sleeves). Two lots that merely share a name
+  // are two positions: VOO in the Roth and the Brokerage was never split, and
+  // an orphan VOO row read "booked to the fund's record from before it was
+  // split" on the card and in the brief (CIO, Drop 2 round 3).
+  const splitNames = new Set(positionsIn(holdingsArr || []).filter(l => l.length > 1).map(l => l[0].name));
+  const unmatchedIn = (a, b) => {
+    const rows = (txns || []).filter(t => WEEK_FLOW_KINDS.includes(t.kind) && !ids.has(t.holdingId) &&
+      String(t.date).slice(0, 10) > a && String(t.date).slice(0, 10) <= b);
+    if (!rows.length) return null;
+    const entries = new Map();
+    for (const t of rows) {
+      const holding = String(t.holdingName || '').trim() || null;   // a row with no name: "recorded"
+      const same = holding ? (holdingsArr || []).filter(h => h.name === holding).length : 0;
+      const kind = holding && splitNames.has(holding) ? 'split' : same ? 'earlier' : 'gone';
+      const e = entries.get(holding + '\n' + kind) || { holding, kind, count: 0, amount: 0, dates: [] };
+      const d = String(t.date).slice(0, 10);
+      e.count++; e.amount += +t.amount || 0;
+      if (!e.dates.includes(d)) e.dates.push(d);
+      entries.set(holding + '\n' + kind, e);
+    }
+    return { count: rows.length, amount: rows.reduce((x, t) => x + (+t.amount || 0), 0),
+      dates: [...new Set(rows.map(t => String(t.date).slice(0, 10)))].sort(),
+      entries: [...entries.values()].map(e => ({ ...e, dates: e.dates.sort() })) };
+  };
+  // A window that left a holding out for want of a price (one chart that did
+  // not come back) is a figure for part of the portfolio: its dollars stand,
+  // named, but no percentage and no "You" line (CIO, Drop 2 round 2 — one
+  // failed VOO chart put a figure for part of the book on the card as his
+  // week, unmarked). A fund with no new price (weekNoNewPrice) keeps the
+  // rest's percentage: it is out of the base, and named.
+  const money = (w, dates) => {
+    const m = weekMoney(holdingsArr, txns, ctx, dates);
+    const flagged = flagsWithin(health, w.start, w.end);
+    return { m, flagged, unmatched: unmatchedIn(w.start, w.end), noNewPrice: weekNoNewPrice(m),
+      left: m.left.map(h => weekLineName(h)), leftShort: m.left.map(h => (hasRealTicker(h) ? h.ticker.toUpperCase() : null)),
+      you: { startValue: m.startValue, endValue: m.endValue, added: m.added, gain: m.gain,
+        pct: flagged.length || m.left.length ? null : m.pct } };
+  };
+  for (const key of ['week', 'month']) {
+    const w = W[key];
+    if (!w) continue;
+    const dates = anchor.filter(p => p.date >= w.start && p.date <= w.end).map(p => p.date);
+    if (dates.length < 2) continue;
+    const r = money(w, dates);
+    const moved = weekLines(r.m, ctx, dates);
+    out.windows[key] = { key, label: w.label, words: w.words, from: w.start, to: w.end, complete: !!w.complete,
+      you: r.you, flagged: r.flagged, unmatched: r.unmatched,
+      strip: weekStrip(ctx, w.start, w.end), lines: moved.lines, rest: moved.rest,
+      left: r.left, leftShort: r.leftShort, noNewPrice: r.noNewPrice,
+      chart: { dates, you: r.you.pct == null ? null : r.m.index, sp: dates.map(d => spAt(d, w.start)) } };
+  }
+  // Midweek: one secondary row, never a tab, never the headline.
+  if (W.sinceFri) {
+    const w = W.sinceFri;
+    const dates = anchor.filter(p => p.date >= w.start && p.date <= w.end).map(p => p.date);
+    if (dates.length >= 2) {
+      const r = money(w, dates);
+      out.windows.sinceFri = { key: 'sinceFri', label: w.label, words: w.words, from: w.start, to: w.end,
+        sessions: w.sessions, you: r.you, flagged: r.flagged, unmatched: r.unmatched,
+        spPct: spAt(w.end, w.start), left: r.left, leftShort: r.leftShort, noNewPrice: r.noNewPrice };
+    }
+  }
+  const ep = W.epoch.start ? weekEpoch(snapshots, txns, W.end) : null;
+  // His target mix over the same span: the policy series, dividends in.
+  let mixPct = null;
+  const weights = policyWeights(tgt);
+  if (weights && W.epoch.start) {
+    const series = computePolicySeries(Object.fromEntries(WEEK_POLICY.map(t => [t, charts?.[t]])), weights);
+    if (series) {
+      const [p0, p1] = samplePolicyAt(series, [W.epoch.start, W.end]);
+      if (p0 > 0 && p1 > 0) mixPct = (p1 / p0 - 1) * 100;
+    }
+  }
+  out.windows.epoch = { key: 'epoch', label: 'Since ' + weekShort(LEDGER_EPOCH), words: 'since ' + weekShort(LEDGER_EPOCH),
+    from: W.epoch.start, to: W.end, perf: ep, mixPct, strip: W.epoch.start ? weekStrip(ctx, W.epoch.start, W.end) : [] };
+  return out;
+}
+
+// The card's facts as the Ask brief carries them: the same numbers, named for
+// a reader that never sees the card, rounded, no chart arrays. `plan` is the
+// card's plan line, computed by the caller from the live drift.
+const WEEK_SERIES_NAMES = { sp: 'S&P 500 (SPY price)', intl: 'International stocks (VXUS price)',
+  bonds: 'US Treasuries (VGIT price)', tenYr: '10-yr Treasury yield', krona: 'Krona vs dollar' };
+function askWeek(facts, r2, plan) {
+  if (!facts?.windows?.week && !facts?.windows?.month) return null;
+  const market = list => (list || []).filter(s => !s.na).map(s => (s.level != null
+    ? { series: WEEK_SERIES_NAMES[s.key], levelPct: r2(s.level), changeBp: r2(s.bp) }
+    : { series: WEEK_SERIES_NAMES[s.key], pct: r2(s.pct) }));
+  // What the record cannot split, said where the figure is (Drop 2 round 1):
+  // a flagged window's percentage goes out null, and money booked against an
+  // id the app no longer has is named — by holding, and by what that record
+  // is (round 2: his LF Global row is the fund's pre-split record, not a
+  // holding that is gone).
+  const BOOKED_TO = { split: "the fund's record from before it was split — the fund is still held",
+    earlier: 'an earlier record of a fund still held', gone: 'a holding no longer in the app' };
+  const caveats = w => ({
+    ...(w.flagged?.length ? { periodsTheRecordCannotSplit: w.flagged } : {}),
+    ...(w.unmatched ? { entriesNotCountedAsAdded: (w.unmatched.entries || [{ holding: null, kind: 'gone',
+      count: w.unmatched.count, amount: w.unmatched.amount, dates: w.unmatched.dates }]).map(e => ({
+      holding: e.holding, count: e.count, amount: r2(e.amount), dates: e.dates, bookedTo: BOOKED_TO[e.kind] })) } : {}),
+    ...((w.noNewPrice || []).length ? { noNewPriceInWindow: w.noNewPrice.map(x => ({ holding: x.name, lastPriced: x.since })) } : {}),
+  });
+  // A figure for part of the portfolio says which part (CIO, Drop 2 round 2):
+  // a holding with no price for the window, or a fund with no new one, is out
+  // of `you`; with one not priced at all the percentage goes out null.
+  const you = (y, w) => {
+    const out = (w.left || []).concat((w.noNewPrice || []).map(x => x.name));
+    return { startValue: r2(y.startValue), endValue: r2(y.endValue), moneyAdded: r2(y.added),
+      changeNetOfMoneyAdded: r2(y.gain), pctNetOfMoneyAdded: (w.left || []).length ? null : r2(y.pct),
+      ...(out.length ? { excludesHoldings: out } : {}) };
+  };
+  // Each line's change is net of the money added to it: the key says so. As
+  // `change`, an eval answer read a line's gain as partly the money added to
+  // it, where the card says "net of $X added" (Drop 2 round 1).
+  const win = w => w && {
+    window: w.label, from: w.from, to: w.to,
+    you: you(w.you, w), ...caveats(w),
+    market: market(w.strip),
+    moved: (w.lines || []).map(l => ({ holding: l.name, changeNetOfMoneyAdded: r2(l.gain), moneyAdded: r2(l.added),
+      payout: l.payout ? { amount: r2(l.payout.amount), exDate: l.payout.exDate } : null,
+      pricedFrom: l.pricedFrom, pricedTo: l.pricedTo })),
+    everythingElse: w.rest ? { changeNetOfMoneyAdded: r2(w.rest.gain), moneyAdded: r2(w.rest.added ?? null),
+      holdings: w.rest.count, payouts: r2(w.rest.payout) } : null,
+    notPriced: w.left || [],
+  };
+  const sf = facts.windows.sinceFri;
+  const e = facts.windows.epoch, p = e?.perf;
+  return {
+    closesTo: facts.asOf, pricesFetched: facts.fetchedAt || null,
+    week: win(facts.windows.week) || null,
+    sinceFri: sf ? { window: sf.label, from: sf.from, to: sf.to, sessions: sf.sessions, you: you(sf.you, sf),
+      ...caveats(sf), ...((sf.left || []).length ? { notPriced: sf.left } : {}), sp500PricePct: r2(sf.spPct) } : null,
+    month: win(facts.windows.month) || null,
+    sinceAug1: e ? { fromClose: e.from, to: e.to, market: market(e.strip),
+      you: p ? { twrPct: r2(p.pct), fromSnapshot: p.from, toSnapshot: p.to, excludedPeriods: p.excluded } : null,
+      sp500PricePct: p ? r2(p.spPct) : null, targetMixTotalReturnPct: r2(e.mixPct) } : null,
+    plan: plan ? { state: plan.state, line: plan.line, stocksFallThatTripsABandPct: plan.stocksFallPct } : null,
+  };
+}
+
+let weekCharts = null;      // { fetchedAt: ms, charts, missing } — this session's fetch
+let weekFactsData = loadWeekCache();
+let weekWin = 'week';
+let weekOpen = false;
+let weekBusy = false;
+let weekFailedAt = 0;
+let weekChartInst = null;
+let weekSavedJson = null;
+let weekChips = [];
+
+function loadWeekCache() {
+  try {
+    const f = JSON.parse(localStorage.getItem(WEEK_CACHE_KEY) || 'null');
+    return f && f.v === 1 && f.windows ? f : null;
+  } catch (e) { return null; }
+}
+function saveWeekCache(facts) {
+  try {
+    const json = JSON.stringify(facts);
+    if (json !== weekSavedJson) { localStorage.setItem(WEEK_CACHE_KEY, json); weekSavedJson = json; }
+  } catch (e) { /* storage full or blocked: the card still renders from memory */ }
+}
+function weekPublicAllowed(host = location.hostname) {
+  if (!WEEK_PUBLIC_HOSTS.includes(host)) return false;
+  try { return localStorage.getItem(WEEK_PUBLIC_KEY) === '1'; } catch (e) { return false; }
+}
+function weekCanFetch() {
+  return (typeof cloudReady === 'function' && cloudReady()) || weekPublicAllowed();
+}
+
+// The policy series for the Ask brief's vsPolicyBenchmark, from charts already
+// in hand (it used to load with the Performance card's third line).
+function weekWarmPolicy(charts, range) {
+  const weights = policyWeights(targets);
+  if (!weights) return;
+  const series = computePolicySeries(Object.fromEntries(WEEK_POLICY.map(t => [t, charts[t]])), weights);
+  if (series) policyCache = { key: range + ':' + JSON.stringify(weights), series };
+}
+
+async function refreshWeek() {
+  if (weekBusy || !weekCanFetch() || !holdings.length) return;
+  weekBusy = true;
+  const t0 = performance.now();
+  try {
+    const range = policyRangeFor(LEDGER_EPOCH);
+    const symbols = weekSymbols(holdings);
+    // Signed in, the edge or nothing — decided once, before the fan-out, so a
+    // refresh refused half-way cannot tip the rest onto the public chain.
+    // Only the sandbox switch (signed out, on localhost) uses that chain.
+    const publicFallback = !(typeof cloudReady === 'function' && cloudReady());
+    // In parallel: the Advisor's panels fetched one chart after another.
+    const got = await Promise.all(symbols.map(t =>
+      fetchYahooChart(t, range, { events: true, publicFallback }).catch(() => null)));
+    const charts = {};
+    symbols.forEach((t, i) => { if (got[i]) charts[t] = got[i]; });
+    if (!charts[WEEK_ANCHOR]) { weekFailedAt = Date.now(); return; }
+    // The symbols his money is priced from (his tickers, the CITs' proxies).
+    // One that did not come back leaves a holding out of every window: the
+    // fetch counts, but it is tried again after WEEK_RETRY_MS, not half an
+    // hour (CIO, Drop 2 round 2 — one VOO 502 held a partial figure, cached,
+    // for 30 minutes).
+    const held = [...new Set(holdings.map(h => (hasRealTicker(h) ? h.ticker.toUpperCase() : proxyEntryFor(h)?.proxy))
+      .filter(Boolean))];
+    weekCharts = { fetchedAt: Date.now(), charts, missing: held.filter(t => !charts[t]) };
+    weekFailedAt = 0;
+    console.log(`[week] ${Object.keys(charts).length}/${symbols.length} charts in ${Math.round(performance.now() - t0)} ms`);
+  } finally {
+    weekBusy = false;
+    renderWeekCard();   // the new facts, or "unavailable" after a failed fetch
+  }
+}
+
+// Called from render(): cheap unless the charts are missing or half an hour old.
+function maybeRefreshWeek() {
+  if (weekBusy || !holdings.length || !weekCanFetch()) return;
+  const now = Date.now();
+  if (weekCharts && now - weekCharts.fetchedAt < (weekCharts.missing?.length ? WEEK_RETRY_MS : WEEK_REFRESH_MS)) return;
+  if (weekFailedAt && now - weekFailedAt < WEEK_RETRY_MS) return;
+  refreshWeek();
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && typeof holdings !== 'undefined') maybeRefreshWeek();
+});
+
+// Closing it goes back to the week: the card is "This week" whenever it is shut.
+function weekToggle() {
+  weekOpen = !weekOpen;
+  if (!weekOpen) weekWin = 'week';
+  renderWeekCard();
+}
+function weekSetWindow(key) {
+  if (!['week', 'month', 'epoch'].includes(key)) return;
+  weekWin = key;
+  renderWeekCard();
+}
+// "Ask about this": fills the one general Ask box and puts the cursor there.
+// Never sends — the question is his to send (PLAN §3). askPrefill keeps a
+// half-typed question and tags the send `src=insight` for the log.
+function weekAsk(i) {
+  const q = weekChips[i];
+  if (q) askPrefill(q, 'insight');
+}
+
+// Deterministic chips, picked by what the window shows; never model-written.
+function weekChipsFor(w, plan) {
+  const out = [];
+  const pension = (w.lines || []).find(l => l.pricedFrom);
+  if (w.key !== 'epoch' && pension && Math.abs(pension.gain) >= 1) {
+    out.push(`Why did my pension ${pension.gain < 0 ? 'drop' : 'rise'} ${w.words}?`);
+  }
+  if (w.key === 'epoch') out.push('How have I done since August?');
+  const ten = (w.strip || []).find(s => s.key === 'tenYr' && !s.na);
+  // Short enough for one line at 375 (CPO, Drop 2 round 1): the long form
+  // wrapped to two and cost the expanded card a row.
+  if (ten && Math.abs(ten.bp) >= 5) out.push(`What do ${ten.level.toFixed(2)}% yields mean for my bonds?`);
+  if ((w.lines || []).some(l => l.payout) && out.length < 2) out.push('How do dividends show up in my numbers?');
+  out.push(plan && plan.state !== 'in' ? 'What does my band rule say to do now?' : 'How far am I from a rebalance?');
+  return out.slice(0, 3);
+}
+
+// Line 1. The window is in the kicker above it ("This week · to Fri Oct 2"),
+// so the line is only the money: short enough for one line at 375px. The
+// money-added clause never breaks inside itself: at 375 the Month line used
+// to leave "added" alone on a second line.
+function weekHeadline(w) {
+  if (w.key === 'epoch') {
+    const p = w.perf;
+    return p ? `<strong>${weekPct(p.pct)}</strong> · net of money added` : null;
+  }
+  const y = w.you;
+  // A window across a flagged period: the dollars and what the record says
+  // was added, no percentage (the foot says why).
+  if ((w.flagged || []).length) {
+    // "net of": "$X recorded as added" read as gross beside lines that say
+    // "net of $X added" (CPO, round 2).
+    const rec = Math.abs(y.added) < 0.5 ? 'nothing recorded as added'
+      : `net of ${weekUsdPlain(y.added)} recorded as ${y.added > 0 ? 'added' : 'taken out'}`;
+    return `<strong>${weekUsd(y.gain)}</strong> <span class="week-nw">· ${rec}</span>`;
+  }
+  const added = Math.abs(y.added) < 0.5 ? 'nothing added'
+    : y.added > 0 ? `net of ${weekUsdPlain(y.added)} added` : `net of ${weekUsdPlain(y.added)} taken out`;
+  // Part of the portfolio (a holding not priced): dollars, no percentage —
+  // line 2 says what is out (CIO, Drop 2 round 2).
+  if (y.pct == null || (w.left || []).length) return `<strong>${weekUsd(y.gain)}</strong> <span class="week-nw">· ${added}</span>`;
+  return `<strong>${weekUsd(y.gain)} (${weekPct(y.pct)})</strong> <span class="week-nw">· ${added}</span>`;
+}
+// What the record cannot split, under the window it applies to. Ledger rows
+// the window could not count are named by holding, and said under the
+// flagged date they belong to — one footnote for Sep 13, not two (CPO, Drop 2
+// round 2: "a holding no longer in the app" sat beside a note about the same
+// event, two lines under the fund it named).
+const weekList = ds => new Intl.ListFormat('en-US').format(ds);
+function weekEntrySentence(e) {
+  const one = e.count === 1;
+  const lead = `${one ? '1 entry' : `${e.count} entries`} ${e.holding ? `for ${e.holding} on` : 'recorded'} ${weekList(e.dates.map(weekShort))} (${weekUsdPlain(e.amount)})`;
+  if (e.kind === 'split') return `${lead} ${one ? 'is' : 'are'} booked to the fund's record from before it was split, so ${one ? "it isn't" : "they aren't"} counted as added.`;
+  if (e.kind === 'earlier') return `${lead} ${one ? 'is' : 'are'} booked to an earlier record of the fund, so ${one ? "it isn't" : "they aren't"} counted as added.`;
+  return `${lead} ${one ? 'is' : 'are'} for a holding no longer in the app and ${one ? 'is' : 'are'} not counted as added.`;
+}
+function weekCaveatsHtml(w) {
+  const flagged = w.flagged || [];
+  // A cache written before round 2 has no entries: one unnamed sentence.
+  const entries = w.unmatched?.count ? (w.unmatched.entries || [{ holding: null, kind: 'gone',
+    count: w.unmatched.count, amount: w.unmatched.amount, dates: w.unmatched.dates }]) : [];
+  const onFlag = entries.filter(e => e.dates.some(d => flagged.includes(d)));
+  const rest = entries.filter(e => !onFlag.includes(e));
+  let out = '';
+  if (flagged.length) {
+    const ds = flagged.map(weekShort);
+    out += `<p class="week-foot">${esc(weekList(ds))} ${ds.length > 1 ? 'are' : 'is'} inside this window: the record
+      there can't separate money added from the market's move, so no return is shown.${
+      onFlag.map(e => ' ' + esc(weekEntrySentence(e))).join('')}</p>`;
+  }
+  if (rest.length) out += `<p class="week-foot">${rest.map(e => esc(weekEntrySentence(e))).join(' ')}</p>`;
+  return out;
+}
+// What a window's figure leaves out, short enough to lead line 2: "excl. VOO
+// ×2", "excl. Swedish pension", else a count.
+function weekLeadOut(w) {
+  const labels = [...(w.left || []).map((n, i) => (w.leftShort || [])[i] || n),
+    ...(w.noNewPrice || []).map(x => x.name)];
+  if (!labels.length) return null;
+  const counts = new Map();
+  labels.forEach(l => counts.set(l, (counts.get(l) || 0) + 1));
+  const named = 'excl. ' + [...counts].map(([l, k]) => (k > 1 ? `${l} ×${k}` : l)).join(', ');
+  return named.length <= 22 ? named : `excl. ${labels.length} holding${labels.length > 1 ? 's' : ''}`;
+}
+function weekSecondLine(w, plan) {
+  const sp = (w.strip || []).find(s => s.key === 'sp' && !s.na);
+  const ten = (w.strip || []).find(s => s.key === 'tenYr' && !s.na);
+  // A figure for part of the portfolio says so first (CIO and CPO, Drop 2
+  // round 2), beside the S&P only: at 375 the line holds 309px, and the
+  // three usual clauses already take 306 (measured). The 10-yr and the plan
+  // are a tap away, and Where you stand sits just below.
+  const out = w.key === 'epoch' ? null : weekLeadOut(w);
+  if (out) return [out, sp && `S&P ${weekPct(sp.pct)}`].filter(Boolean).join(' · ');
+  return [sp && `S&P ${weekPct(sp.pct)}`, ten && `10-yr ${ten.level.toFixed(2)}%`, plan && plan.clause]
+    .filter(Boolean).join(' · ');
+}
+
+function weekStripHtml(strip) {
+  return `<div class="week-strip">${strip.map(s => `<div class="week-row">
+      <span class="week-name">${esc(s.label)}${s.sub ? `<span class="week-sub"> · ${esc(s.sub)}</span>` : ''}</span>
+      <span class="week-num">${s.na ? '—'
+        : s.level != null ? `${s.level.toFixed(2)}% <span class="week-sub">${fmtSignedBp(s.bp / 100)}</span>`
+        : weekPct(s.pct)}</span>
+    </div>`).join('')}</div>`;
+}
+// Each clause of a line's note stays whole and the line breaks between them:
+// at 375 the Month VOO note broke "(ex Sep" / "28)" and the pension's left
+// "added" alone (real-data screenshots, Drop 2 round 1).
+function weekLinesHtml(w) {
+  const row = (name, gain, parts) => `<div class="week-row week-line">
+      <span class="week-name">${esc(name)}${parts.length ? `<span class="week-note-line">${
+        parts.map(p => `<span class="week-nw">${esc(p)}</span>`).join(' · ')}</span>` : ''}</span>
+      <span class="week-num">${weekUsd(gain)}</span>
+    </div>`;
+  // David reinvests every payout (2026-10-04): the dividend left the price and
+  // came back as new units, so it is never described as paid out.
+  // Two clauses, each kept whole: as one clause the payout note ran about 260px
+  // into a 235-253px name column at 375 and 393 on his data (CIO, final).
+  const payout = p => [`incl. ${weekUsdPlain(p.amount)} dividend reinvested`, `ex ${weekShort(p.exDate)}`];
+  const lines = (w.lines || []).map(l => row(l.name, l.gain, [
+    l.pricedFrom ? `priced ${weekShort(l.pricedFrom)} → ${weekShort(l.pricedTo)}` : null,
+    ...(l.payout ? payout(l.payout) : []),
+    l.added >= 0.5 ? `net of ${weekUsdPlain(l.added)} added` : null,
+  ].filter(Boolean))).join('');
+  const rest = w.rest ? row('Everything else', w.rest.gain, [
+    w.rest.payout >= 0.5 ? `incl. ${weekUsdPlain(w.rest.payout)} in dividends reinvested` : null,
+    w.rest.added >= 0.5 ? `net of ${weekUsdPlain(w.rest.added)} added` : null,
+  ].filter(Boolean)) : '';
+  // A fund with no new price in the window: named, no figure (CPO, round 2).
+  const stale = (w.noNewPrice || []).map(x => `<div class="week-row week-line week-stale">
+      <span class="week-name">${esc(x.name)}<span class="week-note-line"><span class="week-nw">no new price since ${
+        esc(weekShort(x.since))}</span> — <span class="week-nw">not in this figure</span></span></span>
+      <span class="week-num">—</span>
+    </div>`).join('');
+  const left = (w.left || []).length
+    ? `<p class="week-foot">Left out — no price for these dates: ${esc(w.left.join(', '))}.</p>` : '';
+  return `<div class="week-lines">${lines}${rest}${stale}</div>${left}`;
+}
+
+function renderWeekCard() {
+  const card = document.getElementById('weekCard');
+  if (!card) return;
+  if (!holdings.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  // Recompute from this session's charts whenever the card renders: an edit
+  // or a new history row changes the answer, and the maths is a few ms.
+  if (weekCharts) {
+    // `now` is when the charts were FETCHED, not this render: a bar fetched
+    // at 15:50 New York is a live price, and recomputed after 16:15 (inside
+    // the half-hour refresh window) it used to count as the day's close.
+    const f = weekCompute({ holdingsArr: holdings, txns: transactions, charts: weekCharts.charts,
+      snapshots: historyData?.snapshots || [], tgt: targets, now: weekCharts.fetchedAt,
+      // UTC, and says so: without the Z the brief's pricesFetched read as New York time.
+      fetchedAt: new Date(weekCharts.fetchedAt).toISOString().slice(0, 16) + 'Z' });
+    if (f) {
+      weekFactsData = f;
+      // Not a figure to paint at the next boot (Drop 2 round 2): one made
+      // while the boot refresh is still stamping prices (the pension's NAV
+      // lands after the week's closes on a weekly open — CPO), or from a fetch
+      // that lost a chart his money needs (CIO). refreshAllPrices re-renders
+      // when it ends; a missing chart is retried after WEEK_RETRY_MS.
+      if (!refreshing && !weekCharts.missing?.length) saveWeekCache(f);
+    }
+    // With the targets as they are now: a target edit re-renders, and the
+    // brief's vsPolicyBenchmark only reads a series built from current weights.
+    weekWarmPolicy(weekCharts.charts, policyRangeFor(LEDGER_EPOCH));
+  }
+  const facts = weekFactsData;
+  const plan = weekPlan(getSleeveTotals(), getSleeveTargetPcts(), total(),
+    +targets.bandAbsPp || 5, +targets.bandRelPct || 25);
+  const w = facts?.windows?.[weekWin] || facts?.windows?.week;
+  if (weekChartInst) { weekChartInst.destroy(); weekChartInst = null; }
+  // Facts that do not reach the last complete week, with nothing newer on the
+  // way: the cache, or this session's charts after a later refresh failed.
+  // Never "This week" (CIO, Drop 2 round 2: a Sep 26 cache read "THIS WEEK"
+  // on Oct 4 while the feed was down, and Ask answered from it).
+  const stale = !!facts && !weekIsCurrent(facts) && (!weekCharts || !!weekFailedAt);
+
+  // "This week · to Fri Oct 2"; "Last week · to Fri Oct 2" once a session has
+  // closed after that Friday; "This month · Sep 2 → Oct 2"; "Since Aug 1 · to
+  // Fri Oct 2". Stale: "Week to Fri Sep 25", "Month · Aug 25 → Sep 25".
+  const kicker = !w ? '' : w.key === 'week' ? (stale ? '' : w.label.replace(/^Week /, ''))
+    : w.key === 'month' ? w.label : `to ${weekDow(w.to)} ${weekShort(w.to)}`;
+  // Last week once a session has closed after its Friday — or once it is
+  // Monday by the calendar: before Monday's close the live bar is dropped,
+  // so asOf is still the Friday (CIO, round 2).
+  const friOf = d => weekAddDays(d, (5 - weekDayOf(d) + 7) % 7);
+  const lastWeek = w?.key === 'week' && (facts?.asOf > w.to || nyToday() >= weekAddDays(friOf(w.to), 3));
+  const title = stale
+    ? { week: w ? `Week to ${weekDow(w.to)} ${weekShort(w.to)}` : 'Week', month: 'Month',
+        epoch: 'Since ' + weekShort(LEDGER_EPOCH) }[w?.key || 'week']
+    : { week: lastWeek ? 'Last week' : 'This week', month: 'This month',
+        epoch: 'Since ' + weekShort(LEDGER_EPOCH) }[w?.key || 'week'];
+  const head1 = w && weekHeadline(w);
+  let summary;
+  if (head1 && stale) {
+    // Stale with no failure and a fetch allowed means no charts yet this
+    // session, so maybeRefreshWeek has one in flight: every weekly first open
+    // after Friday's close read "Not refreshed yet", as if he had to act,
+    // while the card was refreshing itself (CPO, Drop 2 round 3).
+    const why = weekFailedAt ? "Couldn't refresh" : !weekCanFetch() ? 'Sign in with ☁ to refresh' : 'Updating…';
+    summary = `<span class="week-l1">${head1}</span><span class="week-l2">${esc(`${why} · closes to ${weekShort(facts.asOf)}`)}</span>`;
+  } else if (head1) {
+    summary = `<span class="week-l1">${head1}</span><span class="week-l2">${esc(weekSecondLine(w, plan))}</span>`;
+  } else if (!facts && !weekCanFetch()) {
+    summary = `<span class="week-l2">Sign in with ☁ to load the week's closes.</span>`;
+  } else if (weekFailedAt && !facts) {
+    summary = `<span class="week-l2">Market closes are unavailable right now — trying again shortly.</span>`;
+  } else {
+    summary = `<span class="week-l2">${w && w.key === 'epoch' ? 'Not enough history since ' + esc(weekShort(LEDGER_EPOCH)) + ' yet.' : 'Loading the week’s closes…'}</span>`;
+  }
+  const head = `<button type="button" class="week-head" aria-expanded="${weekOpen}" aria-controls="weekBody"
+      onclick="weekToggle()" ${w ? '' : 'disabled'}>
+      <span class="week-kick"><span class="week-title">${esc(title)}</span>
+        <span class="week-when">${esc(kicker)}</span><span class="week-chev" aria-hidden="true"></span></span>
+      ${summary}
+    </button>`;
+  if (!weekOpen || !w) { card.innerHTML = head; card.classList.remove('week-open'); return; }
+
+  card.classList.add('week-open');
+  const tabs = `<div class="week-tabs" role="group" aria-label="Window">${[
+    ['week', 'Week'], ['month', 'Month'], ['epoch', 'Since ' + weekShort(LEDGER_EPOCH)]]
+    .map(([k, label]) => `<button type="button" class="week-tab${w.key === k ? ' week-tab-on' : ''}"
+      aria-pressed="${w.key === k}" onclick="weekSetWindow('${k}')" ${facts.windows[k] ? '' : 'disabled'}>${label}</button>`).join('')}</div>`;
+  const span = `${weekShort(w.from)} → ${weekShort(w.to)}`;
+  let body = `<div class="week-sec">Markets · ${esc(span)}</div>${weekStripHtml(w.strip)}`;
+  if (w.key === 'epoch') {
+    const p = w.perf;
+    body += `<div class="week-sec">Your return</div>` + (p ? `<div class="week-lines">
+        <div class="week-row"><span class="week-name">You<span class="week-note-line">net of money added</span></span><span class="week-num">${weekPct(p.pct)}</span></div>
+        ${w.mixPct != null ? `<div class="week-row"><span class="week-name">Your target mix<span class="week-note-line">the same mix in index funds, dividends included</span></span><span class="week-num">${weekPct(w.mixPct)}</span></div>` : ''}
+        ${p.spPct != null ? `<div class="week-row"><span class="week-name">S&amp;P 500<span class="week-note-line">price</span></span><span class="week-num">${weekPct(p.spPct)}</span></div>` : ''}
+      </div>${p.excluded.length ? `<p class="week-foot">${esc(new Intl.ListFormat('en-US').format(p.excluded.map(weekShort)))}
+        ${p.excluded.length > 1 ? 'are' : 'is'} left out: the record there can't separate money added from the market's move.</p>` : ''}`
+      : `<p class="week-foot">Not enough history since ${esc(weekShort(LEDGER_EPOCH))} yet.</p>`);
+  } else {
+    body += `<div class="week-sec">What moved your money</div>${weekLinesHtml(w)}${weekCaveatsHtml(w)}`;
+    // Midweek, one secondary row: never a tab, the headline or the collapsed line.
+    const sf = w.key === 'week' ? facts.windows.sinceFri : null;
+    if (sf) {
+      const spF = sf.spPct != null ? ` · S&P ${weekPct(sf.spPct)}` : '';
+      const outF = weekLeadOut(sf);
+      // Its own heading and a rule: under "What moved" it read as a fifth
+      // line of last week (CPO, round 2).
+      body += `<div class="week-lines week-since"><div class="week-sec">So far · ${esc(sf.label.replace(/^Since/, 'since'))}</div><div class="week-row">
+          <span class="week-name">You<span class="week-note-line">${esc(sf.sessions)} sessions${esc(spF)}${outF ? ` · ${esc(outF)}` : ''}</span></span>
+          <span class="week-num">${weekUsd(sf.you.gain)}${sf.you.pct != null ? ` (${weekPct(sf.you.pct)})` : ''}</span>
+        </div></div>${weekCaveatsHtml(sf)}`;
+    }
+  }
+  // The chart sits with the figures it draws, above the plan — under "Your
+  // plan" the plan sentence read as the chart's caption (CPO, round 1).
+  const ch = w.key === 'epoch' ? w.perf?.chart : w.chart;
+  const youEnd = w.key === 'epoch' ? w.perf?.pct : w.you.pct;
+  const spEnd = ch ? ch.sp[ch.sp.length - 1] : null;
+  if (ch && ch.dates.length >= 2) {
+    body += `<div class="week-legend">
+        ${youEnd != null && ch.you ? `<span class="week-key"><i class="week-swatch week-swatch-you"></i>You <strong>${weekPct(youEnd)}</strong></span>` : ''}
+        ${spEnd != null ? `<span class="week-key"><i class="week-swatch week-swatch-sp"></i>S&amp;P <strong>${weekPct(spEnd)}</strong></span>` : ''}
+      </div><div class="week-chart"><canvas id="weekChart" aria-label="${ch.you ? 'You and the S&amp;P 500' : 'The S&amp;P 500'} over the window" role="img"></canvas></div>`;
+  }
+  body += plan ? `<div class="week-sec">Your plan</div><p class="week-plan">${esc(plan.line)}</p>` : '';
+  weekChips = weekChipsFor(w.key === 'week' && lastWeek ? { ...w, words: 'last week' } : w, plan);
+  body += `<div class="week-chips"><span class="week-sub">Ask about this</span>${weekChips.map((c, i) =>
+    `<button type="button" class="ask-chip" onclick="weekAsk(${i})">${esc(c)}</button>`).join('')}</div>`;
+  // One line at 375 (it was three). The pension's own dates are on its line
+  // ("priced Sep 23 → Oct 3"); the footnote's "priced on its own NAV dates"
+  // also claimed more than the app knows — those are the dates it fetched
+  // the NAV.
+  body += `<p class="week-foot">Yahoo Finance closes to ${esc(weekShort(facts.asOf))} · facts, no forecasts.</p>`;
+  card.innerHTML = head + `<div id="weekBody" class="week-body">${tabs}${body}</div>`;
+  if (ch && ch.dates.length >= 2) drawWeekChart(ch);
+}
+
+// Two lines, no point markers, at most four dates, a zero line, 12px type.
+// Colours validated for colour-blind separation on both card surfaces
+// (dataviz validator: teal/violet ΔE 22.4 light, 13.8 dark).
+function drawWeekChart(ch) {
+  const canvas = document.getElementById('weekChart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  const dark = isDark();
+  const tick = dark ? '#8b95a8' : '#52525b';
+  const n = ch.dates.length;
+  // A week's six closes get first, middle and last ("Sep 25 · Sep 29 · Oct 2");
+  // a longer window four evenly spaced dates. Never more than four.
+  const pick = n <= 3 ? ch.dates.map((_, i) => i)
+    : n <= 7 ? [0, Math.round((n - 1) / 2), n - 1]
+    : [...new Set([0, Math.round((n - 1) / 3), Math.round(2 * (n - 1) / 3), n - 1])];
+  const step = ticks => (ticks.length > 1 ? Math.abs(ticks[1].value - ticks[0].value) : 1);
+  const digits = s => [0, 1, 2].find(d => Math.abs(s * 10 ** d - Math.round(s * 10 ** d)) < 1e-6) ?? 2;
+  weekChartInst = new Chart(canvas, {
+    type: 'line',
+    data: { labels: ch.dates, datasets: [
+      // Monotone: smooth without inventing a peak or trough between closes.
+      // No "You" line across a flagged period: there is no return to draw.
+      ...(ch.you ? [{ label: 'You', data: ch.you, borderColor: '#0d9488', borderWidth: 2.5, pointRadius: 0,
+        pointHoverRadius: 4, pointHitRadius: 12, cubicInterpolationMode: 'monotone', fill: false, spanGaps: true }] : []),
+      { label: 'S&P 500', data: ch.sp, borderColor: dark ? '#9085e9' : '#4a3aa7', borderWidth: 2, pointRadius: 0,
+        pointHoverRadius: 4, pointHitRadius: 12, cubicInterpolationMode: 'monotone', fill: false, spanGaps: true },
+    ] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: false }, tooltip: { displayColors: true, callbacks: {
+        title: items => weekShort(ch.dates[items[0].dataIndex]),
+        label: c => `${c.dataset.label} ${c.parsed.y == null ? '—' : weekPct(c.parsed.y)}` } } },
+      scales: {
+        x: { grid: { display: false }, border: { color: themeGridColor() },
+          afterBuildTicks: axis => { axis.ticks = pick.map(i => ({ value: i })); },
+          ticks: { autoSkip: false, maxRotation: 0, minRotation: 0, align: 'inner', font: { size: 12 }, color: tick,
+            callback: v => weekShort(ch.dates[v]) } },
+        y: { border: { display: false },
+          grid: { color: c => (c.tick && Math.abs(c.tick.value) < 1e-9 ? (dark ? '#3a4256' : '#c9c6bf') : themeGridColor()) },
+          ticks: { maxTicksLimit: 5, font: { size: 12 }, color: tick,
+            callback: (v, i, ticks) => signed(v, digits(step(ticks)), '%') } },
+      },
+    },
+  });
 }
 
 // ─── Advisor: asset location ─────────────────────────────────────────────────
@@ -3802,44 +4952,6 @@ const fmtSigned$    = n =>
 const moveClass = (n, digits = 2) =>
   +Math.abs(n).toFixed(digits) === 0 ? '' : n > 0 ? 'mkt-up' : 'mkt-down';
 
-function marketMoveCell(label, d, macro) {
-  if (!d) return `<span class="mkt-move mkt-na">${label} —</span>`;
-  const shown = macro ? fmtSignedBp(d.abs) : fmtSignedPct(d.pct);
-  const cls = macro ? moveClass(d.abs * 100, 0) : moveClass(d.pct);
-  return `<span class="mkt-move ${cls}">${label} ${shown}</span>`;
-}
-
-function renderMarketSection() {
-  if (!marketData) {
-    return `<p class="adv-placeholder mkt-empty">Pull current prices, 30-day and YTD moves, and the
-      10-year Treasury yield for the instruments you actually hold.</p>`;
-  }
-  const rows = marketData.rows.map(r => {
-    if (!r.snap) {
-      return `<div class="mkt-row"><span class="mkt-tick">${esc(r.label)}</span>
-        <span class="mkt-na">feed unavailable</span></div>`;
-    }
-    const s = r.snap;
-    const level = r.macro ? `${s.last.toFixed(3)}%` : fmt$(s.last);
-    // "Off high" is a drawdown fact about price. On a yield it would invert
-    // its own meaning (a high yield is a low price), so it is omitted there.
-    const offHigh = r.macro ? '' :
-      `<span class="mkt-off">${s.offHighPct <= -0.05
-        ? `${Math.abs(s.offHighPct).toFixed(1)}% off high` : 'at 52w high'}</span>`;
-    return `<div class="mkt-row">
-      <span class="mkt-tick">${esc(r.label)}</span>
-      <span class="mkt-last">${level}</span>
-      ${marketMoveCell('1d', s.d1, r.macro)}
-      ${marketMoveCell('30d', s.d30, r.macro)}
-      ${marketMoveCell('YTD', s.ytd, r.macro)}
-      ${offHigh}
-    </div>`;
-  }).join('');
-  const asOf = marketData.rows.find(r => r.snap)?.snap.asOfDate;
-  return rows + `<p class="risk-note">Last close ${esc(asOf || '—')} · Yahoo Finance.
-    Levels and moves only — no view on what they mean.</p>`;
-}
-
 function renderDriftSection() {
   const tot = total();
   const bandAbs = +targets.bandAbsPp || 5;
@@ -3848,6 +4960,8 @@ function renderDriftSection() {
   if (!d.rows.length) return '';
 
   const monthlyIn = monthlyContribution();
+  // Whole dollars, as everywhere else on the phone page (CPO, round 1).
+  const usd0 = n => (Math.abs(n) < 0.5 ? '$0' : `${n > 0 ? '+' : '−'}${fmt$0(Math.abs(n))}`);
   let head;
   if (d.anyOutOfBand) {
     // Breaches come in both directions at once, so a single "worst sleeve"
@@ -3863,11 +4977,13 @@ function renderDriftSection() {
     const parts = [];
     if (shortfall > 0) {
       const names = under.map(r => r.label).join(' and ');
+      // Whole dollars here too: the head still printed the shortfall and the
+      // monthly rate to the cent, over rows in whole dollars (CPO, round 2).
       parts.push(months === null
-        ? `${fmt$(shortfall)} short in ${names} — no standing contributions to close it with.`
+        ? `${fmt$0(shortfall)} short in ${names} — no standing contributions to close it with.`
         : months <= 24
-          ? `${fmt$(shortfall)} short in ${names} — about ${Math.ceil(months)} months of contributions at ${fmt$(monthlyIn)}/mo.`
-          : `${fmt$(shortfall)} short in ${names} — roughly ${(months / 12).toFixed(1)} years at ${fmt$(monthlyIn)}/mo, so buying alone will not close it.`);
+          ? `${fmt$0(shortfall)} short in ${names} — about ${Math.ceil(months)} months of contributions at ${fmt$0(monthlyIn)}/mo.`
+          : `${fmt$0(shortfall)} short in ${names} — roughly ${(months / 12).toFixed(1)} years at ${fmt$0(monthlyIn)}/mo, so buying alone will not close it.`);
     }
     if (over.length) {
       parts.push(`${over.map(r => r.label).join(' and ')} ${over.length === 1 ? 'is' : 'are'} over target — new money cannot bring ${over.length === 1 ? 'it' : 'them'} down, only selling or the rest growing into ${over.length === 1 ? 'it' : 'them'}.`);
@@ -3878,25 +4994,44 @@ function renderDriftSection() {
   } else {
     head = `<p class="drift-head drift-ok">✓ Every sleeve is inside your bands${d.worst
       ? ` — largest drift ${Math.abs(d.worst.driftPp).toFixed(1)}pp (${esc(d.worst.label)},
-          ${fmtSigned$(d.worst.driftDollars)})` : ''}.</p>`;
+          ${usd0(d.worst.driftDollars)})` : ''}.</p>`;
   }
 
+  // Drift inside the band is neutral: red and green on a −0.2pp drift read as
+  // a verdict while the head says every sleeve is inside (trim.md item 22;
+  // CPO, Drop 2 round 1). Colour marks a breach only. Whole dollars, and the
+  // amount never breaks: at 375 a breach's sub-line wrapped to "−" / the
+  // amount in cents / "· both band".
+  const leg = { both: 'both bands', absolute: 'absolute band', relative: 'relative band' };
   const rows = d.rows.map(r => `<div class="drift-row ${r.outOfBand ? 'drift-row-breach' : ''}">
     <span>${esc(r.label)}</span>
     <span class="num">${r.curPct.toFixed(1)}%<span class="drift-sub">now</span></span>
     <span class="num">${r.tgtPct.toFixed(1)}%<span class="drift-sub">target</span></span>
-    <span class="num ${moveClass(r.driftPp, 1)}">${fmtSignedPp(r.driftPp)}
-      <span class="drift-sub">${fmtSigned$(r.driftDollars)}${
-        r.reason ? ` · ${r.reason} band` : ''}</span></span>
+    <span class="num ${r.outOfBand ? moveClass(r.driftPp, 1) : ''}">${fmtSignedPp(r.driftPp)}
+      <span class="drift-sub"><span class="drift-amt">${usd0(r.driftDollars)}</span>${
+        r.reason ? ` · ${leg[r.reason]}` : ''}</span></span>
   </div>`).join('');
 
+  // The bands are stated here and set in one place, Plan & settings → Targets
+  // & bands (trim.md item 22: "the band inputs move to the drawer"). Drop 2
+  // integration, 2026-10-04: the layout package built the drawer's labelled
+  // 44px fields while this sentence kept its own two 22px boxes, so one figure
+  // had two editors on the same page.
   return head + `<div class="drift-rows">${rows}</div>
-    <p class="risk-note">Act when a sleeve is off by
-      <input class="band-input" id="bandAbs" type="number" min="0" max="50" step="0.5" value="${bandAbs}"
-        onchange="targets.bandAbsPp=+this.value;markUnsaved();renderAdvisorContext()"> pp
-      or <input class="band-input" id="bandRel" type="number" min="0" max="100" step="5" value="${bandRel}"
-        onchange="targets.bandRelPct=+this.value;markUnsaved();renderAdvisorContext()">% of its own
-      target weight (the 5/25 rule). Your policy, your numbers — this only reports against it.</p>`;
+    <p class="risk-note" id="driftBands">Act when a sleeve is off by ${esc(bandAbs)}pp or ${esc(bandRel)}% of its own
+      target weight. Your policy, your numbers — this only reports against it.
+      <button type="button" class="ask-link inline-link" onclick="openPlanSection('planTargets')">Change your bands</button></p>`;
+}
+
+// Plan & settings opened at one section, scrolled to it — the one tap from a
+// figure on the page to the field that sets it.
+function openPlanSection(id) {
+  const plan = document.getElementById('planCard'), sec = document.getElementById(id);
+  if (!plan || !sec) return;
+  plan.open = true;
+  sec.open = true;
+  renderPlan();
+  sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 // His tax rates: the inputs effectiveRates reads, and through it the asset-
@@ -3904,103 +5039,68 @@ function renderDriftSection() {
 // Advisor's "Where your assets sit" panel. That panel left the card 2026-10-03
 // (David: "the rest is better in the ask feature" — Ask already runs
 // assetLocationSwap on every question), but it was the ONLY place the rates
-// could be set, so the inputs moved to Allocation Strategy with the rest of his
-// policy instead of leaving with the panel. Same ids, same defaults.
+// could be set, so the inputs moved with the rest of his policy instead of
+// leaving with the panel — since Drop 2 into Plan & settings, as labelled
+// 44px rows rather than 22px boxes inside a sentence. Same ids, same defaults.
+//
+// Built once, then synced in place: render() runs once per fetched price
+// during a refresh, and the old full rebuild wiped a rate he was half-way
+// through typing (Drop 1 carry-over).
+function setTaxRate(key, value) {
+  targets[key] = key === 'taxNiit' ? !!value : +value;
+  markUnsaved();
+  renderTaxRates();
+  renderPlan();
+}
+
 function renderTaxRates() {
   const el = document.getElementById('taxRates');
   if (!el) return;
-  // Values are esc()'d: targets come from a restored backup or the cloud doc
-  // as well as these inputs, and this now renders on every render() rather
-  // than only when the old location panel was opened (Drop 1 security review).
-  el.innerHTML = `<p class="risk-note">Ask prices tax drag and asset location at these rates:
-    marginal <input class="band-input" id="taxMarg" type="number" min="0" max="60" step="1"
-      value="${esc(targets.taxMarginal ?? DEFAULT_TAX_MARGINAL)}"
-      onchange="targets.taxMarginal=+this.value;markUnsaved();renderTaxRates()">%
-    · long-term gains <input class="band-input" id="taxLt" type="number" min="0" max="40" step="1"
-      value="${esc(targets.taxLtcg ?? DEFAULT_TAX_LTCG)}"
-      onchange="targets.taxLtcg=+this.value;markUnsaved();renderTaxRates()">%
-    · state + local <input class="band-input" id="taxLocal" type="number" min="0" max="20" step="0.5"
-      value="${esc(targets.taxStateLocal ?? 0)}"
-      onchange="targets.taxStateLocal=+this.value;markUnsaved();renderTaxRates()">%
-    · <label class="band-check"><input type="checkbox" id="taxNiit" ${targets.taxNiit ? 'checked' : ''}
-      onchange="targets.taxNiit=this.checked;markUnsaved();renderTaxRates()"> NIIT 3.8%</label>
-    ${!(+targets.taxStateLocal > 0) ? '<span class="loc-hint">— state + local is 0, so these are federal-only figures.</span>' : ''}
-  </p>`;
-}
-
-function renderAttributionSection() {
-  const picker = ATTRIB_WINDOWS.map(w =>
-    `<button class="btn btn-ghost btn-sm ${attribData?.win.key === w.key ? 'attrib-on' : ''}"
-       onclick="runAttribution('${w.key}')">${w.label}</button>`).join('');
-  const controls = `<div class="attrib-picker">${picker}</div>`;
-
-  if (!attribData) {
-    return controls + `<p class="adv-placeholder attrib-empty">Pick a window to split the change in
-      your portfolio into what you paid in and what the market did — then see which holdings
-      actually drove it.</p>`;
+  const vals = {
+    taxMarg:  targets.taxMarginal ?? DEFAULT_TAX_MARGINAL,
+    taxLt:    targets.taxLtcg ?? DEFAULT_TAX_LTCG,
+    taxLocal: targets.taxStateLocal ?? 0,
+  };
+  if (!document.getElementById('taxMarg')) {
+    // Values are esc()'d: targets come from a restored backup or the cloud doc
+    // as well as these inputs (Drop 1 security review).
+    const row = (id, label, key, max, step) => `<div class="target-row">
+        <label for="${id}">${label}</label>
+        <input id="${id}" type="number" min="0" max="${max}" step="${step}" value="${esc(vals[id])}"
+          onchange="setTaxRate('${key}', this.value)"><span class="pct-label">%</span></div>`;
+    el.innerHTML = `<p class="plan-note">Ask prices tax drag and asset location at these rates.</p>
+      <div class="target-inputs">
+        ${row('taxMarg', 'Marginal income tax', 'taxMarginal', 60, 1)}
+        ${row('taxLt', 'Long-term capital gains', 'taxLtcg', 40, 1)}
+        ${row('taxLocal', 'State + local', 'taxStateLocal', 20, 0.5)}
+        <label class="plan-check"><input type="checkbox" id="taxNiit" ${targets.taxNiit ? 'checked' : ''}
+          onchange="setTaxRate('taxNiit', this.checked)"> Net investment income tax (3.8%)</label>
+      </div>
+      <p class="plan-note" id="taxLocalHint"></p>`;
+  } else {
+    for (const [id, v] of Object.entries(vals)) {
+      const inp = document.getElementById(id);
+      // A value with markup in it lands in .value, which is inert.
+      if (inp && document.activeElement !== inp) inp.value = v;
+    }
+    const niit = document.getElementById('taxNiit');
+    if (niit) niit.checked = !!targets.taxNiit;
   }
-  const r = attribData.result;
-  if (!r.rows.length) {
-    return controls + `<p class="adv-placeholder">No holding had an establishable starting price
-      for that window.</p>`;
-  }
-
-  const head = `<p class="attrib-head">Since ${esc(attribData.sinceDate)} your portfolio moved
-    <strong class="${moveClass(r.totalChange, 0)}">${fmtSigned$(r.totalChange)}</strong> —
-    <strong>${fmtSigned$(r.contributed)}</strong> of that you paid in,
-    <strong class="${moveClass(r.marketGain, 0)}">${fmtSigned$(r.marketGain)}</strong> the market
-    ${r.marketGain >= 0 ? 'gave' : 'took'}.</p>`;
-
-  const rows = r.rows.map(row => {
-    const share = r.grossMove > 0 ? Math.abs(row.marketGain) / r.grossMove * 100 : 0;
-    return `<div class="attrib-row">
-      <span>${esc(row.h.name.slice(0, 28))}<span class="drift-sub">${esc(row.h.account || '—')}</span></span>
-      <span class="num ${moveClass(row.pricePct ?? 0)}">${row.pricePct == null ? '—' : fmtSignedPct(row.pricePct, 1)}
-        <span class="drift-sub">${row.basis}</span></span>
-      <span class="num ${moveClass(row.marketGain, 0)}">${fmtSigned$(row.marketGain)}
-        <span class="drift-sub">market</span></span>
-      <span class="num">${row.contributed ? fmtSigned$(row.contributed) : '—'}
-        <span class="drift-sub">paid in</span></span>
-      <span class="attrib-bar"><i style="width:${Math.min(100, share).toFixed(1)}%"
-        class="${row.marketGain >= 0 ? 'bar-up' : 'bar-down'}"></i></span>
-    </div>`;
-  }).join('');
-
-  const skipped = r.skipped.length
-    ? `<p class="risk-note">${r.skipped.length} holding${r.skipped.length === 1 ? '' : 's'}
-       (${esc(r.skipped.map(s => s.h.name.slice(0, 22) + (s.reason ? ` — ${s.reason}` : '')).join(', '))})
-       could not be attributed for ${esc(attribData.sinceDate)} and are left out entirely rather than
-       counted as zero — the totals above cover ${fmt$(r.nowValue)} of the portfolio, not all of it.</p>`
-    : '';
-
-  return controls + head + `<div class="attrib-rows">${rows}</div>` + skipped +
-    `<p class="risk-note">Market = value change with your own contributions stripped out, per
-     holding. Holdings with a ticker are priced off RAW closes, so a dividend never reads as a
-     price gain; the 401K funds and the Swedish pension are on TOTAL RETURN, because their
-     distributions compound inside the NAV — the per-row label says which. Reinvested dividends
-     land in market, where income belongs. Bars show each holding's share of the total movement.
-     <strong>Three things this cannot see:</strong> a holding added by hand writes no ledger entry,
-     so its purchase reads as market gain; a reinvestment entered by hand is booked as an
-     adjustment, so it reads as money paid in; and a holding you <em>delete</em> rather than zero
-     out leaves nothing to iterate, so it vanishes from the window entirely. Facts about what happened — no view on what happens
-     next.</p>`;
+  const hint = document.getElementById('taxLocalHint');
+  if (hint) hint.innerHTML = !(+targets.taxStateLocal > 0)
+    ? '<span class="loc-hint">State + local is 0, so these are federal-only figures.</span>' : '';
 }
 
 // Nothing in this card volunteers a verdict nobody asked for. Volunteering
 // "relocate this bond lot and save this much a year" to someone who opened the
 // app to check a balance was exactly that; the location panel that did it left
-// the card on 2026-10-03 and the question now lives in Ask. Where you stand is
-// the one section left with Show/Hide — open by default, since it only reports
-// against his own bands.
+// the card on 2026-10-03 and the question now lives in Ask. Market and What
+// moved your money left on 2026-10-04 for the This week card, so Where you
+// stand is the whole card now — David: "the where you stand is fine, the rest
+// is better in the ask feature". Its Show/Hide stays, open by default, since
+// it only reports against his own bands.
 let advShow = { drift: true };
 function advToggle(key) { advShow[key] = !advShow[key]; renderAdvisorContext(); }
-
-function advSection(key, title, bodyFn, teaser) {
-  const open = advShow[key];
-  return `<div class="subsection-label subsection-flex">${title}
-      <button class="btn btn-ghost btn-sm" onclick="advToggle('${key}')">${open ? 'Hide' : 'Show'}</button>
-    </div>` + (open ? bodyFn() : `<p class="adv-placeholder adv-quiet">${teaser}</p>`);
-}
 
 // ─── Ask ─────────────────────────────────────────────────────────────────────
 // A general conversation about his own portfolio, in its own card. The cards
@@ -4016,7 +5116,7 @@ const ASK_KEEP_TURNS = 30, ASK_HISTORY_TURNS = 10, ASK_OPEN_TURNS = 2;
 // Which shell asked, for the function's log line (`v=`), so "is the phone on
 // the new shell?" and "is anyone using Ask?" are log queries, not guesses.
 // Must equal sw.js VERSION — tests/ask.spec.js fails the build when they drift.
-const ASK_SHELL_VERSION = 'v1.11.0';
+const ASK_SHELL_VERSION = 'v1.12.0';
 let askBusy = false;
 let askAbort = null;               // the in-flight question's AbortController
 let askShowEarlier = false;
@@ -4440,7 +5540,7 @@ function askContext() {
       if (p0 > 0 && p1 != null) vsPolicy = { from: post[0].date, to: last.date,
         policyTotalReturnPct: r2((p1 / p0 - 1) * 100), twrMinusPolicyPct: r2((twr - (p1 / p0 - 1)) * 100) };
     }
-    if (!policyWarm) notLoaded.push('Blended policy benchmark — it loads with the chart in the Performance card, and has not loaded this session');
+    if (!policyWarm) notLoaded.push('Blended policy benchmark — it loads with the This week card once signed in, and has not loaded this session');
     performance = {
       snapshots: { count: snaps.length, first: first.date, last: last.date },
       valueChangeSinceFirstSnapshot: { dollars: r2(last.value - first.value),
@@ -4484,8 +5584,10 @@ function askContext() {
     kronaVsDollarPct: r2(sek.fx * 100), netUsdPct: r2(sek.net * 100),
     kronaExposure: { value: r2(kronaHeld.reduce((s, h) => s + val(h), 0)), holdings: byName(kronaHeld),
       pricedInKronorOnly: byName(sekPriced.filter(h => !holdsKronaAssets(h))) },
-    stamps: { columns: ['date', 'navSek', 'usdPerSek'],
-      rows: sekHolding.fxHistory.slice(-ASK_FX_STAMPS).map(r => [r.date, r.nav, r.rate]) },
+    // navDate: the day each NAV is for (avanzaNavDate) — null on stamps from
+    // before Drop 2. `date` is only when the app fetched it.
+    stamps: { columns: ['date', 'navSek', 'usdPerSek', 'navDate'],
+      rows: sekHolding.fxHistory.slice(-ASK_FX_STAMPS).map(r => [r.date, r.nav, r.rate, r.navDate ?? null]) },
   } : null;
 
   // ── fire ── one run with the card's own defaults (the rounded figures its
@@ -4520,27 +5622,22 @@ function askContext() {
     fullRebalanceToTargets: askPlan(0, true),
   };
 
-  // ── session caches ── attached only if he already loaded them.
-  const delta = x => x ? { abs: r2(x.abs), pct: r2(x.pct) } : null;
-  const market = marketData ? {
-    fetched: String(marketData.fetched).slice(0, 16),
-    rows: marketData.rows.filter(r => r.snap).map(r => ({ ticker: r.ticker, label: r.label, macro: !!r.macro,
-      last: r2(r.snap.last), asOfDate: r.snap.asOfDate, d1: delta(r.snap.d1), d30: delta(r.snap.d30),
-      ytd: delta(r.snap.ytd), d365: delta(r.snap.d365), high52: r2(r.snap.high52),
-      offHighPct: r1(r.snap.offHighPct) })),
-  } : null;
-  if (!market) notLoaded.push('Market moves — tap ↻ Refresh market in the Advisor card');
-  const A = attribData?.result;
-  const attributionOut = A ? {
-    window: attribData.win.label, since: attribData.sinceDate,
-    rows: A.rows.map(r => ({ holding: r.h.name, account: acctOf(r.h), startValue: r2(r.startValue),
-      nowValue: r2(r.nowValue), paidIn: r2(r.contributed), marketGain: r2(r.marketGain),
-      pricePct: r2(r.pricePct), basis: r.basis })),
-    totals: { startValue: r2(A.startValue), nowValue: r2(A.nowValue), paidIn: r2(A.contributed),
-      marketGain: r2(A.marketGain), totalChange: r2(A.totalChange) },
-    notAttributable: A.skipped.map(x => ({ holding: x.h.name, reason: x.reason })),
-  } : null;
-  if (!attributionOut) notLoaded.push('What moved your money (attribution) — pick a window in the Advisor card');
+  // ── this week ── the This week card's facts for all three windows, as last
+  // computed (this session's closes, or the cached ones from the last). They
+  // replace the Advisor's market and attribution sections, which were empty
+  // unless he had tapped their buttons that visit (eval Q01 answered a week
+  // question from history rows a day late). Read, never fetched or computed
+  // here: building the brief has no side effects.
+  // Only facts that reach the last complete week (CIO, Drop 2 round 2): a
+  // cache from an earlier Friday, with the refresh failing, went out as "the
+  // last complete week" and Ask answered "How'd I do this week?" from it.
+  const weekCurrent = weekIsCurrent(weekFactsData, now);
+  const thisWeek = weekCurrent ? askWeek(weekFactsData, r2, weekPlan(sleeveVals, tgtPcts, tot, bandAbs, bandRel)) : null;
+  if (!thisWeek) {
+    notLoaded.push(weekFactsData?.windows?.week && !weekCurrent
+      ? `This week's figures ${weekFailedAt ? 'could not be refreshed' : 'have not refreshed yet'} — the last ones on this phone run to ${weekFactsData.asOf}`
+      : "This week's market moves and what moved your money — they load with the This week card once signed in");
+  }
 
   return {
     schema: 'portfolio-brief/2',   // /2 (ask-4): no question-dependent sections; fx.kronaExposure
@@ -4548,7 +5645,7 @@ function askContext() {
     freshness, policy,
     totals: { totalValue: r2(tot), holdings: held.length, accounts: accounts.length },
     accounts, holdings: holdingRows, drift, concentration, contributions, ledger, income,
-    assetLocation, performance, sinceLastLook, fx, fire, scenarios, market, attribution: attributionOut,
+    assetLocation, performance, sinceLastLook, fx, fire, scenarios, thisWeek,
     notLoaded,
     notTracked: [
       'Cost basis, tax lots and unrealised gains — so the tax cost of a sale cannot be computed',
@@ -4561,30 +5658,59 @@ function askContext() {
   };
 }
 
-// Example questions. Static strings on purpose: a chip built from live data
-// ("Which prices are stale?") would itself be a verdict nobody asked for. Three
-// show at a time, stepped through the pool by day so they hold still within one.
-const ASK_CHIPS = [
-  'How far am I from my targets?',
-  'How much have I put in this year?',
-  "What's my dividend income by account?",
-  // Since August, not June: returns start at LEDGER_EPOCH (08-01), so a
-  // June starter could only ever get a caveated swap of the period.
-  'How have I done since August?',
-  'How much of my money rides on the krona?',
-  'How fresh is my data?',
-  'What would a 30% stock drop do to my mix?',
-  'Where would my next $5,000 go?',
-  "What's my biggest single-company exposure?",
-  'Am I on pace for work-optional?',
-  'Why does it matter which account holds my bonds?',
-  'What do my 5/25 bands mean?',
-];
-function askChipsFor(date = new Date()) {
+// Starters. Questions, never verdicts: a starter built from live figures
+// ("Which prices are stale?") would itself be a verdict nobody asked for, so
+// none names a value of his. Each is one the brief answers well today, and the
+// one that names a date reads it from the data's own schema (LEDGER_EPOCH),
+// never from a string in the code: "since June" sat in this pool for weeks
+// after returns moved to start on Aug 1 (Drop 1 review).
+// Two show (Drop 2, 2026-10-04): the week, which is the app's cadence, always
+// first, then one from the pool stepped by day so it holds still within one.
+// They now stay on screen under every thread, so two keep the card short.
+const ASK_STARTER_LEAD = "How'd I do this week?";
+function askStarterPool() {
+  const [y, m, d] = LEDGER_EPOCH.split('-').map(Number);
+  const epoch = new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  return [
+    'Am I on plan?',
+    `How have I done since ${epoch}?`,
+    'Where would my next $5,000 go?',
+    "What's my krona exposure?",
+    'What would a 30% drop do to my mix?',
+    'Am I on pace for work-optional?',
+    'How much have I put in this year?',
+    "What's my dividend income by account?",
+    'Does it matter where my bonds sit?',
+  ];
+}
+function askStartersFor(date = new Date()) {
+  const pool = askStarterPool();
   const dayOfYear = Math.round((Date.UTC(date.getFullYear(), date.getMonth(), date.getDate())
     - Date.UTC(date.getFullYear(), 0, 0)) / 86400000);
-  // A stride of four spreads the three across topics rather than neighbours.
-  return [0, 4, 8].map(step => ASK_CHIPS[(dayOfYear + step) % ASK_CHIPS.length]);
+  return [ASK_STARTER_LEAD, pool[dayOfYear % pool.length]];
+}
+
+// A starter fills the box and focuses it; it never sends. Until Drop 2 a tap
+// sent at once, and every chip vanished for good after the first question
+// (2026-10-03 audit, chat-live). Filling lets him read, edit or add to it
+// first. `src` is for the function's log only: where the text in the box came
+// from ('starter', or 'insight' from the week card); typed text is 'typed'.
+let askSrc = null;
+function askFill(text, src = 'starter') {
+  const input = document.getElementById('askInput');
+  if (!input) return;
+  input.value = String(text ?? '').slice(0, 2000);
+  askSrc = src;
+  askAutoGrow(input);
+  input.focus();
+  // Caret at the end, so he can carry the question on.
+  input.setSelectionRange?.(input.value.length, input.value.length);
+}
+// Typing over a starter keeps it a starter question; emptying the box and
+// typing fresh makes it his own.
+function askEdited(el) {
+  if (!el.value) askSrc = null;
+  askAutoGrow(el);
 }
 
 // The thread survives a reload, per device. Storage can be absent or full
@@ -4692,12 +5818,13 @@ function renderAskState() {
   send.textContent = askBusy ? '…' : 'Ask';
   document.getElementById('askSignin').style.display = signedOut ? '' : 'none';
   document.getElementById('askClear').style.display = askThread.length ? '' : 'none';
+  // Starters stay whenever he can ask, thread or not; signed out they would
+  // only fill a box he cannot send.
   const chips = document.getElementById('askChips');
-  const showChips = !askThread.length && !signedOut;
-  chips.style.display = showChips ? '' : 'none';
-  if (showChips && !chips.childElementCount) {
-    chips.innerHTML = askChipsFor().map(c =>
-      `<button type="button" class="ask-chip" onclick="submitAsk(this.textContent)">${esc(c)}</button>`).join('');
+  chips.style.display = signedOut ? 'none' : '';
+  if (!signedOut && !chips.childElementCount) {
+    chips.innerHTML = askStartersFor().map(c =>
+      `<button type="button" class="ask-chip" onclick="askFill(this.textContent)">${esc(c)}</button>`).join('');
   }
 }
 
@@ -4728,7 +5855,10 @@ function askErrorText(e) {
     return "Ask isn't deployed yet — the app shipped ahead of its cloud function. Everything else works.";
   if (e?.name === 'TimeoutError' || e?.name === 'AbortError' || /did not respond in time|timed? ?out/i.test(msg))
     return 'No answer in time — the model took too long. Try again.';
-  // "sign in required" is the function's own 401, which is what a lapsed JWT gets.
+  // "sign in required" is the function's own 401. proxyPost has already
+  // renewed the token once and retried, so this is a just-renewed token
+  // refused again; a session that could not be renewed never gets here
+  // (SignedOutError → the card's sign-in line).
   if (/^sign in required$|^request failed \(401\)$|jwt/i.test(msg))
     return 'Your cloud session has expired — sign in again with ☁.';
   if (e instanceof TypeError)
@@ -4736,10 +5866,9 @@ function askErrorText(e) {
   return 'Could not get an answer — ' + (msg || 'unknown error') + '.';
 }
 
-async function submitAsk(preset) {
+async function submitAsk() {
   const input = document.getElementById('askInput');
-  const fromChip = typeof preset === 'string';
-  const q = (fromChip ? preset : input?.value || '').trim().slice(0, 2000);
+  const q = (input?.value || '').trim().slice(0, 2000);
   if (!q || askBusy) return;
   // Signed out is a state of the card, not a failed question: keep what was
   // typed, show the sign-in line, push nothing into the thread.
@@ -4750,9 +5879,11 @@ async function submitAsk(preset) {
     .slice(-ASK_HISTORY_TURNS).map(t => ({ q: t.q, a: t.a }));
   const turn = { q, pending: true, ts: Date.now() };
   const ctl = askAbort = new AbortController();
+  const src = askSrc || 'typed';
+  askSrc = null;
   askBusy = true;
   askThread.push(turn);
-  if (input && !fromChip) { input.value = ''; askAutoGrow(input); }
+  if (input) { input.value = ''; askAutoGrow(input); }
   // On a phone the keyboard would otherwise sit on top of the answer.
   if (input && window.matchMedia?.('(pointer: coarse)').matches) input.blur();
   renderAskThread();
@@ -4763,23 +5894,34 @@ async function submitAsk(preset) {
     // 90s: deliberately outlives the function's own 85s upstream budget. The
     // brief is the same for every question; what this question's amounts need
     // rides as `extra`, after the server's cache breakpoint. `client` is for
-    // the log: no ids, just the shell version and typed-or-chip.
+    // the log: no ids, just the shell version and typed / starter / insight.
     const r = await proxyPost('/ask', { question: q, context: askContext(), extra: askExtra(q), history,
-      client: { v: ASK_SHELL_VERSION, src: fromChip ? 'chip' : 'typed' } }, 90000, ctl.signal);
+      client: { v: ASK_SHELL_VERSION, src } }, 90000, ctl.signal);
     result = typeof r?.answer === 'string' && r.answer.trim()
       ? { a: r.answer } : { error: 'No answer came back. Try again.' };
   } catch (e) {
-    result = { error: askErrorText(e) };
+    // The session could not be renewed (cloud.js has already signed the app
+    // out): that is the card's sign-in state, not an answer that failed.
+    result = e?.name === 'SignedOutError' ? { signedOut: true } : { error: askErrorText(e) };
   }
   // Cleared while it was thinking: Clear already reset the card and a newer
   // question may be in flight, so this one has nothing left to touch.
   if (!askThread.includes(turn)) return;
-  delete turn.pending;
-  Object.assign(turn, result);
   askBusy = false;
   askAbort = null;
+  if (result.signedOut) {
+    // No bubble, nothing saved: the question goes back in the box (unless he
+    // has typed the next one) and the sign-in line shows under it.
+    askThread.splice(askThread.indexOf(turn), 1);
+    if (input && !input.value) { input.value = q; askSrc = src === 'typed' ? null : src; askAutoGrow(input); }
+    saveAskThread();
+    renderAskThread();
+    return;
+  }
+  delete turn.pending;
+  Object.assign(turn, result);
   // A failed question goes back in the box, unless he has started another.
-  if (result.error && input && !input.value) { input.value = q; askAutoGrow(input); }
+  if (result.error && input && !input.value) { input.value = q; askSrc = src === 'typed' ? null : src; askAutoGrow(input); }
   saveAskThread();
   renderAskThread();
   askScrollToLatest();
@@ -4788,16 +5930,11 @@ async function submitAsk(preset) {
 function renderAdvisorContext() {
   const el = document.getElementById('advContext');
   if (!el) return;
-  el.innerHTML =
-    `${advSection('drift', 'Where you stand', renderDriftSection,
-        'Compare each sleeve against your targets and rebalancing bands.')}
-     <div class="subsection-label subsection-flex">Market
-       <button class="btn btn-ghost btn-sm" id="btnMarketRefresh" onclick="refreshMarket()">↻ Refresh market</button>
-     </div>${renderMarketSection()}
-     <div class="subsection-label subsection-flex">What moved your money
-       ${attribData ? `<button class="btn btn-ghost btn-sm" id="btnAttrib"
-         onclick="runAttribution('${attribData.win.key}')">↻ Recompute</button>` : ''}
-     </div>${renderAttributionSection()}`;
+  const open = advShow.drift;
+  const btn = document.getElementById('advDriftToggle');
+  if (btn) { btn.textContent = open ? 'Hide' : 'Show'; btn.setAttribute('aria-expanded', String(open)); }
+  el.innerHTML = open ? renderDriftSection()
+    : '<p class="adv-placeholder adv-quiet">Compare each sleeve against your targets and rebalancing bands.</p>';
 }
 
 // ─── Rebalance simulator (P4) ────────────────────────────────────────────────
