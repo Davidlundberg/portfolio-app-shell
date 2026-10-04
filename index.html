@@ -41,8 +41,11 @@
     <div class="header-left">
       <span class="total-label">Portfolio Value</span>
       <span class="total-value" id="totalValue">$0.00</span>
-      <span class="total-updated" id="sinceInceptionReturn"></span>
-      <span class="total-updated" id="trueTwrLabel"></span>
+      <!-- No return lines under the total (2026-10-03): "Value change since
+           inception" and "TWR … · MWR … · vs policy" read an inflated change,
+           an absurd TWR and a four-digit MWR off an incomplete record. The
+           return lives in Ask and the Performance card, both behind the
+           discontinuity guard. -->
       <span class="total-updated" id="sinceLastLook"></span>
       <span class="total-updated" id="lastSavedLabel"></span>
       <span class="total-updated" id="lastRefreshedLabel"></span>
@@ -64,11 +67,22 @@
           <button class="btn btn-ghost" onclick="exportCSV()">↓ Export CSV</button>
           <button class="btn btn-ghost" onclick="saveToFile()" title="Save a full JSON backup (holdings + ledger)">⤓ Backup</button>
           <button class="btn btn-ghost" onclick="triggerLoadJSON()" title="Restore from a JSON backup">⤒ Restore</button>
+          <!-- Which shell this device runs, and the swap when a newer one is
+               waiting (cloud.js, "Shell version"). -->
+          <button class="btn btn-ghost" id="btnShellUpdate" style="display:none;" onclick="applyShellUpdate()">↻ Update ready — reload</button>
+          <div class="hdr-more-version" id="shellVersion"></div>
         </div>
       </details>
       <input type="file" id="fileInputCSV"  accept=".csv,.txt" onchange="importCSV(event)">
       <input type="file" id="fileInputJSON" accept=".json" onchange="loadFromFile(event)">
     </div>
+  </div>
+
+  <!-- A newer shell has installed and is waiting for a reload (cloud.js).
+       Above the attention strip: on a bad refresh day that strip runs to a
+       dozen chips, and the offer must stay on the first screen. -->
+  <div class="shell-update-bar" id="shellUpdateBar" style="display:none;">
+    <button class="shell-update-chip" onclick="applyShellUpdate()">↻ Update ready — reload</button>
   </div>
 
   <!-- Needs attention (manual prices, failed refreshes, stale calibrations) -->
@@ -272,6 +286,8 @@
         </table>
       </div>
     </div>
+    <div class="subsection-label">Tax rates</div>
+    <div id="taxRates"></div>
   </details>
 
   <!-- Recurring Contributions (P1a — auto-accrue payroll buys between statements) -->
@@ -281,40 +297,16 @@
       Auto-adds units each pay period (estimated at that day's price). Entering real
       statement values any time trues everything up.
     </p>
-    <div style="display:flex;gap:8px;align-items:center;margin:6px 0 2px;">
-      <input id="crNlText" type="text" style="flex:1;"
-             placeholder='Describe it: "biweekly $500 transfer to VOO and VGIT at 70/30"'
-             onkeydown="if(event.key==='Enter')parseNlContribution()">
-      <button class="btn btn-ghost btn-sm" onclick="parseNlContribution()" style="height:34px;">Parse</button>
-    </div>
-    <div id="crNlPreview" style="min-height:20px;margin-bottom:4px;"></div>
     <div id="contribList"></div>
     <div id="contribForm"></div>
   </details>
 
-  <!-- Advisor — external context + policy drift, then where new money goes -->
+  <!-- Advisor — policy drift, market context, what moved your money. Next
+       money, Full Rebalance and asset location left the card 2026-10-03: Ask
+       runs the same engines on every question. -->
   <div class="card" id="advisorCard" style="display:none;">
     <h2>Advisor</h2>
     <div id="advContext"></div>
-    <details class="adv-next"><summary class="subsection-label">Next money — where would $X go?</summary>
-    <div class="advisor-form">
-      <div class="form-group">
-        <label for="advAmount">Amount to invest</label>
-        <input type="number" id="advAmount" min="0" step="100" placeholder="e.g. 1000">
-      </div>
-      <div class="form-group">
-        <label for="advAccount">Account (optional)</label>
-        <select id="advAccount"></select>
-      </div>
-      <div class="adv-actions">
-        <button class="btn btn-primary" onclick="computeAdvisorRec()" title="Where should new money go? Buys only.">Get Recommendation</button>
-        <button class="btn btn-ghost" onclick="runFullRebalance()" title="Full rebalance to targets — includes sells (tax warnings shown).">Full Rebalance</button>
-      </div>
-    </div>
-    <div id="advResult">
-      <p class="adv-placeholder">Enter an amount to see where to invest next.</p>
-    </div>
-    </details>
   </div>
 
   <!-- Dividend Income (P3 — T12M projection) -->
@@ -342,6 +334,8 @@
       <div style="flex:0 0 90px;"><label style="font-size:12px;">Real return %</label><input id="fireMu" type="number" step="0.1" oninput="this.dataset.touched=1"></div>
       <div style="flex:0 0 90px;"><label style="font-size:12px;">Volatility %</label><input id="fireSigma" type="number" step="0.1" oninput="this.dataset.touched=1"></div>
       <button class="btn btn-primary btn-sm" onclick="runFireSim()" style="height:34px;">Simulate</button>
+      <button class="btn btn-ghost btn-sm" onclick="saveFireSpend()" style="height:34px;"
+              title="Keep this spending as your FI target; Ask answers from it">Save as my FI spend</button>
     </div>
     <div id="fireResult"></div>
   </details>
@@ -353,7 +347,11 @@
     <div class="perf-legend">
       <div class="perf-legend-item"><div class="perf-legend-dot" style="background:#0d9488;"></div>Portfolio</div>
       <div class="perf-legend-item"><div class="perf-legend-dot" style="background:#a1a1aa;"></div>SPY</div>
+      <!-- Shown by loadPolicyBenchmark once the line is drawn: it is the
+           card's third line, and the only one that was unnamed. -->
+      <div class="perf-legend-item" id="perfLegendPolicy" style="display:none;"><div class="perf-legend-dot" style="background:#3b6da0;"></div>Policy (your targets)</div>
     </div>
+    <p class="perf-note" id="perfNote"></p>
   </div>
 
 </div>
@@ -404,6 +402,13 @@
   </div>
 </div>
 
+<!-- Undo after deleting a holding: its own element, so a sync toast can't wipe the button -->
+<div class="toast toast-undo" id="undoToast" role="status" aria-live="polite" aria-atomic="true">
+  <span class="sr-only">Deleted </span>
+  <span class="toast-undo-msg" id="undoToastMsg"></span>
+  <span class="toast-undo-val" id="undoToastVal"></span>
+  <button type="button" class="toast-action" onclick="undoDelete()">Undo</button>
+</div>
 <div class="toast" id="toast"></div>
 <script src="cloud.js"></script>
 <script src="app.js"></script>

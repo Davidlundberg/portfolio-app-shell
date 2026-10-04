@@ -38,11 +38,18 @@ const PROXY_RECAL_NUDGE_DAYS = 90;
 // Keys are partial name matches; avanzaId is from avanza.se fund pages.
 // splitByCountry: true → on refresh, automatically rebalance the quantity split
 //   between the us_stock and intl_stock holdings of this fund using Avanza's country data.
+// assetsInSek: true → the fund HOLDS Swedish-krona assets, so its dollar value
+//   moves one-for-one with the krona. Priced in SEK is not the same thing: the
+//   global index fund holds mostly dollar and euro stocks, so a weaker krona
+//   lifts its SEK NAV and leaves its dollar value roughly where it was. Counting
+//   the whole pension put a krona fall at about ten times what the short-bond
+//   fund alone carries (2026-10-03 audit, eval Q06). Mark any new Swedish-asset
+//   fund here.
 const AVANZA_FUND_IDS = {
   'LF Global Index':                    { id: '417655', splitByCountry: true },
   'Länsförsäkringar Global Index':      { id: '417655', splitByCountry: true },
-  'Länsförsäkringar Kort räntefond':    { id: '2084' },
-  'LF Short bond':                      { id: '2084' },
+  'Länsförsäkringar Kort räntefond':    { id: '2084', assetsInSek: true },
+  'LF Short bond':                      { id: '2084', assetsInSek: true },
 };
 
 // Sleeve configuration
@@ -252,8 +259,43 @@ async function autoSaveToServer() {
   if (cloudReady()) cloudPushState().catch(() => {});
 }
 
+// Persist what a price fetch wrote: prices, plus the side effects a fetch
+// carries (SEK NAV/FX stamps, the LF Global country split, a seeded CIT
+// calibration). None of that is an edit, so none of it marks the document.
+//
+// Until 2026-10-03 every refresh went through markUnsaved(). That stamped the
+// device dirty "now", so an open Mac's 15-minute refresh was always the newest
+// change, and when the phone had saved in between, last-write-wins pushed the
+// Mac's stale copy over the phone's edit (audit, platform: replaying
+// syncDecision for "phone edit 10:00, Mac synced 09:00, Mac refresh 10:15"
+// gave 'push'). It also pushed twice — once here directly and once from
+// markUnsaved's own 1s timer — so 9 of 29 cloud versions differed only in
+// lastSaved and the 30-version safety net covered under 4 hours.
+//
+// Now a refresh writes only where it is free to: this browser and, on the
+// Mac, data/portfolio.json (Claude and the MCP read it), keeping lastSaved —
+// a price is not a save. The cloud copy's prices age until the next real
+// edit, which is fine: every reader re-prices (the other device on open, the
+// nightly snapshot from closes).
+async function persistMarketData() {
+  // A real edit that never reached its store (offline, server.py down, a
+  // failed push) goes now, once, as itself. Its localChangedAt is the edit's,
+  // not this refresh's, so arbitration still dates it honestly.
+  if (unsaved || (cloudReady() && syncMeta().localDirty)) {
+    clearTimeout(autosaveTimer);   // or its debounce would push it a second time
+    await autoSaveToServer();
+    return;
+  }
+  saveLocal();
+  await writeDiskMirror();         // no-op in shell mode
+  render();
+  saveHistorySnapshot();
+}
+
 async function saveHistorySnapshot() {
-  const today = new Date().toISOString().slice(0, 10);
+  // New York date, like the server's nightly row (index.ts nyDate). On UTC an
+  // evening save after 8pm ET wrote tomorrow's row (audit 2026-10-03).
+  const today = nyToday();
   const value = total();
   if (!value) return;
   const spyPrice = await fetchYahoo('SPY').catch(() => null);
@@ -286,11 +328,16 @@ async function loadHistory() {
 }
 
 // ─── True performance math (P1b) ─────────────────────────────────────────────
-// External flows are only known from the ledger epoch (when P1a started
-// recording them) — so true TWR/MWR is computed over snapshots from that date
-// forward. The old since-inception figure stays, honestly labeled: it's a
-// value change that includes contributions, not a return.
-const LEDGER_EPOCH = '2026-06-11';
+// Returns are only computed over snapshots from the ledger epoch forward.
+// 2026-08-01, not the ledger's first row (06-11): the first two snapshots
+// (07-30, 07-31) priced Brokerage + Roth only, and the 401K and pension
+// (two whole accounts) arrived on 08-01 with no money-in row — so a chain
+// from 06-11 read that arrival as a one-day market gain and put an absurd TWR
+// and a four-digit annualised MWR under the total (audit 2026-10-03; the
+// figures are in the private plan's evidence/audit-map.json). 08-01 is the
+// first complete snapshot. Labels quote the first snapshot actually used,
+// never this string.
+const LEDGER_EPOCH = '2026-08-01';
 
 // + = money into the portfolio (contributions and manual statement true-ups).
 // 'dividend' rows are deliberately NOT flows: a reinvested distribution is
@@ -310,21 +357,81 @@ function recordedIncome(txns) {
     .reduce((s, t) => s + (+t.amount || 0), 0);
 }
 
-// Time-weighted return over [first..last] snapshot, end-of-period flow
-// convention: each period's return = (V1 − flows in (d0,d1]) / V0. Returns a
-// decimal (0.2 = +20%) or null when not computable.
-function computeTWR(snapshots, flows) {
+// Time-weighted growth index over [first..last] snapshot, end-of-period flow
+// convention: each period's growth = (V1 − flows in (d0,d1]) / V0. `exclude`
+// lists period END dates to leave out (growth 1 — see performanceHealth).
+// Returns [1, …] one level per snapshot, or null when not computable. The
+// Performance chart draws this; computeTWR is its last level.
+function twrIndex(snapshots, flows, exclude) {
   if (!snapshots || snapshots.length < 2) return null;
-  let twr = 1;
+  const skip = new Set(exclude || []);
+  const out = [1];
   for (let i = 1; i < snapshots.length; i++) {
     const s0 = snapshots[i - 1], s1 = snapshots[i];
     if (!(s0.value > 0)) return null;
     const F = (flows || [])
       .filter(f => f.date > s0.date && f.date <= s1.date)
       .reduce((s, f) => s + f.amount, 0);
-    twr *= (s1.value - F) / s0.value;
+    out.push(out[i - 1] * (skip.has(s1.date) ? 1 : (s1.value - F) / s0.value));
   }
-  return twr - 1;
+  return out;
+}
+
+// Time-weighted return: a decimal (0.2 = +20%) or null when not computable.
+function computeTWR(snapshots, flows, exclude) {
+  const idx = twrIndex(snapshots, flows, exclude);
+  return idx ? idx[idx.length - 1] - 1 : null;
+}
+
+// ─── Discontinuity guard ─────────────────────────────────────────────────────
+// A snapshot step the ledger cannot explain is a hole in the record, not a
+// return. Two shapes, both seen in David's data (audit 2026-10-03):
+//  - unexplained move: value net of booked flows moved more than 10% of the
+//    period's opening value while the S&P moved less than ±3% (or is unknown).
+//    2026-08-01: a large rise against a small fraction of it in rows, S&P
+//    flat — the 401K and pension arriving.
+//  - flows exceed the change: booked flows more than twice the value change
+//    AND more than 2% of value. 2026-09-13: about four times the day's value
+//    change booked as money in — a pension statement total booked as new
+//    units while the lot it replaced was deleted with no row.
+// Pure. Flagged periods are left out of every TWR chain (computeTWR's
+// `exclude`), MWR is withheld across them, and the Ask brief names them in
+// performance.caveats. measurableFrom is the snapshot that closes the last
+// flagged period: a chain starting there crosses none. mcp/portfolio-lib.js
+// carries a second copy of this function — change both (parity test in
+// tests/performance.spec.js).
+const GUARD_MOVE_PCT = 0.10, GUARD_SPY_CALM_PCT = 0.03, GUARD_FLOW_MULTIPLE = 2, GUARD_FLOW_MIN_PCT = 0.02;
+
+function performanceHealth(snapshots, flows) {
+  const snaps = snapshots || [];
+  const usd = n => '$' + Math.round(Math.abs(n)).toLocaleString('en-US');
+  const pct = n => (n < 0 ? '−' : '+') + Math.abs(n * 100).toFixed(1) + '%';
+  const flags = [];
+  for (let i = 1; i < snaps.length; i++) {
+    const s0 = snaps[i - 1], s1 = snaps[i];
+    if (!(s0.value > 0)) continue;
+    const F = (flows || [])
+      .filter(f => f.date > s0.date && f.date <= s1.date)
+      .reduce((s, f) => s + f.amount, 0);
+    const change = s1.value - s0.value, net = change - F;
+    const spy = s0.spyPrice > 0 && s1.spyPrice > 0 ? s1.spyPrice / s0.spyPrice - 1 : null;
+    if (Math.abs(net) > GUARD_MOVE_PCT * s0.value && (spy == null || Math.abs(spy) < GUARD_SPY_CALM_PCT)) {
+      flags.push({ date: s1.date, cause: `value ${net > 0 ? 'rose' : 'fell'} ${usd(net)} (${pct(net / s0.value)}) ` +
+        (F ? `beyond the ${usd(F)} booked as money ${F < 0 ? 'out' : 'in'}` : 'with no money booked in or out') +
+        `, while the S&P moved ${spy == null ? 'an unknown amount' : pct(spy)} — likely holdings ` +
+        `${net > 0 ? 'added' : 'removed'} without a ledger row, not a return` });
+    } else if (Math.abs(F) > GUARD_FLOW_MULTIPLE * Math.abs(change) && Math.abs(F) > GUARD_FLOW_MIN_PCT * s0.value) {
+      flags.push({ date: s1.date, cause: `${usd(F)} booked as money ${F > 0 ? 'in' : 'out'} against a ` +
+        `${change < 0 ? '−' : '+'}${usd(change)} value change — likely a statement true-up or a lot moved ` +
+        `between holdings, not new money` });
+    }
+  }
+  return { flags, measurableFrom: flags.length ? flags[flags.length - 1].date : (snaps[0]?.date ?? null) };
+}
+
+// Flag dates inside the span (from, to] — the periods a chain over it crosses.
+function flagsWithin(health, from, to) {
+  return (health?.flags || []).filter(f => f.date > from && f.date <= to).map(f => f.date);
 }
 
 // Money-weighted return: annualized IRR of investor cash flows (−V0 at start,
@@ -419,8 +526,10 @@ function samplePolicyAt(series, dates) {
   });
 }
 
-// Annualized MWR is statistical noise on short spans — suppress under 30 days.
-const MWR_MIN_SPAN_DAYS = 30;
+// An annualised MWR is noise until the span is a year: at 30 days (the old
+// floor) a two-month return of about two percent displayed as six times that
+// per year (audit 2026-10-03).
+const MWR_MIN_SPAN_DAYS = 365;
 
 function spanDays(snapshots) {
   if (!snapshots || snapshots.length < 2) return 0;
@@ -430,49 +539,50 @@ function spanDays(snapshots) {
 function renderPerformanceChart() {
   const card = document.getElementById('perfCard');
   const snapshots = historyData?.snapshots ?? [];
-  if (snapshots.length < 2) { card.style.display = 'none'; return; }
+  // The chart starts at the ledger epoch: before it the record is incomplete,
+  // and drawing 07-31 → 08-01 showed the 401K and pension arriving as a gain.
+  const post = snapshots.filter(s => s.date >= LEDGER_EPOCH);
+  const flows = externalFlows(transactions);
+  // Guard over the WHOLE history, as the Ask brief runs it, so both name the
+  // same periods; only the ones inside the drawn span are left out here.
+  const health = performanceHealth(snapshots, flows);
+  const excluded = post.length >= 2 ? flagsWithin(health, post[0].date, post[post.length - 1].date) : [];
+  const idx = twrIndex(post, flows, excluded);
+  if (!idx) { card.style.display = 'none'; return; }
   card.style.display = '';
 
-  // Normalize both series to 100 at inception
-  const base      = snapshots[0].value;
-  const baseSpy   = snapshots[0].spyPrice ?? null;
-  const labels    = snapshots.map(s => s.date);
-  const portSerie = snapshots.map(s => +((s.value / base * 100).toFixed(2)));
+  // Portfolio is the flow-adjusted growth of 100 — the same chain as Ask's
+  // since-epoch figure, so the line ends where Ask's answer does. A raw value
+  // line counted money paid in as gain. SPY is price only, rebased alike.
+  const baseSpy   = post[0].spyPrice ?? null;
+  const labels    = post.map(s => s.date);
+  const portSerie = idx.map(x => +((x * 100).toFixed(2)));
   const spySerie  = baseSpy
-    ? snapshots.map(s => s.spyPrice != null ? +((s.spyPrice / baseSpy * 100).toFixed(2)) : null)
+    ? post.map(s => s.spyPrice != null ? +((s.spyPrice / baseSpy * 100).toFixed(2)) : null)
     : null;
+  const left = new Set(excluded);
+  const isLeft = i => left.has(labels[i]);
 
-  // Header: honest value change (includes contributions — NOT a return)
-  const latest = snapshots[snapshots.length - 1];
-  const valueChange = ((latest.value / base - 1) * 100);
-  const twrEl = document.getElementById('sinceInceptionReturn');
-  if (twrEl) {
-    const sign = valueChange >= 0 ? '+' : '';
-    twrEl.textContent = `Value change since inception: ${sign}${valueChange.toFixed(1)}% (incl. contributions)`;
-    twrEl.className = 'total-updated ' + (valueChange >= 0 ? 'return-positive' : 'return-negative');
-  }
-
-  // True TWR + MWR from the ledger epoch (flows known from there on)
-  const postEpoch = snapshots.filter(s => s.date >= LEDGER_EPOCH);
-  const flows = externalFlows(transactions);
-  const twr = computeTWR(postEpoch, flows);
-  const mwr = spanDays(postEpoch) >= MWR_MIN_SPAN_DAYS ? computeMWR(postEpoch, flows) : null;
-  const trueEl = document.getElementById('trueTwrLabel');
-  if (trueEl) {
-    if (twr !== null) {
-      const ts = twr >= 0 ? '+' : '';
-      const mwrTxt = mwr !== null ? ` · MWR ${(mwr >= 0 ? '+' : '')}${(mwr * 100).toFixed(1)}%/yr` : '';
-      const inc = recordedIncome(transactions);
-      const incTxt = inc > 0 ? ` · income ${fmt$(inc)}` : '';
-      trueEl.textContent = `TWR since ${LEDGER_EPOCH}: ${ts}${(twr * 100).toFixed(2)}%${mwrTxt}${incTxt}`;
-      trueEl.className = 'total-updated ' + (twr >= 0 ? 'return-positive' : 'return-negative');
-    } else {
-      trueEl.textContent = '';
-    }
+  const shortDay = d => new Date(d + 'T00:00:00Z')
+    .toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  // The note names a left-out day and why in words, no figures: it sits on the
+  // default screen and the card cannot be closed, so the bookkeeping dollars
+  // and the diagnosis stay in performance.caveats for Ask and the MCP, which
+  // answer when asked (Drop 1 review, 2026-10-03 — quiet by default).
+  const note = document.getElementById('perfNote');
+  if (note) {
+    const days = excluded.map(shortDay);
+    note.textContent = `Portfolio is net of money paid in, since ${shortDay(post[0].date)}.` + (days.length
+      ? ` ${new Intl.ListFormat('en-US').format(days)} ${days.length > 1 ? 'are' : 'is'} left out: ` +
+        `the record there can't separate money paid in from the market's move.`
+      : '');
   }
 
   const canvas = document.getElementById('perfChart');
   if (perfChartInst) { perfChartInst.destroy(); perfChartInst = null; }
+  // A fresh chart has no policy line until loadPolicyBenchmark adds it.
+  const policyLegend = document.getElementById('perfLegendPolicy');
+  if (policyLegend) policyLegend.style.display = 'none';
 
   const datasets = [{
     label: 'Portfolio',
@@ -481,7 +591,10 @@ function renderPerformanceChart() {
     backgroundColor: 'rgba(13,148,136,0.08)',
     fill: true,
     tension: 0.3,
-    pointRadius: 3,
+    // A left-out period ends on an amber point (the stale-badge amber).
+    pointRadius: labels.map((_, i) => isLeft(i) ? 5 : 3),
+    pointBackgroundColor: labels.map((_, i) => isLeft(i) ? '#f59e0b' : '#0d9488'),
+    pointBorderColor: labels.map((_, i) => isLeft(i) ? '#f59e0b' : '#0d9488'),
     pointHoverRadius: 5,
   }];
   if (spySerie) datasets.push({
@@ -513,6 +626,7 @@ function renderPerformanceChart() {
               const sign = ret >= 0 ? '+' : '';
               return `${ctx.dataset.label}: ${sign}${ret}%`;
             },
+            footer: items => items.some(it => isLeft(it.dataIndex)) ? 'Left out of the return — see below' : '',
           },
         },
       },
@@ -522,7 +636,12 @@ function renderPerformanceChart() {
           ticks: {
             font: { size: 11 },
             color: themeTickColor(),
-            callback: v => `${v >= 100 ? '+' : ''}${(v - 100).toFixed(0)}%`,
+            // Half-point steps once the line is a return (a few %), not the
+            // old triple-digit value line: whole-number labels read "+4%, +4%, +3%…".
+            callback: (v, i, ticks) => {
+              const step = ticks.length > 1 ? Math.abs(ticks[1].value - ticks[0].value) : 1;
+              return `${v >= 100 ? '+' : ''}${(v - 100).toFixed(step < 1 ? 1 : 0)}%`;
+            },
           },
           grid: { color: themeGridColor() },
         },
@@ -531,12 +650,13 @@ function renderPerformanceChart() {
   });
 
   perfChartGen++;
-  loadPolicyBenchmark(snapshots, postEpoch, twr, perfChartGen);
+  loadPolicyBenchmark(post, perfChartGen);
 }
 
 // Fetch VTI/VXUS/BND total-return series, blend by targets, and add the policy
-// line + "vs policy" delta once ready. Failures skip silently — the chart is
-// complete without it. Cached per range+weights for the session.
+// line once ready. Failures skip silently — the chart is complete without it.
+// Cached per range+weights for the session (the Ask brief reads the cache for
+// its own "vs policy" figure; the header line that used to carry it is gone).
 let policyCache = null;
 let perfChartGen = 0;
 
@@ -549,7 +669,7 @@ function policyRangeFor(firstDate) {
   return '5y';
 }
 
-async function loadPolicyBenchmark(snapshots, postEpoch, twr, gen) {
+async function loadPolicyBenchmark(snapshots, gen) {
   const weights = policyWeights(targets);
   if (!weights || snapshots.length < 2) return;
   const range = policyRangeFor(snapshots[0].date);
@@ -584,19 +704,10 @@ async function loadPolicyBenchmark(snapshots, postEpoch, twr, gen) {
     pointHoverRadius: 4,
   });
   perfChartInst.update();
-
-  // "Did my implementation beat my policy?" over the post-epoch TWR window.
-  if (twr !== null && postEpoch.length >= 2) {
-    const [p0, p1] = samplePolicyAt(policyCache.series,
-      [postEpoch[0].date, postEpoch[postEpoch.length - 1].date]);
-    if (p0 != null && p1 != null && p0 > 0) {
-      const delta = twr - (p1 / p0 - 1);
-      const el = document.getElementById('trueTwrLabel');
-      if (el && el.textContent && !el.textContent.includes('vs policy')) {
-        el.textContent += ` · vs policy ${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(2)}%`;
-      }
-    }
-  }
+  // Named in the legend: on the return's few-percent scale this dashed line is
+  // the card's second most prominent, and it was the only unnamed one.
+  const policyLegend = document.getElementById('perfLegendPolicy');
+  if (policyLegend) policyLegend.style.display = '';
 }
 
 function toast(msg, ms = 2800) {
@@ -660,16 +771,6 @@ function getAccountTotals() {
   for (const h of holdings) {
     const acct = h.account || 'Unassigned';
     accts[acct] = (accts[acct] || 0) + h.quantity * h.price;
-  }
-  return accts;
-}
-
-function getUniqueAccounts() {
-  const seen = new Set();
-  const accts = [];
-  for (const h of holdings) {
-    const acct = h.account || 'Unassigned';
-    if (!seen.has(acct)) { seen.add(acct); accts.push(acct); }
   }
   return accts;
 }
@@ -1213,7 +1314,7 @@ function applyQuantityUpdate(ids, newTotalQty, { price = null, source = 'manual'
     if (qtyDelta === 0 && newPrice === h.price) return;
     if (qtyDelta !== 0) {
       transactions.push({
-        id: uid(), date: now.slice(0, 10), kind,
+        id: uid(), date: nyToday(), kind,
         holdingId: h.id, holdingName: h.name, units: qtyDelta,
         unitPrice: newPrice, amount: +(qtyDelta * newPrice).toFixed(2), source,
       });
@@ -1308,11 +1409,63 @@ function addHolding() {
 }
 
 // ─── Delete ───────────────────────────────────────────────────────────────────
+// ✕ deleted a position in one tap, with no confirm and no undo: the audit
+// removed a large position that way and autosave pushed the loss a second
+// later (2026-10-03). It now asks first, naming the value, and
+// keeps the holding for UNDO_DELETE_MS. Undo puts the same object back at the
+// same index. Delete writes no ledger row, so the ledger is untouched either way.
+const UNDO_DELETE_MS = 10000;
+let pendingUndo = null; // { holding, index, timer }
+
 function deleteHolding(id) {
-  const h = holdings.find(x => x.id === id);
-  holdings = holdings.filter(x => x.id !== id);
+  const index = holdings.findIndex(x => x.id === id);
+  if (index < 0) return;
+  const h = holdings[index];
+  const where = h.account ? ` (${h.account})` : '';
+  if (!confirm(`Delete ${h.name}${where}, worth ${fmt$(h.quantity * h.price)}?\n\n` +
+               `You can undo this for 10 seconds.`)) return;
+  holdings.splice(index, 1);
+  if (editingId === id) editingId = null;
+  if (quickPriceId === id) quickPriceId = null;
+  if (splittingId === id) splittingId = null;
   markUnsaved(); render();
-  if (h) toast(`Removed ${h.name}`);
+  offerUndo(h, index);
+}
+
+// Which holding, in the fewest characters that still tell two lots apart:
+// two lots of one fund in different accounts share a name, and at 390 a long
+// fund name after "Removed" truncated to its first few letters, so only the
+// value told them apart.
+function undoLabel(h) {
+  return `${hasRealTicker(h) ? h.ticker.toUpperCase() : h.name}${h.account ? ` (${h.account})` : ''}`;
+}
+
+function offerUndo(holding, index) {
+  if (pendingUndo) clearTimeout(pendingUndo.timer); // a second delete replaces the first's undo
+  pendingUndo = { holding, index, timer: setTimeout(closeUndo, UNDO_DELETE_MS) };
+  // Name and value apart, so a long name truncates and the value never does.
+  // No "Removed" in front: he has just confirmed the delete, Undo says the
+  // rest, and the word cost the account its room ("Removed VOO (Bro…" at 390).
+  document.getElementById('undoToastMsg').textContent = undoLabel(holding);
+  document.getElementById('undoToastVal').textContent = `· ${fmt$(holding.quantity * holding.price)}`;
+  document.getElementById('undoToast').classList.add('show');
+}
+
+function closeUndo() {
+  if (pendingUndo) clearTimeout(pendingUndo.timer);
+  pendingUndo = null;
+  document.getElementById('undoToast').classList.remove('show');
+}
+
+function undoDelete() {
+  const u = pendingUndo;
+  closeUndo();
+  if (!u) return;
+  // A cloud pull inside the window may already have brought it back.
+  if (holdings.some(x => x.id === u.holding.id)) return;
+  holdings.splice(Math.min(u.index, holdings.length), 0, u.holding);
+  markUnsaved(); render();
+  toast(`Restored ${undoLabel(u.holding)}`);
 }
 
 // ─── Inline edit ──────────────────────────────────────────────────────────────
@@ -1344,7 +1497,7 @@ function saveEdit(id) {
     // record it so estimated auto-contributions reconcile against reality.
     if (qtyDelta !== 0) {
       transactions.push({
-        id: uid(), date: new Date().toISOString().slice(0, 10), kind: 'adjustment',
+        id: uid(), date: nyToday(), kind: 'adjustment',
         holdingId: h.id, holdingName: h.name, units: +qtyDelta.toFixed(6),
         unitPrice: price, amount: +(qtyDelta * price).toFixed(2), source: 'manual',
       });
@@ -1543,7 +1696,10 @@ function renderRiskCard() {
   }
 
   if (sek) {
-    html += `<div class="subsection-label">Swedish pension — fund vs krona (${esc(sek.from)} → ${esc(sek.to)})</div>
+    // Named for the one fund it decomposes. "Swedish pension" claimed the whole
+    // pension for LF Global's split, and its net move overstated the whole
+    // pension's once the short-bond fund is weighed in (2026-10-03 audit).
+    html += `<div class="subsection-label">${esc(sek.name)} — fund vs krona (${esc(sek.from)} → ${esc(sek.to)})</div>
       <p class="risk-line">
         Fund ${pctFmt(sek.local, true)} in SEK · krona ${pctFmt(sek.fx, true)} vs USD
         → net <strong>${pctFmt(sek.net, true)}</strong> in USD
@@ -1593,7 +1749,7 @@ function renderLastLookChip() {
 function noteLook() {
   if (!holdings.length || !(total() > 0)) return;
   localStorage.setItem(LAST_LOOK_KEY, JSON.stringify({
-    ts: Date.now(), date: new Date().toISOString().slice(0, 10), value: total(),
+    ts: Date.now(), date: nyToday(), value: total(),
   }));
 }
 document.addEventListener('visibilitychange', () => { if (document.hidden) noteLook(); });
@@ -1607,6 +1763,8 @@ window.addEventListener('pagehide', noteLook);
 let updAccount = null;
 
 const matchesAvanza = h => Object.keys(AVANZA_FUND_IDS).some(k => (h.name || '').includes(k));
+// Money that moves one-for-one with the krona: see AVANZA_FUND_IDS.assetsInSek.
+const holdsKronaAssets = h => Object.entries(AVANZA_FUND_IDS).some(([k, e]) => e.assetsInSek && (h.name || '').includes(k));
 
 // A holding whose price nothing can fetch — the user maintains it by hand.
 function isManualPrice(h) {
@@ -2115,9 +2273,12 @@ function runFireSim() {
   const sigma = parseFloat(document.getElementById('fireSigma').value) / 100;
   const out = document.getElementById('fireResult');
   if (!(spend > 0)) { out.innerHTML = '<p class="adv-placeholder">Enter your target annual spending.</p>'; return; }
-  // The one FIRE input with no derivable default. Kept with the targets so it
-  // syncs like them — and so Ask can answer "am I on pace?" without the card.
-  if (targets.fireAnnualSpend !== spend) { targets.fireAnnualSpend = spend; markUnsaved(); }
+  // A what-if stays a what-if. Simulate used to write the typed spend back to
+  // targets.fireAnnualSpend, so trying one figure after another silently
+  // changed the number Ask and the MCP read, and pushed it to the cloud (audit
+  // 2026-10-03: five what-ifs in a row left the last one saved). Saving is now
+  // its own button, saveFireSpend.
+  const saved = +targets.fireAnnualSpend > 0 ? +targets.fireAnnualSpend : null;
   const sim = simulateFire({
     start: total(), monthlyContrib: contrib, annualSpend: spend,
     muAnnual: isNaN(mu) ? 0.04 : mu, sigmaAnnual: isNaN(sigma) ? 0.12 : sigma,
@@ -2141,8 +2302,22 @@ function runFireSim() {
       <div class="fire-odds" role="list">${[10, 15, 20, 25, 30].map(y =>
         `<div class="fire-odds-cell" role="listitem" data-years="${y}"><span class="fire-odds-h">${y}y</span><span class="fire-odds-v">${sim.successByYears[y]}%</span></div>`).join('')}</div>`;
   }
-  html += `<div style="font-size:11px;color:var(--text-secondary);margin-top:8px;">${esc(sim.assumptionNote || '')} · today's dollars · a model, not advice</div></div>`;
-  out.innerHTML = html;
+  html += `<div style="font-size:11px;color:var(--text-secondary);margin-top:8px;">${esc(sim.assumptionNote || '')} · today's dollars · a model, not advice</div>`;
+  if (saved !== spend) {
+    html += `<div class="fire-whatif">What-if only · ${saved
+      ? `your saved FI spend is ${fmt$(saved)}` : 'no FI spend saved yet'}</div>`;
+  }
+  out.innerHTML = html + `</div>`;
+}
+
+// The one FIRE input with no derivable default. Kept with the targets so it
+// syncs like them, and so Ask can answer "am I on pace?" without the card.
+function saveFireSpend() {
+  const spend = parseFloat(document.getElementById('fireSpend').value);
+  if (!(spend > 0)) { toast('Enter your target annual spending first.'); return; }
+  if (targets.fireAnnualSpend !== spend) { targets.fireAnnualSpend = spend; markUnsaved(); }
+  runFireSim();
+  toast(`Saved ${fmt$(spend)} as your FI spend`);
 }
 
 function renderFireDefaults() {
@@ -2173,22 +2348,30 @@ function renderDividends() {
     return;
   }
   // All interpolated values esc()-escaped or app-computed.
+  // The header is a real <thead> and every figure carries its column's
+  // data-label, so at phone width the shared stacked-table layout (style.css,
+  // ≤640px) hides the header and labels each line. A bare header <tr> landed
+  // in <tbody>, which the layout cannot hide: its five headings held the
+  // table at 461px inside a 308px card, and every figure sat off to the right
+  // of an inner scroller with no cue that it was there (Drop 1 review, round 2).
+  // Rules use the theme tokens: --border was never defined, so the #eee
+  // fallback drew bright white lines in dark mode, full width once stacked.
   let html = `<table style="width:100%;font-size:13px;border-collapse:collapse;margin-top:6px;">
-    <tr style="text-align:left;color:var(--text-secondary);"><th style="padding:4px 6px;">Holding</th><th style="text-align:right;">$/share (T12M)</th><th style="text-align:right;">Est. annual</th><th style="text-align:right;">Yield</th><th style="padding-left:10px;">Pays</th></tr>`;
+    <thead><tr style="text-align:left;color:var(--text-secondary);"><th style="padding:4px 6px;">Holding</th><th style="text-align:right;">$/share (T12M)</th><th style="text-align:right;">Est. annual</th><th style="text-align:right;">Yield</th><th class="div-pays">Pays</th></tr></thead><tbody>`;
   for (const r of inc.rows) {
-    html += `<tr style="border-top:1px solid var(--border,#eee);">
+    html += `<tr style="border-top:1px solid var(--border-subtle);">
       <td style="padding:4px 6px;">${esc(r.ticker)} <span style="color:var(--text-secondary);font-size:12px;">${esc(r.account)}</span></td>
-      <td style="text-align:right;">${fmt$(r.perShare)}</td>
-      <td style="text-align:right;font-weight:600;">${fmt$(r.annualIncome)}</td>
-      <td style="text-align:right;">${r.yieldPct === null ? '—' : r.yieldPct.toFixed(2) + '%'}</td>
-      <td style="font-size:12px;color:var(--text-secondary);padding-left:10px;">${esc(r.months.join(', '))}</td>
+      <td data-label="$/share (T12M)" style="text-align:right;">${fmt$(r.perShare)}</td>
+      <td data-label="Est. annual" style="text-align:right;font-weight:600;">${fmt$(r.annualIncome)}</td>
+      <td data-label="Yield" style="text-align:right;">${r.yieldPct === null ? '—' : r.yieldPct.toFixed(2) + '%'}</td>
+      <td data-label="Pays" class="div-pays" style="font-size:12px;color:var(--text-secondary);">${esc(r.months.join(', '))}</td>
     </tr>`;
   }
-  html += `<tr style="border-top:2px solid var(--border,#ddd);font-weight:700;">
+  html += `<tr style="border-top:2px solid var(--border-default);font-weight:700;">
     <td style="padding:6px;">Total</td><td></td>
-    <td style="text-align:right;">${fmt$(inc.totalAnnual)}/yr</td>
-    <td colspan="2" style="font-size:12px;color:var(--text-secondary);padding-left:10px;">≈ ${fmt$(inc.monthlyAvg)}/month</td>
-  </tr></table>`;
+    <td data-label="Est. annual" style="text-align:right;">${fmt$(inc.totalAnnual)}/yr</td>
+    <td data-label="Monthly" colspan="2" class="div-pays" style="font-size:12px;color:var(--text-secondary);">≈ ${fmt$(inc.monthlyAvg)}/month</td>
+  </tr></tbody></table>`;
   if (inc.accumulatingExcluded > 0) {
     html += `<p style="font-size:12px;color:var(--text-secondary);margin:8px 0 0;">${inc.accumulatingExcluded} accumulating holding${inc.accumulatingExcluded === 1 ? '' : 's'} excluded (401K CITs / pension funds reinvest dividends inside the NAV — no cash distributions).</p>`;
   }
@@ -2299,7 +2482,7 @@ async function fetchAvanza(name) {
         // on every same-named holding, so the pension's USD return can be
         // decomposed into fund-vs-krona once two stamps exist. Same
         // accrue-from-now philosophy as the ledger epoch.
-        const today = new Date().toISOString().slice(0, 10);
+        const today = nyToday();
         for (const h of holdings.filter(x => x.name === name)) {
           if (!Array.isArray(h.fxHistory)) h.fxHistory = [];
           const row = { date: today, nav: fundData.nav, rate: sekToUsd, currency: 'SEK' };
@@ -2356,14 +2539,15 @@ async function refreshHoldingPrice(id) {
        : (fetchFromNavTable(h.name) ?? await fetchAvanza(h.name)));
   if (price !== null) {
     h.price = price; h.updated = new Date().toISOString();
-    markUnsaved(); render();
+    render();
     toast(`${h.name} ${label} → ${fmt$(price)}`);
+    await persistMarketData();   // a fetched price is not an edit — see persistMarketData
   } else {
     toast(`Could not fetch "${displayKey}" — enter ${label} manually.`);
   }
 }
 
-async function refreshAllPrices({ silent = false, autoSave = false } = {}) {
+async function refreshAllPrices({ silent = false } = {}) {
   if (refreshing) return;
   refreshing = true;
 
@@ -2388,27 +2572,33 @@ async function refreshAllPrices({ silent = false, autoSave = false } = {}) {
   let updated = 0, failed = 0;
   const failedTickers = [];
   const failedIds = new Set();
-  for (const h of fetchable) {
-    const hasRealTicker = h.ticker && h.ticker.toUpperCase() !== 'N/A';
-    const lookup = (hasRealTicker ? h.ticker : h.name).toUpperCase();
-    const price  = useAvanza(h) ? await fetchAvanza(h.name)
-                 : proxyEntryFor(h) ? await fetchProxyNav(h)
-                 : matchesNavTable(h) ? fetchFromNavTable(h.name)
+  for (const f of fetchable) {
+    const hasRealTicker = f.ticker && f.ticker.toUpperCase() !== 'N/A';
+    const lookup = (hasRealTicker ? f.ticker : f.name).toUpperCase();
+    const price  = useAvanza(f) ? await fetchAvanza(f.name)
+                 : proxyEntryFor(f) ? await fetchProxyNav(f)
+                 : matchesNavTable(f) ? fetchFromNavTable(f.name)
                  : await fetchYahoo(lookup);
-    if (price !== null) {
+    // Boot runs this refresh and the sign-in sync side by side, so a pull can
+    // replace `holdings` while a fetch is in flight. Land the price on the
+    // holding that is live now; writing it onto the object the loop started
+    // with would strand it, and the pulled copy — whose prices are only as
+    // fresh as the other device's last edit (persistMarketData) — would stay
+    // on screen until the next refresh.
+    const h = holdings.includes(f) ? f : holdings.find(x => f.id != null && x.id === f.id);
+    if (price !== null && h) {
       h.price   = price;
       h.updated = new Date().toISOString();
       updated++;
-    } else {
+    } else if (price === null) {
       failed++;
       failedTickers.push(lookup);
-      failedIds.add(h.id);
+      failedIds.add(f.id);
     }
     btn.textContent = `↻ ${updated + failed}/${fetchable.length}…`;
     render();
   }
 
-  if (updated > 0) markUnsaved();
   btn.disabled = false; btn.textContent = '↻ Refresh All';
 
   lastRefreshFailures = failedIds;
@@ -2423,10 +2613,12 @@ async function refreshAllPrices({ silent = false, autoSave = false } = {}) {
     toast(msg, 5000);
   }
 
-  if (autoSave && updated > 0) {
-    // Silently persist so storage (file locally, cloud row in shell mode)
-    // always has fresh prices. Full payload — never drop the ledger.
-    try { await autoSaveToServer(); } catch (_) { /* offline — no-op */ }
+  // One write, and not a push: prices are market data, not an edit — see
+  // persistMarketData. (This used to be markUnsaved() plus a direct
+  // autoSaveToServer(): two cloud pushes per refresh.) Full payload to disk —
+  // never drop the ledger.
+  if (updated > 0) {
+    try { await persistMarketData(); } catch (_) { /* offline — no-op */ }
   }
 
   refreshing = false;
@@ -2457,7 +2649,7 @@ function exportCSV() {
   ], { type:'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `portfolio_${new Date().toISOString().slice(0,10)}.csv`;
+  a.download = `portfolio_${nyToday()}.csv`;
   a.click();
   toast('CSV exported');
 }
@@ -2541,7 +2733,7 @@ function nextPayDates(rule, throughISO) {
 }
 
 function applyContributionRules() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = nyToday();
   let applied = 0;
   const summary = {};
   for (const rule of contributionRules) {
@@ -2578,14 +2770,30 @@ function addContributionRule() {
     toast('Pick a holding, a positive amount, and a first pay date.');
     return;
   }
-  contributionRules.push({
+  const rule = {
     id: uid(), holdingId: h.id, holdingName: h.name,
     amount, cadence, anchorDate, lastAppliedThrough: null,
-  });
+  };
+  const back = backdatedAccrual(rule);
+  if (back.daysBack > BACKDATE_CONFIRM_DAYS && back.rows > 0 && !confirm(
+    `This rule starts ${anchorDate}, ${back.daysBack} days ago.\n\n` +
+    `Adding it now writes ${back.rows} back-dated contribution${back.rows === 1 ? '' : 's'}, ` +
+    `${fmt$(back.dollars)} in total, into ${h.name}${h.account ? ` (${h.account})` : ''}, ` +
+    `estimated at today's price.\n\nAdd it anyway?`)) {
+    toast('Rule not added');
+    return;
+  }
+  contributionRules.push(rule);
   const appliedNow = applyContributionRules();
   if (appliedNow === 0) markUnsaved();
   render();
-  toast(`Rule added: ${fmt$(amount)} ${CADENCE_LABELS[cadence]} → ${h.name.slice(0, 40)}`);
+  // One toast for the whole add. The accrual's own "Applied N…" toast was
+  // replaced by this one at once, so a back-dated start never said what it
+  // had written (Drop 1 review) — it says it here, as the confirm promised it.
+  const added = `Rule added: ${fmt$(amount)} ${CADENCE_LABELS[cadence]} → ${h.name.slice(0, 40)}`;
+  toast(appliedNow > 0 && back.rows > 0
+    ? `${added} · ${back.rows} back-dated contribution${back.rows === 1 ? '' : 's'} written (${fmt$(back.dollars)})`
+    : added, appliedNow > 0 ? 7000 : undefined);
 }
 
 function deleteContributionRule(id) {
@@ -2593,139 +2801,23 @@ function deleteContributionRule(id) {
   markUnsaved(); render();
 }
 
-// ─── Natural-language contribution rules ─────────────────────────────────────
-// "I have a bi-weekly fidelity transfer of $500 that goes to VOO and VGIT at
-// a 70/30 rate" → two rules ($350 / $150, biweekly). Deterministic parser —
-// this app deliberately has no LLM backend or API key, and the realistic
-// utterance space (amount + cadence + targets + optional split + optional
-// start date) is small. A preview-before-commit catches any misparse.
+// ─── Back-dated rules ────────────────────────────────────────────────────────
+// A start date in the past backfills every pay date since, at today's price,
+// in one tap. The "Describe it" text box that used to sit here read "6/16" as
+// 2001-06-16 (new Date("6/16") in V8), and one Confirm wrote 1,000 rows of
+// phantom units (audit 2026-10-03, cards-plan critical). The box is gone (a
+// rule from words is the chat's job, with its own preview). The date picker
+// cannot misparse, but a mis-tapped year does the same damage, so a start more
+// than BACKDATE_CONFIRM_DAYS back says what it will write, first.
+const BACKDATE_CONFIRM_DAYS = 60;
 
-// Pure. Returns { rules: [{holdingId, holdingName, account, amount}],
-// cadence, anchorDate, summary } or { error }.
-function parseContributionText(text, holdingsArr) {
-  const t = String(text || '').trim();
-  if (!t) return { error: 'Type something like "$500 biweekly to VOO and VGIT 70/30".' };
-  const lower = t.toLowerCase();
-
-  // Cadence
-  let cadence = null;
-  if (/bi-?weekly|every (2|two) weeks|every other week|fortnight|per paycheck|each paycheck|every paycheck/.test(lower)) cadence = 'biweekly';
-  else if (/semi-?monthly|1st (and|&) 15th|first (and|&) fifteenth|twice a month/.test(lower)) cadence = 'semimonthly';
-  else if (/monthly|every month|per month|a month|each month/.test(lower)) cadence = 'monthly';
-  if (!cadence) return { error: 'Couldn\'t find a cadence — say "biweekly", "monthly", or "1st and 15th".' };
-
-  // Work on a copy with any "starting <date>" clause removed, so dates like
-  // "starting 7/1" can't be mistaken for a split ratio or an amount.
-  const startMatch = t.match(/starting (?:on )?([A-Za-z0-9 ,/-]+?)(?:\.|,|$)/i);
-  const tBody = startMatch ? t.replace(startMatch[0], ' ') : t;
-
-  // Total amount: prefer a $-prefixed number; fall back to a bare number.
-  // Ratio pairs are stripped first and trailing \b excludes ordinals (15th).
-  const ratioStripped = tBody.replace(/(\d+(?:\.\d+)?)\s*%?\s*[/\-]\s*(\d+(?:\.\d+)?)\s*%?(?:\s*[/\-]\s*(\d+(?:\.\d+)?)\s*%?)?/g, ' ');
-  const amtMatch = ratioStripped.match(/\$\s?(\d[\d,]*(?:\.\d+)?)\s*(k)?\b/i)
-                || ratioStripped.match(/\b(\d[\d,]*(?:\.\d+)?)\s*(k)?\b/i);
-  const amount = amtMatch ? parseFloat(amtMatch[1].replace(/,/g, '')) * (amtMatch[2] ? 1000 : 1) : NaN;
-  if (!(amount > 0)) return { error: 'Couldn\'t find the dollar amount — include something like "$500".' };
-
-  // Targets: tickers first (word-boundary match against held tickers), then
-  // holding-name substrings (≥4 chars) for fundy names. Ambiguous tickers
-  // (same ticker in two accounts) resolve to the larger position — the
-  // preview shows the account so a wrong guess is visible before commit.
-  const targets = [];
-  const seen = new Set(); // ticker AND name keys — the same instrument held in
-                          // two accounts must resolve to ONE target (largest)
-  const byValue = [...holdingsArr].sort((a, b) => b.quantity * b.price - a.quantity * a.price);
-  for (const h of byValue) {
-    const tick = (h.ticker || '').toUpperCase();
-    const tickKey = tick && tick !== 'N/A' ? `t:${tick}` : null;
-    const nameKey = `n:${(h.name || '').toLowerCase()}`;
-    if (seen.has(nameKey) || (tickKey && seen.has(tickKey))) continue;
-    if (tickKey && new RegExp(`\\b${tick}\\b`, 'i').test(t)) {
-      seen.add(tickKey); seen.add(nameKey);
-      targets.push(h);
-      continue;
-    }
-    const nameWords = (h.name || '').toLowerCase().split(/\s+/).filter(w => w.length >= 4);
-    if (nameWords.length && nameWords.every(w => lower.includes(w))) {
-      seen.add(nameKey); if (tickKey) seen.add(tickKey);
-      targets.push(h);
-    }
-  }
-  if (!targets.length) return { error: 'Couldn\'t match a holding — mention a ticker (VOO) or the fund\'s name as it appears in the table.' };
-
-  // Split ratio: "70/30", "70-30", "70% / 30%"; nothing → equal split.
-  // Ratios normalize by their sum (7/3 works too). Matched on the
-  // start-date-free body so "starting 7/1" never reads as a ratio.
-  let weights = null;
-  const ratio = tBody.match(/(\d+(?:\.\d+)?)\s*%?\s*[/\-]\s*(\d+(?:\.\d+)?)\s*%?(?:\s*[/\-]\s*(\d+(?:\.\d+)?)\s*%?)?/);
-  if (ratio) {
-    weights = [ratio[1], ratio[2], ratio[3]].filter(Boolean).map(Number);
-  }
-  if (weights && weights.length !== targets.length) {
-    return { error: `Found ${targets.length} holding${targets.length === 1 ? '' : 's'} but a ${weights.length}-way split — they need to match.` };
-  }
-  if (!weights) weights = targets.map(() => 1);
-  const wSum = weights.reduce((s, w) => s + w, 0);
-  if (!(wSum > 0)) return { error: 'Split ratio didn\'t add up — try "70/30".' };
-
-  // Anchor date: "starting <parseable date>", else today
-  let anchorDate = new Date().toISOString().slice(0, 10);
-  if (startMatch) {
-    const parsed = new Date(startMatch[1].trim());
-    if (!isNaN(parsed.getTime())) anchorDate = parsed.toISOString().slice(0, 10);
-  }
-
-  const rules = targets.map((h, i) => ({
-    holdingId: h.id,
-    holdingName: h.name,
-    account: h.account || 'Unassigned',
-    amount: +(amount * weights[i] / wSum).toFixed(2),
-  }));
-  const summary = rules
-    .map(r => `${fmt$(r.amount)} → ${(r.holdingName || '').slice(0, 36)} (${r.account})`)
-    .join(' · ') + ` — ${CADENCE_LABELS[cadence]}, starting ${anchorDate}`;
-  return { rules, cadence, anchorDate, summary };
-}
-
-let nlParsePreview = null; // holds the parsed-but-unconfirmed result
-
-function parseNlContribution() {
-  const input = document.getElementById('crNlText');
-  const out = document.getElementById('crNlPreview');
-  const result = parseContributionText(input.value, holdings);
-  if (result.error) {
-    nlParsePreview = null;
-    out.innerHTML = `<span style="color:var(--danger,#dc2626);font-size:13px;">${esc(result.error)}</span>`;
-    return;
-  }
-  nlParsePreview = result;
-  out.innerHTML = `<span style="font-size:13px;">Got it: <strong>${esc(result.summary)}</strong></span>
-    <button class="btn btn-primary btn-sm" onclick="confirmNlContribution()" style="margin-left:8px;">Confirm</button>
-    <button class="btn btn-ghost btn-sm" onclick="cancelNlContribution()">Cancel</button>`;
-}
-
-function confirmNlContribution() {
-  if (!nlParsePreview) return;
-  const { rules, cadence, anchorDate } = nlParsePreview;
-  for (const r of rules) {
-    contributionRules.push({
-      id: uid(), holdingId: r.holdingId, holdingName: r.holdingName,
-      amount: r.amount, cadence, anchorDate, lastAppliedThrough: null,
-    });
-  }
-  nlParsePreview = null;
-  const el = document.getElementById('crNlText');
-  if (el) el.value = '';
-  const appliedNow = applyContributionRules();
-  if (appliedNow === 0) markUnsaved();
-  render();
-  toast(`Added ${rules.length} rule${rules.length === 1 ? '' : 's'} from text`);
-}
-
-function cancelNlContribution() {
-  nlParsePreview = null;
-  const out = document.getElementById('crNlPreview');
-  if (out) out.innerHTML = '';
+// Pure. What adding `rule` today would accrue: how far back it starts, and
+// the rows and dollars nextPayDates would write (the same 500-row cap).
+function backdatedAccrual(rule, today = nyToday()) {
+  const daysBack = Math.round(
+    (Date.parse(`${today}T00:00:00Z`) - Date.parse(`${String(rule.anchorDate).slice(0, 10)}T00:00:00Z`)) / 86400000);
+  const rows = nextPayDates({ ...rule, lastAppliedThrough: null }, today).length;
+  return { daysBack, rows, dollars: +(rows * (+rule.amount || 0)).toFixed(2) };
 }
 
 function ruleNextDate(rule) {
@@ -2735,7 +2827,7 @@ function ruleNextDate(rule) {
   const upcoming = nextPayDates(
     { ...rule, lastAppliedThrough: rule.lastAppliedThrough || null },
     probe.toISOString().slice(0, 10),
-  ).filter(d => d > new Date().toISOString().slice(0, 10));
+  ).filter(d => d > nyToday());
   return upcoming[0] || '—';
 }
 
@@ -2808,7 +2900,7 @@ function render() {
   renderAskState();
   if (hasHoldings) {
     renderGapTable();
-    updateAdvisorAccounts();
+    renderTaxRates();
     renderAdvisorContext();
   }
   renderPerformanceChart();
@@ -2951,7 +3043,7 @@ function renderTable() {
           <button class="btn btn-ghost btn-sm" title="Fetch ${isMF ? 'NAV' : 'price'} for ${esc(fetchKey)}" onclick="refreshHoldingPrice('${h.id}')">↻</button>
           <button class="btn btn-ghost btn-sm" onclick="startEdit('${h.id}')">Edit</button>
           <button class="btn btn-ghost btn-sm" title="Split into two sleeve allocations" onclick="startSplit('${h.id}')">Split</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteHolding('${h.id}')">✕</button>
+          <button class="btn btn-danger btn-sm" title="Delete ${esc(h.name)}" aria-label="Delete ${esc(h.name)}" onclick="deleteHolding('${h.id}')">✕</button>
         </div></td>
       </tr>
       ${splittingId === h.id ? `<tr>
@@ -3088,8 +3180,8 @@ function renderTargetInputs() {
         <span class="sleeve-dot" style="background:${row.color}"></span>
         ${row.label}
       </label>
-      <input type="number" min="0" max="100" step="1" value="${targets[row.key]}"
-             oninput="targets['${row.key}']=+this.value; saveLocal(); renderTargetInputs(); renderGapTable();">
+      <input type="number" min="0" max="100" step="1" value="${esc(targets[row.key])}"
+             oninput="previewTarget('${row.key}', this.value)" onchange="commitTarget('${row.key}', this.value)">
       <span class="pct-label">%</span>
       <span class="target-dollar">${fmt$(dollarVal)}</span>
     </div>`;
@@ -3109,12 +3201,33 @@ function renderTargetInputs() {
         <span class="sleeve-dot" style="background:${row.color}"></span>
         ${row.label}
       </label>
-      <input type="number" min="0" max="100" step="1" value="${targets[row.key]}"
-             oninput="targets['${row.key}']=+this.value; saveLocal(); renderTargetInputs(); renderGapTable();">
+      <input type="number" min="0" max="100" step="1" value="${esc(targets[row.key])}"
+             oninput="previewTarget('${row.key}', this.value)" onchange="commitTarget('${row.key}', this.value)">
       <span class="pct-label">%</span>
       <span class="target-dollar">${fmt$(dollarVal)}</span>
     </div>`;
   }).join('');
+}
+
+// Target edits used to call only saveLocal() on every keystroke: nothing
+// marked the doc dirty, so they never reached data/portfolio.json or the
+// cloud, and the next boot adopted the file's old targets (audit 2026-10-03,
+// sandbox: a target edit sent 0 POSTs and was back to the old split after
+// reload). Each keystroke
+// also rebuilt the inputs, dropping focus after the first digit. Now typing
+// only previews the gap table; committing (change: blur or Enter) saves once
+// and re-renders everything that reads targets: the Advisor's drift against
+// the bands, the attention strip, and the policy line on the chart.
+function previewTarget(key, value) {
+  targets[key] = +value;
+  renderGapTable();
+}
+
+function commitTarget(key, value) {
+  targets[key] = +value;
+  markUnsaved();
+  render();
+  renderTargetInputs();
 }
 
 // ─── Render: Gap Table ────────────────────────────────────────────────────────
@@ -3132,6 +3245,9 @@ function renderGapTable() {
   const warnEl = document.getElementById('targetWarning');
   warnEl.textContent = warnings.length ? '⚠ ' + warnings.join(' · ') : '';
 
+  // data-label: at phone width the row stacks (style.css ≤640px), and with no
+  // labels a sleeve read as four bare lines (target % / current % / $… / ✓), target
+  // and current impossible to tell apart (Drop 1 review, round 2).
   document.getElementById('gapTableBody').innerHTML = Object.entries(SLEEVE_CONFIG).map(([sleeve, cfg]) => {
     const curVal = slvVals[sleeve] || 0;
     const curPct = tot > 0 ? curVal / tot * 100 : 0;
@@ -3158,10 +3274,10 @@ function renderGapTable() {
           ${cfg.label}
         </span>
       </td>
-      <td class="r">${tgtPct.toFixed(1)}%</td>
-      <td class="r">${curPct.toFixed(1)}%</td>
-      <td class="r">${fmt$(curVal)}</td>
-      <td class="r ${gapCls}">${gapStr}</td>
+      <td class="r" data-label="Target">${tgtPct.toFixed(1)}%</td>
+      <td class="r" data-label="Current">${curPct.toFixed(1)}%</td>
+      <td class="r" data-label="Value">${fmt$(curVal)}</td>
+      <td class="r ${gapCls}" data-label="Gap">${gapStr}</td>
     </tr>`;
   }).join('');
 }
@@ -3173,8 +3289,8 @@ function renderGapTable() {
 // "therefore buy" is not one this app is entitled to make.
 //
 // The macro row is the CBOE 10-year Treasury yield index. It is quoted in
-// percent, not dollars, so its moves are shown in basis points — a "−3.2%"
-// on a yield would read as a price move and mean nothing.
+// percent, not dollars, so its moves are shown in basis points — a percent
+// change of a yield would read as a price move and mean nothing.
 const MACRO_TICKER = '^TNX';
 const MACRO_LABEL  = '10-yr Treasury';
 
@@ -3318,7 +3434,7 @@ function monthsToCloseGap(gapDollars, monthlyIn) {
 // "What moved my money" — the decomposition the header cannot give you. A
 // change in total value is two different things wearing one number: money you
 // PUT IN, and money the market gave or took. Splitting them is the difference
-// between "I'm up $16K" and "I'm up $16K, of which $15K was my own paycheck".
+// between "I'm up" and "I'm up, and almost all of it was my own paycheck".
 //
 // Per holding, exactly:
 //   marketGain(h) = (qty_now × P_now) − (qty_start × P_start) − contributed(h)
@@ -3342,6 +3458,10 @@ const ATTRIB_WINDOWS = [
 // already belongs to the next year, so a YTD run after ~7pm ET resolved to
 // 2027-01-01, `closeAtOrBefore` returned the latest close, and the card
 // cheerfully reported that the portfolio had moved $0.00.
+// Every date the client WRITES uses it too (ledger rows, contribution
+// accruals, history snapshots, fx stamps, the last look): the server keys its
+// rows by the New York date, and the UTC day runs ahead every evening after
+// 8pm ET, so an evening edit was booked to tomorrow (audit 2026-10-03).
 function nyToday(now = Date.now()) {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
@@ -3406,8 +3526,9 @@ function closeAtOrBefore(chart, dateStr, series = 'closes') {
 // back-adjustment pushes the historical value down by every distribution
 // since, so scaling by the adjusted ratio understates the start price by
 // roughly the yield and reports the coupon as if the price had risen. VGIT sat
-// flat across a year while paying 3.9% to cash; on the adjusted ratio that
-// reads as "+2.3% price, +$536 market" against a truth of zero.
+// flat across a year while paying its coupon to cash; on the adjusted ratio
+// that reads as a price gain of a few percent, and hundreds of dollars of
+// "market", against a truth of zero.
 //
 //   distributing holding (real ticker) -> RAW close ratio. The cash left the
 //     fund. If it was reinvested, the ledger booked a `dividend` row and the
@@ -3778,80 +3899,33 @@ function renderDriftSection() {
       target weight (the 5/25 rule). Your policy, your numbers — this only reports against it.</p>`;
 }
 
-function renderLocationSection() {
-  const { rows, swap, rates } = assetLocationSwap();
-  const pct = n => `${(n * 100).toFixed(1)}%`;
-  const rateInputs = `<p class="risk-note">Your rates:
+// His tax rates: the inputs effectiveRates reads, and through it the asset-
+// location rows Ask carries in every brief. They used to sit at the foot of the
+// Advisor's "Where your assets sit" panel. That panel left the card 2026-10-03
+// (David: "the rest is better in the ask feature" — Ask already runs
+// assetLocationSwap on every question), but it was the ONLY place the rates
+// could be set, so the inputs moved to Allocation Strategy with the rest of his
+// policy instead of leaving with the panel. Same ids, same defaults.
+function renderTaxRates() {
+  const el = document.getElementById('taxRates');
+  if (!el) return;
+  // Values are esc()'d: targets come from a restored backup or the cloud doc
+  // as well as these inputs, and this now renders on every render() rather
+  // than only when the old location panel was opened (Drop 1 security review).
+  el.innerHTML = `<p class="risk-note">Ask prices tax drag and asset location at these rates:
     marginal <input class="band-input" id="taxMarg" type="number" min="0" max="60" step="1"
-      value="${targets.taxMarginal ?? DEFAULT_TAX_MARGINAL}"
-      onchange="targets.taxMarginal=+this.value;markUnsaved();renderAdvisorContext()">%
+      value="${esc(targets.taxMarginal ?? DEFAULT_TAX_MARGINAL)}"
+      onchange="targets.taxMarginal=+this.value;markUnsaved();renderTaxRates()">%
     · long-term gains <input class="band-input" id="taxLt" type="number" min="0" max="40" step="1"
-      value="${targets.taxLtcg ?? DEFAULT_TAX_LTCG}"
-      onchange="targets.taxLtcg=+this.value;markUnsaved();renderAdvisorContext()">%
+      value="${esc(targets.taxLtcg ?? DEFAULT_TAX_LTCG)}"
+      onchange="targets.taxLtcg=+this.value;markUnsaved();renderTaxRates()">%
     · state + local <input class="band-input" id="taxLocal" type="number" min="0" max="20" step="0.5"
-      value="${targets.taxStateLocal ?? 0}"
-      onchange="targets.taxStateLocal=+this.value;markUnsaved();renderAdvisorContext()">%
+      value="${esc(targets.taxStateLocal ?? 0)}"
+      onchange="targets.taxStateLocal=+this.value;markUnsaved();renderTaxRates()">%
     · <label class="band-check"><input type="checkbox" id="taxNiit" ${targets.taxNiit ? 'checked' : ''}
-      onchange="targets.taxNiit=this.checked;markUnsaved();renderAdvisorContext()"> NIIT 3.8%</label>
+      onchange="targets.taxNiit=this.checked;markUnsaved();renderTaxRates()"> NIIT 3.8%</label>
     ${!(+targets.taxStateLocal > 0) ? '<span class="loc-hint">— state + local is 0, so these are federal-only figures.</span>' : ''}
   </p>`;
-
-  if (!rows.length) {
-    return `<p class="adv-placeholder loc-empty">Run “Update dividends” first — location math needs a
-      yield per holding.</p>` + rateInputs;
-  }
-
-  const LOC_LABEL = { taxable: 'taxable', sheltered: 'sheltered', foreign: 'outside US tax' };
-  const table = `<div class="loc-row loc-head-row">
-      <span>Holding</span><span class="num">Yield</span>
-      <span class="num">Cost/yr if taxable</span><span class="num">Tax/yr today</span>
-    </div>` + rows
-    .slice().sort((a, b) => b.rate - a.rate)
-    .map(r => `<div class="loc-row">
-      <span>${esc(r.h.name.slice(0, 30))}<span class="drift-sub">${esc(r.h.account || '—')} ·
-        ${LOC_LABEL[r.loc]}</span></span>
-      <span class="num">${pct(r.yield)}${r.estimated ? '<span class="drift-sub">est.</span>' : ''}</span>
-      <span class="num">${pct(r.rate)}<span class="drift-sub">${r.kind}</span></span>
-      <span class="num ${r.loc === 'taxable' ? 'mkt-down' : ''}">${
-        r.loc === 'taxable' ? fmt$(r.rate * r.value) : '—'}</span>
-    </div>`).join('');
-  const foreignCount = rows.filter(r => r.loc === 'foreign').length;
-  const foreignNote = foreignCount
-    ? `<p class="risk-note">${foreignCount} holding${foreignCount === 1 ? '' : 's'} sit outside US
-       tax entirely (Swedish pension). Shown for completeness, never proposed as one side of a
-       swap — the rates above do not apply to them, and it is not an account you trade in.</p>`
-    : '';
-
-  let verdict;
-  if (rates.ordinary <= 0 && rates.qualified <= 0) {
-    // With every rate at zero there is no drag to compare, so "nothing to gain"
-    // would be an artefact of the inputs rather than a finding.
-    verdict = `<p class="loc-head loc-swap">Set your tax rates below — at 0% there is no drag to
-      compare, so this section cannot tell you anything yet.</p>`;
-  } else if (!swap) {
-    verdict = `<p class="loc-head drift-ok">✓ Nothing to gain by relocating — the assets that
-      cost the most to hold in a taxable account are already sheltered.</p>`;
-  } else {
-    const s = swap;
-    verdict = `<p class="loc-head loc-swap">⇄ Relocating ${fmt$(s.amount)} would save about
-      <strong>${fmt$(s.annualSaving)}/year</strong> at your rates, with your allocation unchanged.${
-      s.estimated ? ' One side uses an estimated yield (accumulating fund).' : ''}</p>
-      <div class="loc-plan">
-        <p class="risk-line">1 — Sell ${fmt$(s.amount)} of <strong>${esc(s.into.h.name.slice(0, 30))}</strong>
-          in ${esc(s.into.h.account || '—')} <span class="drift-sub">costs ${fmt$(s.currentCost)}/yr in tax where it sits</span></p>
-        <p class="risk-line">2 — Inside ${esc(s.out.h.account || '—')}, move ${fmt$(s.amount)} out of
-          <strong>${esc(s.out.h.name.slice(0, 30))}</strong> into
-          <strong>${esc(SLEEVE_CONFIG[getSleeve(s.into.h)]?.label || 'the same sleeve')}</strong>
-          <span class="drift-sub">not a taxable event — it happens inside the account</span></p>
-        <p class="risk-line">3 — With the step-1 proceeds, buy ${fmt$(s.amount)} of
-          <strong>${esc(SLEEVE_CONFIG[getSleeve(s.out.h)]?.label || 'that sleeve')}</strong>
-          in ${esc(s.into.h.account || '—')}</p>
-        <p class="risk-note">Steps 2 and 3 cancel out at the portfolio level — every sleeve ends at
-          exactly the weight it has now. Step 1 is a taxable sale, so check the gain before acting;
-          steps inside a sheltered account are not taxable events. Advisory math only.</p>
-      </div>`;
-  }
-  return verdict + `<div class="loc-rows">${table}</div>` + foreignNote + rateInputs;
 }
 
 function renderAttributionSection() {
@@ -3912,11 +3986,13 @@ function renderAttributionSection() {
      next.</p>`;
 }
 
-// Nothing in this card computes a verdict until it is asked to. Volunteering
-// "relocate $23,432 and save $272/year" to someone who opened the app to check
-// a balance is an opinion nobody requested — and the whole design brief was
-// data in, David decides.
-let advShow = { drift: true, location: false };
+// Nothing in this card volunteers a verdict nobody asked for. Volunteering
+// "relocate this bond lot and save this much a year" to someone who opened the
+// app to check a balance was exactly that; the location panel that did it left
+// the card on 2026-10-03 and the question now lives in Ask. Where you stand is
+// the one section left with Show/Hide — open by default, since it only reports
+// against his own bands.
+let advShow = { drift: true };
 function advToggle(key) { advShow[key] = !advShow[key]; renderAdvisorContext(); }
 
 function advSection(key, title, bodyFn, teaser) {
@@ -3937,6 +4013,10 @@ function advSection(key, title, bodyFn, teaser) {
 // card says so inline rather than pushing an error into the thread.
 const ASK_THREAD_KEY = 'portfolio_ask_thread_v1';
 const ASK_KEEP_TURNS = 30, ASK_HISTORY_TURNS = 10, ASK_OPEN_TURNS = 2;
+// Which shell asked, for the function's log line (`v=`), so "is the phone on
+// the new shell?" and "is anyone using Ask?" are log queries, not guesses.
+// Must equal sw.js VERSION — tests/ask.spec.js fails the build when they drift.
+const ASK_SHELL_VERSION = 'v1.11.0';
 let askBusy = false;
 let askAbort = null;               // the in-flight question's AbortController
 let askShowEarlier = false;
@@ -3946,20 +4026,63 @@ let askThread = loadAskThread();   // [{ q, a | error, ts }] (+ pending while in
 let askRestored = askThread.length;
 
 // Dollar amounts named in a question ("where would my next $5,000 go?"), so
-// the brief can carry the rebalance engine's own plan for exactly that sum
-// instead of leaving the model to redo the pro-rata maths. A number counts
-// only when something marks it as money — a $, a k/m suffix, the word
-// "dollars" — or it is a bare figure of 1,000+ that is not a year. "401k",
-// "S&P 500", "5/25", "30%" and "2026" are all deliberately not amounts, and
-// neither is a sum in another currency: "50,000 kr" is not fifty thousand dollars.
+// the question can carry the engine's own result for exactly that sum instead
+// of leaving the model to redo the maths. A number counts only when something
+// marks it as money — a $, a k/m suffix, the word "dollars" — or it is a bare
+// figure of 1,000+ that is not a year. "401k", "S&P 500", "5/25", "30%" and
+// "2026" are all deliberately not amounts, and neither is a sum in another
+// currency: "50,000 kr" is not fifty thousand dollars.
+//
+// Then each sum is sorted by what it is FOR, from the nearest cue in its own
+// sentence (2026-10-03 audit): until ask-4 every dollar figure became a
+// new-money buy plan, so "if I spend $100k" got a 100k deposit plan and
+// the FIRE run he meant was never computed; so did a statement balance and
+// "log a 6500 contribution".
+//   newMoney — "next 10k", invest, put, add, bonus, deposit, split, allocate,
+//              deploy, "buy with", and "where would 15k go" → a buy-only plan
+//   spend    — spend, retire on, live on; failing those, "a year" or "annual"
+//              → a FIRE run at that spend
+//   neither  — anything else, and "7k of it" (part of a sum already named).
+//              "I spent $5k on VOO" is a purchase, and "withdraw $5k" a
+//              one-off, so neither is a spend cue unless "a year" says so.
 const ASK_MAX_AMOUNTS = 3;
+const ASK_CUE_REACH = 40;   // characters either side; a cue further off is about something else
+// The verb, not the noun: "allocation" is how he asks about his mix ("my
+// allocation at $400k"), so only allocate/allocating cue new money.
+const ASK_NEW_MONEY_CUE = /\b(?:next|invest\w*|put(?:ting)?|add(?:s|ed|ing)?|bonus\w*|deposit\w*|windfall|lump[- ]sum|new money|split|allocat(?:e|es|ed|ing)|deploy\w*|buy with)\b/gi;
+const ASK_SPEND_CUE = /\b(?:spend|spends|spending|retire on|live on|living on)\b/gi;
+const ASK_SPEND_WEAK = /\b(?:a year|per year|a yr|yearly|annual\w*)\b|\/\s*(?:yr|year)\b/i;
+function askAmountKind(s, start, end) {
+  // The amount's own sentence only: a cue in the one before is about something else.
+  const before = s.slice(Math.max(0, start - ASK_CUE_REACH), start).split(/[?!;\n]|\.(?=\s|$)/).pop();
+  const after = s.slice(end, end + ASK_CUE_REACH).split(/[?!;\n]|\.(?=\s|$)/)[0];
+  if (/^\s*of (?:it|that|this|them)\b/i.test(after)) return null;
+  let best = null;
+  for (const [kind, re] of [['newMoney', ASK_NEW_MONEY_CUE], ['spend', ASK_SPEND_CUE]]) {
+    for (const c of before.matchAll(re)) {
+      const d = before.length - (c.index + c[0].length);
+      if (!best || d < best.d) best = { kind, d };
+    }
+    for (const c of after.matchAll(re)) {
+      if (!best || c.index < best.d) best = { kind, d: c.index };
+    }
+  }
+  if (best) return best.kind;
+  // "Where would $15k go?" names no verb: the sum itself is what goes. Without
+  // this the commonest phrasing got no plan once the card's Get Recommendation
+  // left for Ask (Drop 1 review, 2026-10-03). Not the past tense: "where did
+  // that 5k go?" asks about money already gone and got a buy plan (round 2).
+  if (/\bwhere\b/i.test(before) && !/\bwhere\b.*\bdid(?:n't)?\b/i.test(before) &&
+      /^\s*go(?:es)?\b/i.test(after)) return 'newMoney';
+  return ASK_SPEND_WEAK.test(before) || ASK_SPEND_WEAK.test(after) ? 'spend' : null;
+}
 function askAmounts(text) {
   const s = String(text || '');
   const re = /(\$\s*)?(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?(?:(k|mm|m)\b|\s*(thousand|million|grand)\b)?(\s*(?:dollars|usd|bucks)\b)?/gi;
   const mult = { k: 1e3, m: 1e6, mm: 1e6, thousand: 1e3, million: 1e6, grand: 1e3 };
-  const out = [];
+  const out = { newMoney: [], spend: [] };
   let m;
-  while ((m = re.exec(s)) && out.length < ASK_MAX_AMOUNTS) {
+  while ((m = re.exec(s))) {
     const [whole, dollar, intPart, frac, suffix, word, unit] = m;
     // Part of a word, a decimal, a date or a fraction ("VGIT2", "1.5", "9/20").
     if (!dollar && /[\w.,\/\-]/.test(s[m.index - 1] || '')) continue;
@@ -3975,7 +4098,9 @@ function askAmounts(text) {
       if (!intPart.includes(',') && !frac && n >= 1900 && n <= 2100) continue;
     }
     const v = +(n * scale).toFixed(2);
-    if (v >= 1 && v <= 1e9 && !out.includes(v)) out.push(v);
+    if (!(v >= 1 && v <= 1e9)) continue;
+    const kind = askAmountKind(s, m.index, m.index + whole.length);
+    if (kind && out[kind].length < ASK_MAX_AMOUNTS && !out[kind].includes(v)) out[kind].push(v);
   }
   return out;
 }
@@ -3989,9 +4114,58 @@ function askAmounts(text) {
 // employer appears only as an aggregate. And identical data serialises to an
 // identical string: dates not instants, fixed key order — because the server
 // caches the brief between turns and a stray millisecond would miss every time.
+// For the same reason it no longer depends on the question (ask-4, 2026-10-03):
+// what a question's amounts need is askExtra()'s, sent beside it.
 const ASK_LEDGER_ROWS = 60, ASK_SERIES_POINTS = 60, ASK_FX_STAMPS = 30, ASK_LOOKTHROUGH_ROWS = 10;
 
-function askContext(question = '') {
+// The rebalance engine's plan for one sum, as the brief and askExtra carry it:
+// plain fields only, no holding objects.
+function askPlan(amount, allowSells) {
+  const r2 = n => n == null || !isFinite(n) ? null : +(+n).toFixed(2);
+  const p = rebalancePlan(holdings, targets, amount, { allowSells });
+  return p ? { amount: r2(amount), totalBefore: p.totalBefore, totalAfter: p.totalAfter,
+    rows: p.rows.map(r => ({ sleeve: r.sleeve, label: r.label, action: r.action, amount: r.amount,
+      suggestion: r.suggestion, note: r.note })), warnings: p.warnings } : null;
+}
+
+// One FIRE run with the card's own defaults — the rounded μ/σ its inputs show,
+// the rules' monthly total, seed 42 — at a given annual spend. The brief runs it
+// at the saved spend; askExtra at any spend the question names, so "what if I
+// spend 150k?" gets the simulated years instead of a hand-off to the card.
+function askFireInputs() {
+  const ba = blendedAssumptions(holdings);
+  return { start: total(), monthlyContrib: monthlyContribFromRules(),
+    muPct: +(ba.mu * 100).toFixed(1), sigmaPct: +(ba.sigma * 100).toFixed(1) };
+}
+function askFireRun(spend, fi = askFireInputs()) {
+  const sim = simulateFire({ start: fi.start, monthlyContrib: fi.monthlyContrib, annualSpend: spend,
+    muAnnual: fi.muPct / 100, sigmaAnnual: fi.sigmaPct / 100, seed: 42 });
+  return sim ? { fiTarget: sim.fiTarget, alreadyFI: sim.alreadyFI, medianYears: sim.medianYears,
+    p10Years: sim.p10Years, p90Years: sim.p90Years, neverWithin50YearsPct: sim.neverPct,
+    successByYears: sim.successByYears } : null;
+}
+
+// Results for THIS question only, computed by the same engines and sent after
+// the server's cache breakpoint: a buy-only plan per sum named as new money,
+// a FIRE run per annual spend named. Empty when the question names neither.
+function askExtra(question) {
+  const { newMoney, spend } = askAmounts(question);
+  const out = {};
+  const plans = newMoney.map(a => askPlan(a, false)).filter(Boolean);
+  if (plans.length) out.newMoney = plans;
+  if (spend.length) {
+    const fi = askFireInputs();
+    const runs = spend.map(s => {
+      const run = askFireRun(s, fi);
+      return run && { annualSpend: s, monthlyContrib: fi.monthlyContrib, muRealPct: fi.muPct,
+        sigmaPct: fi.sigmaPct, swrPct: 4, ...run };
+    }).filter(Boolean);
+    if (runs.length) out.fire = runs;
+  }
+  return out;
+}
+
+function askContext() {
   const r2 = n => n == null || !isFinite(n) ? null : +(+n).toFixed(2);
   const r1 = n => n == null || !isFinite(n) ? null : +(+n).toFixed(1);
   const day = iso => iso ? String(iso).slice(0, 10) : null;
@@ -4211,16 +4385,28 @@ function askContext(question = '') {
     foreignPensionExcluded: true,
   };
 
-  // ── performance ── whole-portfolio snapshots only; true returns only from
-  // the ledger epoch, because before it nobody recorded what was paid in.
+  // ── performance ── whole-portfolio snapshots only; returns only from the
+  // ledger epoch (its first complete snapshot), and never THROUGH a period the
+  // discontinuity guard flags. Before 2026-10-03 the brief carried a twrPct
+  // near 100, a four-digit mwrAnnualPct and a 30-day loss that was really a
+  // statement update, as facts, and Ask repeated them.
   let performance = null;
   if (snaps.length >= 2) {
     const first = snaps[0], last = snaps[snaps.length - 1];
     const post = snaps.filter(s => s.date >= LEDGER_EPOCH);
     const flowsIn = (from, to) => flows.filter(f => f.date > from && f.date <= to)
       .reduce((s, f) => s + f.amount, 0);
-    const twr = computeTWR(post, flows);
-    const mwr = spanDays(post) >= MWR_MIN_SPAN_DAYS ? computeMWR(post, flows) : null;
+    // The same guard, over the same whole history, as the Performance chart.
+    const health = performanceHealth(snaps, flows);
+    // The since-epoch figure is THE answer to "how have I done": flagged
+    // periods are left out of its chain and listed beside it. MWR is one IRR
+    // over the whole span — it cannot step round a hole, so a flag withholds it.
+    const excluded = post.length >= 2 ? flagsWithin(health, post[0].date, last.date) : [];
+    const twr = computeTWR(post, flows, excluded);
+    const mwr = !excluded.length && spanDays(post) >= MWR_MIN_SPAN_DAYS ? computeMWR(post, flows) : null;
+    // Measurable from the later of the epoch's first snapshot and the guard's.
+    const measurableFrom = !post.length ? null
+      : health.measurableFrom > post[0].date ? health.measurableFrom : post[0].date;
     const atOrBefore = dstr => { let f = null; for (const s of snaps) { if (s.date <= dstr) f = s; else break; } return f; };
     // The S&P 500 yardstick the snapshots already carry, between the same two
     // snapshots as the figure beside it. Price only — SPY's dividends are not in it.
@@ -4231,10 +4417,14 @@ function askContext(question = '') {
       const s0 = atOrBefore(windowStartDate({ days }, now));
       if (!s0 || s0 === last) return null;
       const F = flowsIn(s0.date, last.date);
-      const w = s0.date >= LEDGER_EPOCH ? computeTWR(snaps.filter(s => s.date >= s0.date), flows) : null;
+      // A short window across a flagged period gets no return at all — not a
+      // figure with a hole in it, and not the change ex-flows that hole corrupts.
+      const spans = flagsWithin(health, s0.date, last.date);
+      const w = s0.date >= LEDGER_EPOCH && !spans.length
+        ? computeTWR(snaps.filter(s => s.date >= s0.date), flows) : null;
       return { window: label, from: s0.date, to: last.date, valueChange: r2(last.value - s0.value),
-        flowsIn: r2(F), changeExFlows: r2(last.value - s0.value - F), twrPct: w == null ? null : r2(w * 100),
-        spyPricePct: spyPct(s0, last) };
+        flowsIn: r2(F), changeExFlows: spans.length ? null : r2(last.value - s0.value - F),
+        twrPct: w == null ? null : r2(w * 100), spyPricePct: spyPct(s0, last), spansFlaggedPeriods: spans };
     }).filter(Boolean);
     let hw = first;
     for (const s of snaps) if (s.value > hw.value) hw = s;
@@ -4255,8 +4445,10 @@ function askContext(question = '') {
       snapshots: { count: snaps.length, first: first.date, last: last.date },
       valueChangeSinceFirstSnapshot: { dollars: r2(last.value - first.value),
         pct: first.value > 0 ? r1((last.value / first.value - 1) * 100) : null, includesMoneyPaidIn: true },
+      caveats: health.flags,
+      measurableFrom,
       sinceLedgerEpoch: post.length >= 2 ? { from: post[0].date, twrPct: twr == null ? null : r2(twr * 100),
-        mwrAnnualPct: mwr == null ? null : r1(mwr * 100),
+        excludedPeriods: excluded, mwrAnnualPct: mwr == null ? null : r1(mwr * 100),
         flowsIn: r2(flowsIn(post[0].date, last.date)), spyPricePct: spyPct(post[0], last) } : null,
       vsPolicyBenchmark: vsPolicy,
       windows,
@@ -4279,24 +4471,30 @@ function askContext(question = '') {
   // ── fx ──
   const sek = sekDecomposition();
   const sekHolding = sek && holdings.find(h => h.name === sek.name && Array.isArray(h.fxHistory) && h.fxHistory.length >= 2);
+  // Krona exposure is what HOLDS kronor, not what is priced in them: the
+  // short-bond fund, not the global index fund (AVANZA_FUND_IDS.assetsInSek).
+  // The old `sekExposedValue` summed the whole pension, ≈10× too much; the
+  // field is renamed so ask-4 can tell an old shell's figure from this one.
+  const byName = list => [...list.reduce((m, h) => m.set(h.name, (m.get(h.name) || 0) + val(h)), new Map())]
+    .map(([holding, v]) => ({ holding, value: r2(v) }));
+  const sekPriced = held.filter(h => matchesAvanza(h) || (Array.isArray(h.fxHistory) && h.fxHistory.length));
+  const kronaHeld = sekPriced.filter(holdsKronaAssets);
   const fx = sek && sekHolding ? {
     fund: sek.name, from: sek.from, to: sek.to, fundInKronorPct: r2(sek.local * 100),
     kronaVsDollarPct: r2(sek.fx * 100), netUsdPct: r2(sek.net * 100),
-    sekExposedValue: r2(held.filter(h => matchesAvanza(h) || (Array.isArray(h.fxHistory) && h.fxHistory.length))
-      .reduce((s, h) => s + val(h), 0)),
+    kronaExposure: { value: r2(kronaHeld.reduce((s, h) => s + val(h), 0)), holdings: byName(kronaHeld),
+      pricedInKronorOnly: byName(sekPriced.filter(h => !holdsKronaAssets(h))) },
     stamps: { columns: ['date', 'navSek', 'usdPerSek'],
       rows: sekHolding.fxHistory.slice(-ASK_FX_STAMPS).map(r => [r.date, r.nav, r.rate]) },
   } : null;
 
   // ── fire ── one run with the card's own defaults (the rounded figures its
   // inputs show), and only once a spending number has been saved.
-  const ba = blendedAssumptions(holdings);
-  const muPct = +(ba.mu * 100).toFixed(1), sigmaPct = +(ba.sigma * 100).toFixed(1);
+  const fi = askFireInputs();
   const spend = +targets.fireAnnualSpend > 0 ? +targets.fireAnnualSpend : null;
-  const sim = spend ? simulateFire({ start: tot, monthlyContrib: monthlyContribFromRules(), annualSpend: spend,
-    muAnnual: muPct / 100, sigmaAnnual: sigmaPct / 100, seed: 42 }) : null;
+  const sim = spend ? askFireRun(spend, fi) : null;
   const fire = {
-    start: r2(tot), monthlyContribDefault: monthlyContribFromRules(), muRealPct: muPct, sigmaPct,
+    start: r2(tot), monthlyContribDefault: fi.monthlyContrib, muRealPct: fi.muPct, sigmaPct: fi.sigmaPct,
     swrPct: 4, annualSpend: spend,
     // Where muRealPct / sigmaPct come from — the app's own table, not a forecast.
     assumptions: {
@@ -4304,27 +4502,22 @@ function askContext(question = '') {
         [k, { realReturnPct: r2(a.mu * 100), volatilityPct: r2(a.sigma * 100) }])),
       basis: 'blended by CURRENT holding weights (not targets); volatility is a weighted average that ignores diversification; returns are real (after inflation)',
     },
-    simulation: sim ? { fiTarget: sim.fiTarget, alreadyFI: sim.alreadyFI, medianYears: sim.medianYears,
-      p10Years: sim.p10Years, p90Years: sim.p90Years, neverWithin50YearsPct: sim.neverPct,
-      successByYears: sim.successByYears } : null,
+    simulation: sim,
   };
   if (!sim) {
     fire.note = 'No annual spending saved, so no simulation was run.';
-    notLoaded.push("Annual spending for the FIRE estimate — enter it in the 'When does work become optional?' card");
+    // Not "enter it in the card": the prompt never sends him to a card, and a
+    // spend named in the question is run for it (askExtra's fire).
+    notLoaded.push("Annual spending for the FIRE estimate — none is saved. Name a yearly spend in the question " +
+      "and the app runs the simulation for it; 'Save as my FI spend' keeps one");
   }
 
-  // ── scenarios ── the rebalance engine's own plans, including one for each
-  // dollar amount the question names.
-  const plan = (amount, allowSells) => {
-    const p = rebalancePlan(holdings, targets, amount, { allowSells });
-    return p ? { amount: r2(amount), totalBefore: p.totalBefore, totalAfter: p.totalAfter,
-      rows: p.rows.map(r => ({ sleeve: r.sleeve, label: r.label, action: r.action, amount: r.amount,
-        suggestion: r.suggestion, note: r.note })), warnings: p.warnings } : null;
-  };
+  // ── scenarios ── the rebalance engine's full rebalance. A plan per named sum
+  // moved to askExtra (ask-4). oneMonthOfContributions went too: the eval read
+  // it as what his rules buy (eval Q02/Q22: a different split from the rules')
+  // — contributions.bySleeveMonthly is that figure.
   const scenarios = {
-    fullRebalanceToTargets: plan(0, true),
-    oneMonthOfContributions: monthlyIn > 0 ? plan(monthlyIn, false) : null,
-    newMoney: askAmounts(question).map(a => plan(a, false)).filter(Boolean),
+    fullRebalanceToTargets: askPlan(0, true),
   };
 
   // ── session caches ── attached only if he already loaded them.
@@ -4350,7 +4543,7 @@ function askContext(question = '') {
   if (!attributionOut) notLoaded.push('What moved your money (attribution) — pick a window in the Advisor card');
 
   return {
-    schema: 'portfolio-brief/1',
+    schema: 'portfolio-brief/2',   // /2 (ask-4): no question-dependent sections; fx.kronaExposure
     nyDate: nyToday(now),
     freshness, policy,
     totals: { totalValue: r2(tot), holdings: held.length, accounts: accounts.length },
@@ -4375,7 +4568,9 @@ const ASK_CHIPS = [
   'How far am I from my targets?',
   'How much have I put in this year?',
   "What's my dividend income by account?",
-  'How has my portfolio done since June?',
+  // Since August, not June: returns start at LEDGER_EPOCH (08-01), so a
+  // June starter could only ever get a caveated swap of the period.
+  'How have I done since August?',
   'How much of my money rides on the krona?',
   'How fresh is my data?',
   'What would a 30% stock drop do to my mix?',
@@ -4565,8 +4760,12 @@ async function submitAsk(preset) {
 
   let result;
   try {
-    // 90s: deliberately outlives the function's own 85s upstream budget.
-    const r = await proxyPost('/ask', { question: q, context: askContext(q), history }, 90000, ctl.signal);
+    // 90s: deliberately outlives the function's own 85s upstream budget. The
+    // brief is the same for every question; what this question's amounts need
+    // rides as `extra`, after the server's cache breakpoint. `client` is for
+    // the log: no ids, just the shell version and typed-or-chip.
+    const r = await proxyPost('/ask', { question: q, context: askContext(), extra: askExtra(q), history,
+      client: { v: ASK_SHELL_VERSION, src: fromChip ? 'chip' : 'typed' } }, 90000, ctl.signal);
     result = typeof r?.answer === 'string' && r.answer.trim()
       ? { a: r.answer } : { error: 'No answer came back. Try again.' };
   } catch (e) {
@@ -4598,34 +4797,7 @@ function renderAdvisorContext() {
      <div class="subsection-label subsection-flex">What moved your money
        ${attribData ? `<button class="btn btn-ghost btn-sm" id="btnAttrib"
          onclick="runAttribution('${attribData.win.key}')">↻ Recompute</button>` : ''}
-     </div>${renderAttributionSection()}
-     ${advSection('location', 'Where your assets sit', renderLocationSection,
-        'Work out what it costs to hold each sleeve where it currently sits.')}`;
-}
-
-// ─── Advisor: account dropdown ────────────────────────────────────────────────
-function updateAdvisorAccounts() {
-  const accts  = getUniqueAccounts();
-  const select = document.getElementById('advAccount');
-  const prev   = select.value;
-  select.innerHTML = '<option value="">Any account</option>' +
-    accts.map(a => `<option value="${esc(a)}" ${a === prev ? 'selected' : ''}>${esc(a)}</option>`).join('');
-}
-
-// ─── Advisor: tax tip ─────────────────────────────────────────────────────────
-function accountTaxTip(account) {
-  const a = (account || '').toLowerCase();
-  if (/roth/i.test(a))
-    return 'Roth IRA — tax-free growth forever. Best for highest-growth assets (tilts, stocks). Putting bonds here wastes the tax shelter.';
-  if (/401|403b/i.test(a))
-    return '401K/Traditional — tax-deferred; withdrawals taxed as ordinary income. Good for bonds, REITs, and high-yield assets you don\'t want taxed annually.';
-  if (/espp/i.test(a))
-    return 'ESPP/Taxable — employer stock creates concentration risk. Consider diversifying proceeds into your target sleeves after the holding period.';
-  if (/brokerage|taxable/i.test(a))
-    return 'Taxable brokerage — favor low-turnover index ETFs to minimize capital gains. Bonds generate ordinary income; keep them in tax-advantaged accounts if possible.';
-  if (/swedish|pension/i.test(a))
-    return 'Swedish pension — tax-advantaged. Treat similarly to Roth; prioritize long-term growth assets here.';
-  return null;
+     </div>${renderAttributionSection()}`;
 }
 
 // ─── Rebalance simulator (P4) ────────────────────────────────────────────────
@@ -4633,6 +4805,9 @@ function accountTaxTip(account) {
 // allowed), return exact dollar actions per sleeve with a concrete holding
 // suggestion each. Tax-aware: sells prefer tax-advantaged accounts; taxable
 // sells carry a capital-gains warning. No lot data yet — warnings, not lots.
+// Its only reader in the shell is Ask's brief (`scenarios`): the Next money
+// form and the Full Rebalance button that also drew it left the Advisor card
+// on 2026-10-03.
 const TAX_ADVANTAGED_RE = /roth|401|403|pension|swedish/i;
 
 function rebalancePlan(holdingsArr, targetsObj, amount, { allowSells = false } = {}) {
@@ -4660,7 +4835,7 @@ function rebalancePlan(holdingsArr, targetsObj, amount, { allowSells = false } =
   } else {
     if (amount <= 0) {
       return { totalBefore: +tot.toFixed(2), totalAfter: +totalAfter.toFixed(2), rows: [],
-               warnings: ['Enter an amount to invest, or use Full Rebalance (allows sells).'] };
+               warnings: ['No amount to invest — a buy-only plan needs one; a full rebalance (sells allowed) does not.'] };
     }
     for (const k of sleeves) buys[k] = 0;
     const posKeys = sleeves.filter(k => k !== 'other' && deltas[k] > 0);
@@ -4707,132 +4882,6 @@ function rebalancePlan(holdingsArr, targetsObj, amount, { allowSells = false } =
   return { totalBefore: +tot.toFixed(2), totalAfter: +totalAfter.toFixed(2), rows, warnings };
 }
 
-// One list for both answers below. A grid, not a <table>: the phone-width
-// rules in style.css restack every tbody tr/td for the holdings table, and at
-// 390px they folded the old table here into an unlabelled column that ran off
-// the box. `detail` is HTML built by the caller; everything else is escaped.
-function planListHtml(items, { actions = false } = {}) {
-  return `<div class="adv-split${actions ? ' adv-split-acts' : ''}" data-testid="${actions ? 'rebalance-rows' : 'advisor-split'}">` +
-    items.map(it => `<div class="adv-split-row" data-sleeve="${esc(it.sleeve)}">
-      <span class="adv-split-dot"><span class="sleeve-dot" style="background:${SLEEVE_CONFIG[it.sleeve]?.color || 'var(--text-muted)'}"></span></span>
-      <span class="adv-split-name">${esc(it.label)}</span>
-      ${actions ? `<span class="adv-split-act"><span class="adv-act-${esc(it.action)}">${esc(it.action.toUpperCase())}</span></span>` : ''}
-      <span class="adv-split-amt${it.action === 'hold' ? ' adv-act-hold' : ''}">${it.action === 'hold' ? '—' : fmt$(Math.abs(it.amount))}</span>
-      <span class="adv-split-how">${it.detail || ''}</span>
-    </div>`).join('') + '</div>';
-}
-
-const planWarningsHtml = warnings => warnings.map(w =>
-  `<div class="adv-tax-tip"><strong>⚠</strong> ${esc(w)}</div>`).join('');
-
-function runFullRebalance() {
-  const amount = parseFloat(document.getElementById('advAmount').value) || 0;
-  const result = document.getElementById('advResult');
-  const plan = rebalancePlan(holdings, targets, amount, { allowSells: true });
-  if (!plan) { result.innerHTML = '<p class="adv-placeholder">Add holdings with prices first.</p>'; return; }
-  // All interpolated values esc()-escaped or app-computed (app's render pattern).
-  result.innerHTML = `<div class="adv-rec-box">
-    <div class="adv-sleeve-name">Full rebalance
-      <span class="adv-plan-sub">sells allowed · ${fmt$(plan.totalBefore)} → ${fmt$(plan.totalAfter)}</span>
-    </div>
-    ${planListHtml(plan.rows.map(r => ({ ...r,
-      detail: esc(r.suggestion) + (r.note ? ` <em>(${esc(r.note)})</em>` : '') })), { actions: true })}
-    ${planWarningsHtml(plan.warnings)}
-  </div>`;
-}
-
-// ─── Advisor: recommendation ──────────────────────────────────────────────────
-// The holding line under one BUY row. Largest position first — the same pick
-// the engine's own `suggestion` makes, so with no account chosen this names
-// the holding the Ask box names — narrowed to the chosen account when there
-// is one.
-function advisorHoldingLine(sleeve, account) {
-  const label = SLEEVE_CONFIG[sleeve].label;
-  const val = h => (h.quantity || 0) * (h.price || 0);
-  const acctOf = h => h.account || 'Unassigned';
-  const named = h => `<strong>${esc(h.name)}${h.ticker && h.ticker !== 'N/A' ? ` (${esc(h.ticker)})` : ''}</strong>`;
-  const anywhere = holdings.filter(h => getSleeve(h) === sleeve).sort((a, b) => val(b) - val(a));
-  const inAcct = account ? anywhere.filter(h => acctOf(h) === account) : anywhere;
-
-  if (inAcct.length > 0) {
-    const h = inAcct[0];
-    return `Add to ${named(h)} — you already hold this ${label} position in
-      ${account ? `your <strong>${esc(account)}</strong> account` : `<strong>${esc(acctOf(h))}</strong>`}.`;
-  }
-  if (anywhere.length > 0) {
-    const h = anywhere[0];
-    return `You hold ${named(h)} in <strong>${esc(acctOf(h))}</strong>.
-      Either open a similar position in <strong>${esc(account)}</strong>, or contribute to
-      <strong>${esc(acctOf(h))}</strong> if that's where the ${label} sleeve makes more sense.`;
-  }
-  const suggestions = {
-    us_stock:   'a US total market or S&P 500 index ETF (e.g. VOO, VTI, SCHB)',
-    intl_stock: 'an international index ETF (e.g. VXUS, VEA, VWO)',
-    tilt:       'a factor tilt, sector, or individual position aligned with your strategy',
-    bond:       'a bond ETF matching your duration preference (e.g. VGIT for intermediate, BND for total market)',
-  };
-  return `No ${label} holding yet${account ? ` in <strong>${esc(account)}</strong>` : ''}.
-    Consider adding ${suggestions[sleeve] || 'an appropriate instrument'}.`;
-}
-
-// One answer: the split is rebalancePlan's buy-only plan, the same rows the
-// Ask brief carries as `scenarios.newMoney`. This adds only what the engine
-// cannot know — which account he is paying into.
-function computeAdvisorRec() {
-  const amount  = parseFloat(document.getElementById('advAmount').value);
-  const account = document.getElementById('advAccount').value;
-  const result  = document.getElementById('advResult');
-
-  if (isNaN(amount) || amount <= 0) {
-    result.innerHTML = '<p class="adv-placeholder">Enter a positive amount to see a recommendation.</p>';
-    return;
-  }
-
-  const plan = rebalancePlan(holdings, targets, amount);
-  if (!plan) {
-    result.innerHTML = '<p class="adv-placeholder">Add holdings with prices first, then get a recommendation.</p>';
-    return;
-  }
-  const buys = plan.rows.filter(r => r.action === 'buy');
-  if (!buys.length) {   // under a dollar a sleeve — the engine holds everything
-    result.innerHTML = '<p class="adv-placeholder">That is too small to split. Enter a larger amount.</p>';
-    return;
-  }
-
-  let html = `<div class="adv-rec-box">
-    <div class="adv-sleeve-name">Where ${fmt$(amount)} goes
-      <span class="adv-plan-sub">buy-only · ${fmt$(plan.totalBefore)} → ${fmt$(plan.totalAfter)}</span>
-    </div>
-    ${planListHtml(buys.map(r => ({ ...r, detail: advisorHoldingLine(r.sleeve, account) })))}`;
-
-  // Tax tip
-  const tip = accountTaxTip(account);
-  if (tip) {
-    html += `<div class="adv-tax-tip"><strong>Tax note:</strong> ${tip}</div>`;
-  }
-  html += planWarningsHtml(plan.warnings);
-
-  // All sleeve gaps summary ($ short of target once this money is in);
-  // 'other' is never gap-filled, so it is left out as before.
-  const slvVals = getSleeveTotals();
-  const tgtPcts = getSleeveTargetPcts();
-  const bought = new Set(buys.map(r => r.sleeve));
-  html += `<div class="adv-gaps">`;
-  const gaps = Object.keys(SLEEVE_CONFIG).filter(s => s !== 'other')
-    .map(s => [s, tgtPcts[s] / 100 * plan.totalAfter - (slvVals[s] || 0)])  // positive = underweight
-    .sort(([, a], [, b]) => b - a);
-  for (const [sleeve, gap] of gaps) {
-    const cfg = SLEEVE_CONFIG[sleeve];
-    html += `<span class="adv-gap-item" style="${bought.has(sleeve) ? 'font-weight:600;' : ''}">
-      <span class="sleeve-dot" style="background:${cfg.color}"></span>
-      ${cfg.label}: ${gap > 50 ? fmt$(gap) + ' short' : '✓'}
-    </span>`;
-  }
-  html += `</div></div>`;
-
-  result.innerHTML = html;
-}
-
 // ─── Keyboard shortcuts ───────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && document.activeElement === document.getElementById('iPrice')) addHolding();
@@ -4872,8 +4921,8 @@ async function loadFromServer() {
     applyContributionRules();
     render();
     renderTargetInputs();
-    // History may have rendered before transactions arrived — recompute the
-    // TWR/MWR header now that external flows are known.
+    // History may have rendered before transactions arrived — redraw the
+    // flow-adjusted chart now that external flows are known.
     renderPerformanceChart();
     return true;
   } catch (e) { return false; }
@@ -4905,9 +4954,9 @@ if (IS_SHELL) {
 }
 
 // Auto-refresh prices on load (after UI settles) and every 15 minutes
-setTimeout(() => refreshAllPrices({ silent: true, autoSave: true }), 1200);
+setTimeout(() => refreshAllPrices({ silent: true }), 1200);
 setInterval(() => {
-  if (!document.hidden) refreshAllPrices({ silent: true, autoSave: true });
+  if (!document.hidden) refreshAllPrices({ silent: true });
 }, 15 * 60 * 1000);
 
 // Keep "X min ago" label current

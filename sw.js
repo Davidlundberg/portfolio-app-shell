@@ -16,8 +16,21 @@
  *
  * Bump VERSION on any shell change — activate deletes all older caches.
  * tools/publish_shell.py asserts the published version matches this constant.
+ *
+ * Updates WAIT (2026-10-03). This worker used to skipWaiting() at install, so
+ * a publish took over silently: the launch that downloaded it kept running
+ * the old shell (navigations are cache-first), the next launch ran the new
+ * one, and nothing on screen said which was which — an old shell could send
+ * an old Ask brief to a new edge prompt. Now a new worker installs and waits;
+ * the page asks for VERSION (shown in the ⋯ menu), sees the waiting worker,
+ * offers "Update ready — reload", and only that tap sends SKIP_WAITING.
+ * Ignoring the offer costs nothing: once no window uses the old worker (the
+ * app fully closed) the waiting one takes over by itself, so a closed-and-
+ * reopened app runs the new shell on the same launch as before (checked in
+ * Chromium, shell sandbox — including the first hop from v1.10.5, whose page
+ * has no offer to show).
  */
-const VERSION = 'v1.10.5';
+const VERSION = 'v1.11.0';
 const SHELL_CACHE = `portfolio-shell-${VERSION}`;
 const RUNTIME_CACHE = `portfolio-runtime-${VERSION}`;
 
@@ -43,8 +56,21 @@ self.addEventListener('install', (event) => {
       // {cache:'reload'} bypasses the HTTP cache so a version bump always
       // precaches the freshly deployed shell, never a heuristically-cached copy.
       .then((cache) => cache.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' }))))
-      .then(() => self.skipWaiting())
+    // No skipWaiting() here — see the header: the page decides when to swap.
   );
+});
+
+// The page's side of the update handshake (cloud.js, "Shell version").
+//   GET_VERSION  → reply on the transferred port with this worker's VERSION,
+//                  so the ⋯ menu names the shell that actually served the page.
+//   SKIP_WAITING → the user tapped "Update ready — reload".
+self.addEventListener('message', (event) => {
+  const msg = event.data || {};
+  if (msg.type === 'GET_VERSION' && event.ports && event.ports[0]) {
+    event.ports[0].postMessage({ version: VERSION });
+  } else if (msg.type === 'SKIP_WAITING') {
+    self.skipWaiting();
+  }
 });
 
 self.addEventListener('activate', (event) => {

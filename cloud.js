@@ -57,6 +57,10 @@ function setSyncMeta(patch) {
   localStorage.setItem(SYNC_META_KEY, JSON.stringify({ ...syncMeta(), ...patch }));
 }
 // app.js calls this from markUnsaved() — every local edit stamps the device dirty.
+// A fetched price is not an edit and never comes through here (app.js
+// persistMarketData): if it did, an open tab's refresh would always be the
+// "newest change" and last-write-wins would push its stale copy over the
+// other device's edit.
 function noteLocalChange() {
   setSyncMeta({ localDirty: true, localChangedAt: new Date().toISOString() });
 }
@@ -205,12 +209,29 @@ function stateDoc() {
 // local data.
 function adoptDoc(doc) {
   if (!doc || !Array.isArray(doc.holdings)) return false;
-  holdings = doc.holdings.map(h => ({ type: 'stock', ...h }));
+  const mine = new Map(holdings.map(h => [h.id, h]));
+  holdings = doc.holdings.map(h => keepFxStamps({ type: 'stock', ...h }, h.id != null ? mine.get(h.id) : null));
   if (doc.targets) Object.assign(targets, doc.targets);
   transactions      = doc.transactions || [];
   contributionRules = doc.contributionRules || [];
   lastSaved         = doc.lastSaved || null;
   return true;
+}
+
+// The SEK NAV/FX stamps (fxHistory) are written by whichever device refreshes
+// that day, and since 2026-10-03 a refresh no longer pushes (app.js
+// persistMarketData) — so a day only this device refreshed exists only here
+// until its next real edit. Adopting the other device's copy must not erase
+// it: union by date, the incoming row winning a same-day tie, same 400 cap as
+// fetchAvanza. A stamp is a market fact, so keeping it can't resurrect an edit.
+function keepFxStamps(h, local) {
+  if (!local || !Array.isArray(local.fxHistory) || !local.fxHistory.length) return h;
+  const byDate = new Map(local.fxHistory.map(r => [r.date, r]));
+  for (const r of (Array.isArray(h.fxHistory) ? h.fxHistory : [])) byDate.set(r.date, r);
+  h.fxHistory = [...byDate.values()]
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+    .slice(-400);
+  return h;
 }
 
 async function cloudFetchState() {
@@ -489,9 +510,120 @@ async function cloudBoot() {
   }
 }
 
+// ─── Shell version + "Update ready — reload" ─────────────────────────────────
+// Until 2026-10-03 nothing on screen said which shell a device was running,
+// and a publish swapped in silently one launch late (sw.js header) — so the
+// phone could keep sending an old Ask brief to a new edge prompt, and "is the
+// phone on the new code?" had no answer short of guessing. The ⋯ menu now
+// names the running VERSION, and a newer worker that has installed and is
+// waiting is offered as "Update ready — reload"; only that tap swaps it in.
+let shellVersion = null;      // 'v1.10.5' — the shell that served this page
+let shellUpdate = null;       // { worker, version } once a newer shell is ready
+let shellReloading = false;   // this page asked for the swap → reload on takeover
+
+// sw.js answers on a transferred port. A pre-handshake worker (≤ v1.10.5)
+// never answers, so this gives up rather than hang the menu.
+function askWorkerVersion(worker) {
+  return new Promise((resolve) => {
+    if (!worker) { resolve(null); return; }
+    const ch = new MessageChannel();
+    const t = setTimeout(() => resolve(null), 3000);
+    ch.port1.onmessage = (e) => { clearTimeout(t); resolve((e.data && e.data.version) || null); };
+    worker.postMessage({ type: 'GET_VERSION' }, [ch.port2]);
+  });
+}
+
+async function readShellVersion() {
+  const sw = navigator.serviceWorker;
+  // The controlling worker served this page out of its own cache, so its
+  // VERSION is the running shell's (not the newest published one). With no
+  // controller on a phone (first visit) the page came from the network, i.e.
+  // from the same publish as the worker now installing.
+  if (sw && sw.controller) return askWorkerVersion(sw.controller);
+  if (IS_SHELL && sw) {
+    const reg = await Promise.race([sw.ready, new Promise(r => setTimeout(r, 5000))]);
+    return askWorkerVersion(reg && reg.active);
+  }
+  // Local mode has no worker: server.py serves the working tree, and its
+  // sw.js carries the version these files will publish as.
+  try {
+    const src = await (await fetch('sw.js', { cache: 'no-store' })).text();
+    const m = src.match(/const VERSION = '(v[\d.]+)';/);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
+function renderShellVersion() {
+  const line = document.getElementById('shellVersion');
+  if (line) {
+    line.textContent = !shellVersion ? ''
+      : `Version ${shellVersion}${IS_SHELL ? '' : ' · local'}` +
+        (shellUpdate && shellUpdate.version ? ` · ${shellUpdate.version} ready` : '');
+  }
+  for (const id of ['shellUpdateBar', 'btnShellUpdate']) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = shellUpdate ? '' : 'none';
+  }
+}
+
+function watchShellUpdates(reg) {
+  const sw = navigator.serviceWorker;
+  let hadController = !!sw.controller;
+  const offer = async (worker) => {
+    // No controller = a first install: that worker just takes over, nothing to offer.
+    if (!worker || !sw.controller) return;
+    shellUpdate = { worker, version: null };
+    renderShellVersion();
+    shellUpdate.version = await askWorkerVersion(worker);
+    renderShellVersion();
+  };
+  if (reg.waiting) offer(reg.waiting);
+  reg.addEventListener('updatefound', () => {
+    const w = reg.installing;
+    if (w) w.addEventListener('statechange', () => { if (w.state === 'installed') offer(w); });
+  });
+  sw.addEventListener('controllerchange', () => {
+    if (shellReloading) { location.reload(); return; }
+    // Taken over without our tap (another tab tapped, or the first install
+    // claimed this page). This page still runs the old files; a reload is
+    // all the "update" left to do.
+    if (hadController) { shellUpdate = { worker: null, version: null }; renderShellVersion(); }
+    hadController = true;
+  });
+  // Look for a newer sw.js now, on every launch. register() with an unchanged
+  // script URL never checks (spec); the browser's own check after a
+  // navigation does (Chromium, shell sandbox), but how a home-screen launch
+  // on iOS times it is unverified — and the offer is meant to show on the
+  // very next launch. One small revalidating GET of sw.js.
+  if (sw.controller) reg.update().catch(() => {});
+  // A phone PWA mostly resumes rather than relaunches — look again when the
+  // app comes back to the front.
+  let lastCheck = Date.now();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || Date.now() - lastCheck < 10 * 60 * 1000) return;
+    lastCheck = Date.now();
+    reg.update().catch(() => {});
+  });
+}
+
+function applyShellUpdate() {
+  if (!shellUpdate) return;
+  shellReloading = true;
+  if (!shellUpdate.worker) { location.reload(); return; }
+  shellUpdate.worker.postMessage({ type: 'SKIP_WAITING' });
+  // controllerchange reloads; never leave the tap dead if it doesn't come.
+  setTimeout(() => location.reload(), 4000);
+}
+
 // Service worker: shell only — local dev must never fight a cache.
 if (IS_SHELL && 'serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch(e => console.warn('[sw]', e));
+    navigator.serviceWorker.register('sw.js')
+      .then(watchShellUpdates)
+      .catch(e => console.warn('[sw]', e));
   });
 }
+window.addEventListener('load', async () => {
+  shellVersion = await readShellVersion();
+  renderShellVersion();
+});

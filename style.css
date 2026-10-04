@@ -45,12 +45,10 @@
   /* Advisor */
   --adv-box-bg: rgba(30,58,95,0.04);
   --adv-box-border: #eeece7;
-  --adv-tip-bg: rgba(13,148,136,0.08);
-  --adv-tip-border: rgba(13,148,136,0.15);
-  --adv-tip-color: #0f766e;
   /* Toast */
   --toast-bg: #18181b;
   --toast-color: #f0f2f5;
+  --toast-action: #2dd4bf;
   /* Lit-edge (dark only) */
   --lit-edge: transparent;
 }
@@ -84,11 +82,9 @@
   --import-sticky-bg: #0f1117;
   --adv-box-bg: rgba(13,148,136,0.06);
   --adv-box-border: #1e2433;
-  --adv-tip-bg: rgba(13,148,136,0.12);
-  --adv-tip-border: rgba(13,148,136,0.2);
-  --adv-tip-color: #2dd4bf;
   --toast-bg: #f0f2f5;
   --toast-color: #09090b;
+  --toast-action: #0f766e;
   --lit-edge: rgba(255,255,255,0.05);
 }
 
@@ -119,11 +115,9 @@
     --import-sticky-bg: #0f1117;
     --adv-box-bg: rgba(13,148,136,0.06);
     --adv-box-border: #1e2433;
-    --adv-tip-bg: rgba(13,148,136,0.12);
-    --adv-tip-border: rgba(13,148,136,0.2);
-    --adv-tip-color: #2dd4bf;
     --toast-bg: #f0f2f5;
     --toast-color: #09090b;
+    --toast-action: #0f766e;
     --lit-edge: rgba(255,255,255,0.05);
   }
 }
@@ -196,6 +190,23 @@ h2 {
   border-radius: 10px; box-shadow: var(--shadow-elevated); min-width: 180px;
 }
 .hdr-more-menu .btn { justify-content: flex-start; width: 100%; }
+/* Running shell version: quiet, last line of the ⋯ menu. */
+.hdr-more-version {
+  font-size: 12px; color: var(--text-muted); padding: 8px 12px 2px;
+  border-top: 1px solid var(--border-subtle); font-feature-settings: "tnum";
+}
+.hdr-more-version:empty { display: none; }
+/* "Update ready — reload": an offer, not a warning — accent, not the amber
+   of the Needs-attention chips. */
+.shell-update-bar { margin-bottom: 16px; }
+/* 44px: the one tap that moves the phone to the new shell (Drop 1 review). */
+.shell-update-chip {
+  border: 1px solid rgba(13,148,136,0.35); background: rgba(13,148,136,0.08);
+  color: var(--accent-hover); border-radius: 999px; padding: 10px 14px;
+  font-size: 13px; font-family: inherit; cursor: pointer; min-height: 44px;
+}
+.shell-update-chip:hover { background: rgba(13,148,136,0.15); }
+[data-theme="dark"] .shell-update-chip { color: var(--accent-light); }
 
 /* ── Theme toggle ── */
 .theme-toggle {
@@ -403,10 +414,11 @@ tr:hover td { background: var(--row-hover); }
 
 /* ── Performance chart ── */
 .perf-chart-container { position: relative; height: 220px; }
-.perf-legend { display: flex; gap: 16px; margin-top: 12px; }
+.perf-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 12px; }
 .perf-legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary); }
 .perf-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
 .perf-empty { font-size: 15px; color: var(--text-muted); padding: 40px 0; text-align: center; }
+.perf-note { font-size: 12px; color: var(--text-muted); margin: 10px 0 0; line-height: 1.45; }
 .return-positive { color: #10b981; }
 .return-negative { color: #ef4444; }
 
@@ -526,64 +538,18 @@ td select { padding-right: 24px; }
 .sleeve-label { display: flex; align-items: center; gap: 7px; }
 
 /* ── Investment Advisor ── */
-.advisor-form {
-  display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 20px;
-}
-.advisor-form .form-group { min-width: 140px; }
-#advResult { min-height: 40px; }
 .adv-rec-box {
   background: var(--adv-box-bg); border: 1px solid var(--adv-box-border);
   border-radius: 10px; padding: 16px 20px;
 }
 .adv-sleeve-name { font-size: 18px; font-weight: 600; letter-spacing: -0.2px; margin-bottom: 6px; color: var(--text-primary); }
 .adv-detail { font-size: 15px; color: var(--text-secondary); line-height: 1.6; margin-bottom: 12px; }
-.adv-tax-tip {
-  padding: 10px 14px;
-  background: var(--adv-tip-bg); border: 1px solid var(--adv-tip-border);
-  border-radius: 6px;
-  font-size: 14px; color: var(--adv-tip-color); line-height: 1.5; margin-bottom: 12px;
-}
-.adv-gaps {
-  font-size: 13px; color: var(--text-secondary);
-  display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px;
-  font-feature-settings: "cv01", "tnum";
-}
-.adv-gap-item { display: flex; align-items: center; gap: 5px; }
-.adv-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-/* inline-block: at 390px it drops to its own line whole, never mid-phrase. */
-.adv-plan-sub { display: inline-block; font-size: 13px; font-weight: 400; letter-spacing: 0; color: var(--text-secondary); }
-/* The split and the full rebalance: one grid, rows as `display: contents` so
-   the amounts share a right edge. Not a <table> — same reason as .fire-odds. */
-.adv-split {
-  display: grid; grid-template-columns: 16px minmax(0, 1fr) auto;
-  margin: 8px 0 14px; max-width: 640px; font-size: 14px; color: var(--text-primary);
-  font-feature-settings: "cv01", "tnum";
-}
-.adv-split-acts { grid-template-columns: 16px minmax(0, 1fr) auto auto; }
-.adv-split-row { display: contents; }
-.adv-split-row > * { padding-top: 10px; }
-.adv-split-row + .adv-split-row > :not(.adv-split-how) { border-top: 1px solid var(--border-subtle); }
-.adv-split-dot { display: flex; align-items: center; }
-.adv-split-name, .adv-split-amt { font-weight: 600; }
-.adv-split-amt { text-align: right; padding-left: 12px; }
-.adv-split-act { padding-left: 12px; }
-/* The word is smaller than its cell so it sits on the amount's baseline. */
-.adv-split-act > span { font-size: 12px; font-weight: 600; letter-spacing: 0.03em; }
-.adv-act-buy  { color: #15803d; }
-.adv-act-sell { color: #dc2626; }
-.adv-act-hold { color: var(--text-muted); }
-[data-theme="dark"] .adv-act-buy  { color: #4ade80; }
-[data-theme="dark"] .adv-act-sell { color: #f87171; }
-.adv-split-how {
-  grid-column: 2 / -1; padding-top: 2px; padding-bottom: 10px;
-  font-size: 13px; font-weight: 400; color: var(--text-secondary); line-height: 1.5;
-}
-.adv-split-how strong { font-weight: 600; color: var(--text-primary); }
 .adv-placeholder { font-size: 15px; color: var(--text-muted); }
 /* FIRE odds: five horizons, always one row. A grid rather than a <table> —
    the phone-width rules below turn every tbody tr/td into a stacked list for
    the holdings table, which folded this into a single column at 390px. */
 .fire-odds-label { font-size: 13px; color: var(--text-secondary); margin-top: 8px; }
+.fire-whatif { font-size: 12px; color: var(--text-secondary); margin-top: 4px; }
 .fire-odds {
   display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px;
   margin-top: 6px; max-width: 420px;
@@ -605,6 +571,8 @@ td select { padding-right: 24px; }
 /* ── Toast ── */
 .toast {
   position: fixed; bottom: 24px; right: 24px;
+  /* A long message wraps inside the same 24px gutter instead of running to x=0. */
+  max-width: calc(100vw - 48px);
   background: var(--toast-bg); color: var(--toast-color); padding: 10px 18px; border-radius: 6px;
   font-size: 14px; font-weight: 500;
   box-shadow: var(--shadow-toast);
@@ -614,6 +582,39 @@ td select { padding-right: 24px; }
   pointer-events: none; z-index: 999;
 }
 .toast.show { opacity: 1; transform: translateY(0); }
+
+/* Undo after deleting a holding. Same look and spot as the toast, one line
+   however long the name, and the plain toast steps up above it while it is
+   open so the two never overlap. Hidden means hidden: no focusable button. */
+.toast-undo {
+  display: flex; align-items: center; gap: 10px;
+  max-width: calc(100vw - 48px);
+  padding: 2px 2px 2px 18px;
+  visibility: hidden;
+  transition: opacity 200ms cubic-bezier(0.22, 1, 0.36, 1),
+              transform 200ms cubic-bezier(0.22, 1, 0.36, 1),
+              visibility 0s linear 200ms;
+}
+.toast-undo.show { visibility: visible; pointer-events: auto; transition-delay: 0s; }
+.toast-undo-msg { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Read out, never drawn: without "Deleted" the status region announced only
+   "VOO (Brokerage) · $… Undo", so a screen reader never said what happened
+   (Drop 1 review, round 2). On screen the confirm just said it. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; border: 0;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+}
+.toast-undo-val { flex: none; margin-left: -4px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+/* 44px tall inside a toast that stays 48: Undo is the only way back from a
+   delete, and it lasts ten seconds (Drop 1 review). */
+.toast-action {
+  flex: none; min-height: 44px; padding: 0 14px; border: none; border-radius: 4px;
+  background: transparent; color: var(--toast-action);
+  font: inherit; font-weight: 600; cursor: pointer;
+}
+.toast-action:hover { background: rgba(127,127,127,0.18); }
+.toast-action:focus-visible { outline: 2px solid var(--toast-action); outline-offset: -2px; }
+.toast-undo.show ~ .toast { bottom: 84px; }
 
 input[type="file"] { display: none; }
 
@@ -636,6 +637,11 @@ input[type="file"] { display: none; }
 [data-theme="dark"] .mkt-down { color: #f87171; }
 .mkt-off { font-size: 12px; color: var(--text-muted); margin-left: auto; }
 .mkt-na  { font-size: 12px; color: var(--text-muted); }
+/* Unloaded, the strip is one paragraph with no margin, and the next heading
+   ("What moved your money") sat flush under it (0px, measured at 390) as if
+   it captioned the market.
+   12px matches the gap the loaded strip leaves via its .risk-note. */
+.mkt-empty { margin-bottom: 12px; }
 
 .drift-head { font-size: 14px; margin: 4px 0 10px; }
 .drift-ok     { color: #15803d; }
@@ -761,10 +767,6 @@ input.band-input {
 }
 .card-collapsible[open] .collapse-hint::after { content: ' ✕'; }
 .card-collapsible:not([open]) .collapse-hint::after { content: ' ＋'; }
-.adv-next > summary {
-  cursor: pointer; list-style: none; margin-bottom: 10px;
-}
-.adv-next > summary::-webkit-details-marker { display: none; }
 .adv-quiet { font-size: 13px; margin-bottom: 12px; }
 
 /* ── Advisor: attribution ── */
@@ -795,34 +797,12 @@ input.band-input {
   .attrib-bar { display: none; }   /* the numbers already carry it on mobile */
 }
 
-/* A relocation saving is an opportunity, not a warning — it gets the neutral
-   accent, not the amber the drift breach uses. */
-.loc-head { font-size: 14px; margin: 4px 0 10px; }
-.loc-swap { color: #1d4ed8; }
-[data-theme="dark"] .loc-swap { color: #93b4fc; }
-.loc-rows { margin: 10px 0 4px; max-width: 640px; }
-.loc-row {
-  display: grid; grid-template-columns: minmax(120px, 1.8fr) repeat(3, minmax(66px, 0.9fr));
-  gap: 10px; align-items: baseline;
-  font-size: 13px; padding: 5px 0;
-  border-bottom: 1px solid var(--border);
-}
-.loc-row:last-child { border-bottom: none; }
-.loc-head-row {
-  font-size: 11px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: 0.03em; color: var(--text-muted);
-  border-bottom: 1px solid var(--border); padding-bottom: 4px;
-}
-.loc-row .num { text-align: right; font-variant-numeric: tabular-nums; }
-.loc-plan { margin: 2px 0 6px; }
-.loc-plan .risk-line { margin: 3px 0; }
+/* Tax-rate inputs (Allocation Strategy). The asset-location table they used
+   to sit under left the Advisor card 2026-10-03; the inputs stayed. */
 .loc-hint { color: #b45309; }
 [data-theme="dark"] .loc-hint { color: #fbbf24; }
 .band-check { white-space: nowrap; }
 .band-check input { width: auto; min-height: 0; margin-right: 3px; vertical-align: middle; }
-@media (max-width: 640px) {
-  .loc-row { grid-template-columns: 1fr repeat(3, minmax(58px, auto)); gap: 6px; }
-}
 
 /* ── Risk & Exposure card ── */
 .risk-line { font-size: 14px; margin: 4px 0 2px; }
@@ -841,6 +821,13 @@ input.band-input {
 }
 .risk-bar > span { display: block; height: 100%; background: var(--navy); border-radius: 4px; }
 .risk-row .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ── Dividend Income ── at phone width the table stacks like the holdings
+   list (the ≤640px block below), one labelled line per figure. The scroller
+   stays as a safety net: before the stacking, the five-column table was 461px
+   at 390 and pushed the whole page sideways. */
+#divBody { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+#divBody .div-pays { padding-left: 10px; }
 
 /* ── Import kind picker (true-up vs reinvested dividend) ── */
 /* background-color, not the shorthand: that reset the chevron's no-repeat and
@@ -987,11 +974,6 @@ input.band-input {
   .bottom-row { grid-template-columns: 1fr; }
   .header-actions { width: 100%; }
   .alloc-grid { grid-template-columns: 1fr; }
-  .advisor-form { flex-direction: column; }
-  .advisor-form .form-group { min-width: 100%; }
-  /* Side by side while both fit; each takes a full row once they do not. */
-  .adv-actions { align-self: stretch; }
-  .adv-actions .btn { flex: 1 1 auto; justify-content: center; }
   /* Phone-grade touch targets and readable inputs (16px stops iOS focus zoom) */
   .btn { min-height: 44px; }
   .header-actions .btn, .theme-toggle { min-height: 40px; }
@@ -1001,7 +983,15 @@ input.band-input {
   /* The whole label is the tap target, not the 20px box. */
   .imp-dup { min-height: 44px; font-size: 15px; }
   .imp-dup input { width: 20px; height: 20px; }
-  .hdr-more-menu { left: 0; right: auto; }
+  /* The ⋯ menu hangs from the right edge of the (full-width) actions row,
+     not from the ⋯ button. Anchored to the button with left:0 it was fine
+     where ⋯ wraps to a second row (local mode's long "Set up phone access"),
+     but on the phone shell ⋯ ends the first row, and the open menu ran 120px
+     off the right edge (scrollWidth 510 at 390, shell sandbox 2026-10-03) —
+     cutting off the shell version it now carries. */
+  .header-actions { position: relative; }
+  .hdr-more { position: static; }
+  .hdr-more-menu { left: auto; right: 0; }
   /* Inline edit/split forms were laid out for a desktop row. At 390px their
      selects collapsed to ~40px — "ETF⌄ Brok⌄ US S⌄" — and Split's fixed
      90px/1fr/130px grid left both sleeve pickers as bare chevrons, so a sleeve
@@ -1047,4 +1037,12 @@ input.band-input {
   .import-table tr.row-warn { background: rgba(245,158,11,0.06); }
   .import-table tr.row-err  { background: rgba(239,68,68,0.06); }
   .import-table tr.row-warn td, .import-table tr.row-err td { background: none; }
+  /* Dividend Income stacks too. The Total row's blank spacer cell would print
+     an empty line, and the Pays column's desktop indent would push its label
+     off the left edge the other labels share. */
+  #divBody td:empty { display: none; }
+  #divBody .div-pays { padding-left: 0; }
+  /* Current vs Target stacks the same way; its desktop cell padding and rule
+     outrank the list's, and put a 10px gap and a line between every figure. */
+  .gap-table td { padding: 2px 0; border-top: none; }
 }
