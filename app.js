@@ -610,12 +610,21 @@ function autoDetectSleeve(h) {
   return 'other';
 }
 
+// A stored key the app does not know (an import, an older or newer copy, a
+// hand edit: "crypto") is Other wherever it is read. The stored value is left
+// as it is. Every reader goes through here: a raw SLEEVE_CONFIG[h.sleeve]
+// lookup crashed the Holdings card and Ask's brief (2026-10-11).
+function knownSleeve(key) {
+  return Object.hasOwn(SLEEVE_CONFIG, key) ? key : 'other';
+}
+
 function getSleeve(h) {
   // Use manual override if set, otherwise auto-detect
-  return h.sleeve || autoDetectSleeve(h);
+  return knownSleeve(h.sleeve || autoDetectSleeve(h));
 }
 
 function sleeveOptions(selected) {
+  if (selected) selected = knownSleeve(selected);
   return `<option value="">Auto-detect</option>` +
     Object.entries(SLEEVE_CONFIG).map(([val, cfg]) =>
       `<option value="${val}" ${val === selected ? 'selected' : ''}>${cfg.label}</option>`
@@ -2117,7 +2126,7 @@ function blendedAssumptions(holdingsArr) {
   if (!(tot > 0)) return { mu: 0.04, sigma: 0.12 };
   let mu = 0, sigma = 0;
   for (const h of holdingsArr) {
-    const a = SLEEVE_ASSUMPTIONS[h.sleeve || autoDetectSleeve(h)] || SLEEVE_ASSUMPTIONS.other;
+    const a = SLEEVE_ASSUMPTIONS[getSleeve(h)];
     const w = val(h) / tot;
     mu += w * a.mu;
     sigma += w * a.sigma; // weighted-avg vol — conservative (ignores diversification)
@@ -3298,7 +3307,7 @@ function keepEditRow(tbody, lots, before, after) {
   const h = lots[0], key = h.id;
   const live = {
     [`en-${key}`]: h.name, [`etick-${key}`]: h.ticker || '', [`et-${key}`]: h.type,
-    [`eacc-${key}`]: h.account || '', [`eslv-${key}`]: h.sleeve || '',
+    [`eacc-${key}`]: h.account || '', [`eslv-${key}`]: h.sleeve ? knownSleeve(h.sleeve) : '',
     [`eq-${key}`]: String(+lotsQty(lots).toFixed(6)), [`ep-${key}`]: editPriceStr(h.price),
   };
   for (const [id, v] of Object.entries(live)) {
@@ -5116,7 +5125,7 @@ const ASK_KEEP_TURNS = 30, ASK_HISTORY_TURNS = 10, ASK_OPEN_TURNS = 2;
 // Which shell asked, for the function's log line (`v=`), so "is the phone on
 // the new shell?" and "is anyone using Ask?" are log queries, not guesses.
 // Must equal sw.js VERSION — tests/ask.spec.js fails the build when they drift.
-const ASK_SHELL_VERSION = 'v1.12.0';
+const ASK_SHELL_VERSION = 'v1.12.1';
 let askBusy = false;
 let askAbort = null;               // the in-flight question's AbortController
 let askShowEarlier = false;
@@ -5950,7 +5959,7 @@ const TAX_ADVANTAGED_RE = /roth|401|403|pension|swedish/i;
 function rebalancePlan(holdingsArr, targetsObj, amount, { allowSells = false } = {}) {
   amount = +amount || 0;
   const val = h => (h.quantity || 0) * (h.price || 0);
-  const sleeveOf = h => h.sleeve || autoDetectSleeve(h);
+  const sleeveOf = getSleeve;
   const tot = holdingsArr.reduce((s, h) => s + val(h), 0);
   if (!(tot > 0)) return null;
 
