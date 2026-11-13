@@ -51,6 +51,12 @@
   --toast-action: #2dd4bf;
   /* Lit-edge (dark only) */
   --lit-edge: transparent;
+  /* This week (v1.13.0): gains, losses and the card's sleeve colours */
+  --week-up: #047857; --week-up-bg: #ecfdf5;
+  --week-down: #b91c1c; --week-down-bg: #fef2f2;
+  --week-flat: #52525b; --week-flat-bg: #f4f4f5;
+  --week-src: #6b7280; --week-chip-bg: #f0fdfa; --week-chip-bd: #99f6e4;
+  --week-us: #0d9488; --week-intl: #6d5fd3; --week-bond: #1e3a5f; --week-tilt: #b45309; --week-zero: #9ca3af;
 }
 
 /* ── Dark Mode Tokens ── */
@@ -88,6 +94,11 @@
   --toast-color: #09090b;
   --toast-action: #0f766e;
   --lit-edge: rgba(255,255,255,0.05);
+  --week-up: #34d399; --week-up-bg: rgba(52,211,153,0.12);
+  --week-down: #f87171; --week-down-bg: rgba(248,113,113,0.12);
+  --week-flat: #a3adbf; --week-flat-bg: rgba(255,255,255,0.06);
+  --week-src: #a3adbf; --week-chip-bg: rgba(45,212,191,0.08); --week-chip-bd: rgba(45,212,191,0.3);
+  --week-us: #2dd4bf; --week-intl: #9085e9; --week-bond: #6b9bd1; --week-tilt: #f59e0b; --week-zero: #6b7280;
 }
 
 /* Auto dark mode for system preference (only if no manual override) */
@@ -121,6 +132,11 @@
     --toast-color: #09090b;
     --toast-action: #0f766e;
     --lit-edge: rgba(255,255,255,0.05);
+    --week-up: #34d399; --week-up-bg: rgba(52,211,153,0.12);
+    --week-down: #f87171; --week-down-bg: rgba(248,113,113,0.12);
+    --week-flat: #a3adbf; --week-flat-bg: rgba(255,255,255,0.06);
+    --week-src: #a3adbf; --week-chip-bg: rgba(45,212,191,0.08); --week-chip-bd: rgba(45,212,191,0.3);
+    --week-us: #2dd4bf; --week-intl: #9085e9; --week-bond: #6b9bd1; --week-tilt: #f59e0b; --week-zero: #6b7280;
   }
 }
 
@@ -438,7 +454,7 @@ tr:hover td { background: var(--row-hover); }
 .week-head:focus-visible { outline: none; box-shadow: 0 0 0 4px rgba(13,148,136,0.2); border-radius: 6px; }
 .week-kick { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
 .week-title {
-  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
   color: var(--navy-text); white-space: nowrap;
 }
 .week-when { flex: 1; min-width: 0; font-size: 13px; color: var(--text-muted); }
@@ -451,13 +467,52 @@ tr:hover td { background: var(--row-hover); }
   transform: rotate(-45deg); transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 .week-open .week-chev::before { transform: rotate(45deg); }
-.week-l1 { display: block; font-size: 16px; line-height: 1.4; }
-.week-l1 strong, .week-num, .week-key strong { font-feature-settings: "cv01", "tnum"; }
-.week-l1 strong { font-weight: 600; }
+/* v1.13.0 face lift: the week's story first, then his money, then his three
+   sleeves — the approved mockup (2026-10-11). The head is the kick row only;
+   the summary under the hero is its own button, so source links in the hero
+   are never inside a button. */
+.week-hero {
+  margin: 6px 0 6px; font-size: 19px; line-height: 1.38; font-weight: 600; letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+/* The deterministic headline (no note): figures, a little quieter. */
+.week-hero-plain { font-size: 17px; }
+.week-srcs { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-left: 5px; vertical-align: 2px; }
+.week-src {
+  display: inline-block; padding: 1px 5px; border: 1px solid var(--border-default); border-radius: 5px;
+  font-size: 11px; font-weight: 600; line-height: 1.35; letter-spacing: 0;
+  color: var(--week-src); text-decoration: none; white-space: nowrap; vertical-align: middle;
+}
+.week-src:hover { border-color: var(--accent); color: var(--text-primary); }
+.week-src:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(13,148,136,0.25); }
+.week-sum {
+  display: block; width: 100%; text-align: left; background: none; border: 0; padding: 0;
+  font: inherit; color: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.week-sum:focus-visible { outline: none; box-shadow: 0 0 0 4px rgba(13,148,136,0.2); border-radius: 6px; }
+.week-you { display: block; font-size: 15px; line-height: 1.45; color: var(--text-secondary); }
+.week-you strong { font-size: 22px; font-weight: 700; margin-right: 4px; }
+.week-you strong, .week-num, .week-key strong, .week-pill-v, .week-delta, .week-susd, .week-rval,
+.week-leg, .week-explain b, .week-plan b { font-feature-settings: "cv01", "tnum"; }
+.week-up { color: var(--week-up); }
+.week-down { color: var(--week-down); }
+.week-flat { color: var(--week-flat); }
 /* "· net of $X added" moves to a second line whole, never word by word. */
 .week-nw { white-space: nowrap; }
-.week-l2 { display: block; margin-top: 2px; font-size: 14px; line-height: 1.45; color: var(--text-secondary); }
-.week-body { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-subtle); }
+.week-status { display: block; margin-top: 2px; font-size: 14px; line-height: 1.45; color: var(--text-secondary); }
+.week-pills {
+  display: grid; grid-template-columns: repeat(var(--week-pills, 3), minmax(0, 1fr)); gap: 8px; margin: 12px 0 0;
+}
+.week-pill { display: block; min-width: 0; padding: 9px 10px; border-radius: 10px; background: var(--bg-surface); }
+.week-pill-n {
+  display: block; font-size: 12px; font-weight: 500; color: var(--text-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.week-pill-v { display: block; margin-top: 2px; font-size: 17px; font-weight: 700; white-space: nowrap; }
+.week-more { display: block; margin-top: 10px; text-align: center; font-size: 14px; font-weight: 600; color: var(--accent); }
+[data-theme="dark"] .week-more { color: var(--accent-light); }
+.week-top { display: block; }
+.week-body { margin-top: 16px; }
 .week-tabs { display: flex; gap: 4px; padding: 3px; margin-bottom: 4px; background: var(--bg-surface); border-radius: 8px; }
 .week-tab {
   flex: 1 1 0; min-width: 0; min-height: 36px; border: 0; border-radius: 6px; cursor: pointer;
@@ -467,8 +522,8 @@ tr:hover td { background: var(--row-hover); }
 .week-tab:disabled { opacity: 0.45; cursor: default; }
 .week-tab:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(13,148,136,0.25); }
 .week-sec {
-  margin: 16px 0 2px; font-size: 11px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: 0.03em; color: var(--navy-text);
+  margin: 20px 0 6px; font-size: 12px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--navy-text);
 }
 .week-row {
   display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
@@ -488,9 +543,63 @@ tr:hover td { background: var(--row-hover); }
 .week-swatch-sp  { background: #4a3aa7; }
 [data-theme="dark"] .week-swatch-sp { background: #9085e9; }
 .week-chart { position: relative; width: 100%; min-width: 0; height: 220px; }
-.week-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px; }
-.week-chips > .week-sub { flex-basis: 100%; }
+.week-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 18px; }
+.week-chips .ask-chip { color: var(--text-primary); background: var(--week-chip-bg); border-color: var(--week-chip-bd); }
 .week-foot { margin-top: 10px; font-size: 12px; line-height: 1.45; color: var(--text-muted); }
+.week-foot-end { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border-subtle); }
+/* Sleeve rows: name with its holdings under it, the week's % in a tinted
+   pill, the dollars right; why it moved under the row. Every piece wraps
+   before it widens (375: 311px of row). */
+.week-srow { padding: 11px 0; border-bottom: 1px solid var(--border-subtle); }
+.week-srow:last-child { border-bottom: 0; }
+.week-srow-top { display: flex; align-items: flex-start; gap: 8px; }
+.week-sname { flex: 1 1 auto; min-width: 0; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.week-ssub { display: block; margin-top: 1px; font-size: 13px; font-weight: 400; line-height: 1.35; color: var(--text-muted); }
+.week-snote { margin-top: 2px; font-size: 13px; line-height: 1.35; color: var(--text-muted); }
+.week-delta { flex: 0 0 auto; padding: 2px 7px; border-radius: 6px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.week-delta.week-up { background: var(--week-up-bg); }
+.week-delta.week-down { background: var(--week-down-bg); }
+.week-delta.week-flat { background: var(--week-flat-bg); }
+.week-susd { flex: 0 0 auto; min-width: 62px; text-align: right; font-size: 15px; font-weight: 600; white-space: nowrap; }
+.week-why { margin-top: 4px; font-size: 14px; line-height: 1.45; color: var(--text-secondary); overflow-wrap: anywhere; }
+.week-why-quiet { color: var(--text-muted); font-style: italic; }
+/* Why his bonds are down this year. */
+.week-explain { margin-top: 10px; padding: 12px 12px 10px; border-radius: 10px; background: var(--bg-surface); }
+.week-explain h4 { margin-bottom: 8px; font-size: 14px; font-weight: 700; }
+.week-ratebar { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 13px; }
+.week-rlbl { flex: 0 0 auto; width: 92px; white-space: nowrap; color: var(--text-muted); }
+.week-track { position: relative; flex: 1 1 auto; min-width: 0; height: 8px; border-radius: 4px; background: var(--border-default); }
+.week-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: var(--week-bond); }
+.week-rval { flex: 0 0 auto; width: 48px; text-align: right; font-weight: 600; }
+.week-explain p { margin-top: 8px; font-size: 14px; line-height: 1.5; color: var(--text-secondary); }
+.week-explain b { color: var(--text-primary); }
+/* The next thousand dollars by his targets. */
+.week-split { display: flex; height: 10px; margin: 10px 0 6px; overflow: hidden; border-radius: 5px; background: var(--border-default); }
+.week-split i { display: block; height: 100%; background: var(--week-c); }
+.week-split-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 14px; color: var(--text-secondary); }
+.week-leg { white-space: nowrap; }
+.week-leg::before {
+  content: ''; display: inline-block; width: 9px; height: 9px; margin-right: 6px; border-radius: 2px;
+  background: var(--week-c);
+}
+.week-c-us_stock { --week-c: var(--week-us); }
+.week-c-intl_stock { --week-c: var(--week-intl); }
+.week-c-bond { --week-c: var(--week-bond); }
+.week-c-tilt { --week-c: var(--week-tilt); }
+.week-c-other, .week-c-zero { --week-c: var(--week-zero); }
+/* On the radar. */
+.week-radar { padding: 10px 0; border-bottom: 1px solid var(--border-subtle); }
+.week-tag {
+  display: inline-block; margin-bottom: 3px; font-size: 11px; font-weight: 700; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--text-muted);
+}
+.week-radar-h { font-size: 15px; font-weight: 600; line-height: 1.38; overflow-wrap: anywhere; }
+.week-tie { margin-top: 4px; font-size: 14px; line-height: 1.45; color: var(--text-secondary); overflow-wrap: anywhere; }
+.week-slot { margin-top: 10px; }
+/* Ahead: date tiles. */
+.week-ahead { display: flex; flex-wrap: wrap; gap: 8px; }
+.week-date { padding: 7px 10px; border: 1px solid var(--border-default); border-radius: 9px; font-size: 14px; line-height: 1.3; }
+.week-date b { display: block; font-size: 13px; color: var(--navy-text); }
 /* Midweek "So far": set apart from last week's money lines (CPO, round 2). */
 .week-since { margin-top: 12px; border-top: 1px solid var(--border-default); }
 .week-since > .week-sec { margin-top: 10px; }

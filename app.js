@@ -3852,6 +3852,27 @@ const WEEK_STRIP = [
   // SEK=X is kronor per dollar; the krona's own move is its inverse.
   { key: 'krona', ticker: 'SEK=X',      label: 'Krona vs $',     perUsd: true },
 ];
+// The bond explainer (Insights face lift, v1.13.0) reads a year of closes for
+// the 5-yr Treasury yield and VGIT. Only those two are fetched over the longer
+// range; every other chart keeps the epoch's. Two years, not one: a "1y" range
+// fetched on a weekend starts a day or two after the date a year back.
+const WEEK_FIVE_YR = '^FVX';
+const WEEK_BOND_ETF = 'VGIT';
+const WEEK_LONG = [WEEK_FIVE_YR, WEEK_BOND_ETF];
+const WEEK_LONG_RANGE = '2y';
+const WEEK_EXPLAIN_MIN_PT = 0.25;         // a smaller year's move is not worth explaining
+const WEEK_YEAR_SLACK_DAYS = 4;           // a year back: that date's close, or one up to 4 days before
+// His money by sleeve: the card's rows and its three collapsed pills. `note`
+// is the weekly note's key for the sleeve's "why" line.
+const WEEK_SLEEVES = [
+  { key: 'us_stock',   label: 'US stocks',     note: 'us' },
+  { key: 'intl_stock', label: 'International', note: 'intl' },
+  { key: 'bond',       label: 'Bonds',         note: 'bonds' },
+  { key: 'tilt',       label: 'Tilts' },
+  { key: 'other',      label: 'Other' },
+];
+const WEEK_PILLS = ['us_stock', 'intl_stock', 'bond'];
+const WEEK_NEXT_AMOUNT = 1000;            // "Your targets would split the next" thousand dollars
 
 const weekDayOf = d => new Date(d + 'T00:00:00Z').getUTCDay();
 const weekAddDays = (d, n) => new Date(Date.parse(d + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
@@ -4070,6 +4091,21 @@ function weekNoNewPrice(m) {
   }
   return [...groups.values()];
 }
+// A payout that went ex inside the window left the price, not his pocket:
+// named, never read as a loss (PLAN §3). Units held the day before ex.
+function weekPayout(r, ctx, dates) {
+  const start = dates[0], end = dates[dates.length - 1];
+  let amount = 0, exDate = null;
+  if (!hasRealTicker(r.h)) return { amount, exDate };
+  for (const dv of ctx.divs[r.h.ticker.toUpperCase()] || []) {
+    if (dv.date <= start || dv.date > end) continue;
+    const i = dates.findIndex(d => d >= dv.date);
+    const units = i > 0 ? r.qty[i - 1] : r.qty[0];
+    amount += dv.amount * units;
+    if (!exDate || dv.date > exDate) exDate = dv.date;
+  }
+  return { amount, exDate };
+}
 function weekLines(money, ctx, dates) {
   const start = dates[0], end = dates[dates.length - 1], n = dates.length;
   const groups = new Map();
@@ -4085,17 +4121,9 @@ function weekLines(money, ctx, dates) {
       if (!g.from || r.stampFrom < g.from) g.from = r.stampFrom;
       if (!g.to || r.stampTo > g.to) g.to = r.stampTo;
     }
-    // A payout that went ex inside the window left the price, not his pocket:
-    // named on the line, never read as a loss (PLAN §3). Units held the day before.
-    if (hasRealTicker(r.h)) {
-      for (const dv of ctx.divs[r.h.ticker.toUpperCase()] || []) {
-        if (dv.date <= start || dv.date > end) continue;
-        const i = dates.findIndex(d => d >= dv.date);
-        const units = i > 0 ? r.qty[i - 1] : r.qty[0];
-        g.payout += dv.amount * units;
-        if (!g.exDate || dv.date > g.exDate) g.exDate = dv.date;
-      }
-    }
+    const p = weekPayout(r, ctx, dates);
+    g.payout += p.amount;
+    if (p.exDate && (!g.exDate || p.exDate > g.exDate)) g.exDate = p.exDate;
     groups.set(key, g);
   }
   const all = [...groups.values()].map(g => ({ ...g,
@@ -4113,7 +4141,75 @@ function weekLines(money, ctx, dates) {
     // headline's figure (QA, Drop 2 round 1).
     rest: rest.length ? { gain: rest.reduce((s, g) => s + g.gain, 0), count: rest.length,
       added: rest.reduce((s, g) => s + g.added, 0), payout: rest.reduce((s, g) => s + g.payout, 0) } : null,
+    // Every line priced on its own dates (the pension), not only the top three:
+    // the sleeve rows mix it with funds priced on the window's closes, so the
+    // card says it once under them.
+    offWindow: all.filter(g => g.offWindow).map(g => ({ name: g.name, from: g.from, to: g.to })),
   };
+}
+
+// The holdings behind a sleeve row, as he would name them: a ticker; a 401K
+// fund by its account in a stock sleeve ("401K") and by what it holds in the
+// bond sleeve ("TIPS"); the pension's funds as "pension" and, for its krona
+// bond fund, "krona fund".
+function weekShortName(h, sleeve) {
+  if (hasRealTicker(h)) return h.ticker.toUpperCase();
+  const px = proxyEntryFor(h);
+  if (px) return sleeve === 'bond' ? px.index.replace(/^US /, '') : (h.account || px.index);
+  if (Array.isArray(h.fxHistory) && h.fxHistory.length) {
+    if (sleeve === 'bond') return h.fxHistory.some(r => r && r.currency === 'SEK') ? 'krona fund' : 'pension bond fund';
+    return /pension/i.test(h.account || '') ? 'pension' : (h.account || 'pension');
+  }
+  const name = String(h.name || '');
+  return name.length > 20 ? name.slice(0, 19) + '…' : name;
+}
+// His money by sleeve over one window: each sleeve is weekMoney over its own
+// holdings, so its percentage is the same chained return net of money added,
+// weighted by value. A sleeve with a holding left out (no price) keeps its
+// dollars and shows no percentage, like the whole-portfolio figure.
+function weekSleeves(holdingsArr, txns, ctx, dates, noPct) {
+  const n = dates.length, out = [];
+  // A sleeve key the card does not know is Other: the rows always add up to
+  // the headline (CIO, v1.13.0 review).
+  const known = new Set(WEEK_SLEEVES.map(s => s.key));
+  const sleeveOf = h => (known.has(getSleeve(h)) ? getSleeve(h) : 'other');
+  for (const s of WEEK_SLEEVES) {
+    const hs = holdingsArr.filter(h => sleeveOf(h) === s.key);
+    if (!hs.length) continue;
+    const m = weekMoney(hs, txns, ctx, dates);
+    if (!m.priced.length) continue;
+    const byValue = m.priced.slice().sort((a, b) => b.vals[n - 1] - a.vals[n - 1]);
+    let payout = 0, exDate = null;
+    for (const r of m.priced) {
+      const p = weekPayout(r, ctx, dates);
+      payout += p.amount;
+      if (p.exDate && (!exDate || p.exDate > exDate)) exDate = p.exDate;
+    }
+    out.push({ key: s.key, label: s.label, names: [...new Set(byValue.map(r => weekShortName(r.h, s.key)))],
+      startValue: m.startValue, endValue: m.endValue, added: m.added, gain: m.gain,
+      pct: noPct || m.left.length ? null : m.pct,
+      payout: payout > 0.005 ? { amount: payout, exDate } : null });
+  }
+  return out;
+}
+
+// Why his bonds are down (or up) this year: the 5-yr yield and VGIT's price a
+// year apart, and what that did to his VGIT shares. Price only — VGIT's raw
+// closes, payouts not in it. Null unless he holds VGIT and both series reach
+// back a year.
+function weekBondYear(ctx, holdingsArr, end) {
+  const shares = holdingsArr.filter(h => hasRealTicker(h) && h.ticker.toUpperCase() === WEEK_BOND_ETF)
+    .reduce((s, h) => s + (+h.quantity || 0), 0);
+  if (!(shares > 0) || !end) return null;
+  // The edge's rule (insights.ts closeAt), so card and note agree: 365 days
+  // back, and the close on that date or up to WEEK_YEAR_SLACK_DAYS before it.
+  const ago = weekAddDays(end, -365);
+  const ys = ctx.closes[WEEK_FIVE_YR], vs = ctx.closes[WEEK_BOND_ETF];
+  const y0 = weekAt(ys, ago), y1 = weekAt(ys, end), v0 = weekAt(vs, ago), v1 = weekAt(vs, end);
+  const near = p => p && p.date >= weekAddDays(ago, -WEEK_YEAR_SLACK_DAYS);
+  if (!near(y0) || !near(v0) || !y1 || !v1 || y1.date <= ago) return null;
+  return { from: y0.date, to: y1.date, yieldFrom: y0.c, yieldTo: y1.c, changePt: y1.c - y0.c,
+    priceFrom: v0.c, priceTo: v1.c, pricePct: (v1.c / v0.c - 1) * 100, shares, usd: shares * (v1.c - v0.c) };
 }
 
 // The market strip for a window: each series' close-to-close move.
@@ -4214,6 +4310,8 @@ function weekSymbols(holdingsArr) {
     else if (proxyEntryFor(h)) s.add(proxyEntryFor(h).proxy);
   }
   WEEK_POLICY.forEach(t => s.add(t));
+  // The 5-yr yield only for the bond explainer, which needs VGIT held.
+  if (holdingsArr.some(h => hasRealTicker(h) && h.ticker.toUpperCase() === WEEK_BOND_ETF)) s.add(WEEK_FIVE_YR);
   return [...s];
 }
 
@@ -4296,7 +4394,8 @@ function weekCompute({ holdingsArr, txns, charts, snapshots, tgt, now = Date.now
     const moved = weekLines(r.m, ctx, dates);
     out.windows[key] = { key, label: w.label, words: w.words, from: w.start, to: w.end, complete: !!w.complete,
       you: r.you, flagged: r.flagged, unmatched: r.unmatched,
-      strip: weekStrip(ctx, w.start, w.end), lines: moved.lines, rest: moved.rest,
+      strip: weekStrip(ctx, w.start, w.end), lines: moved.lines, rest: moved.rest, offWindow: moved.offWindow,
+      sleeves: weekSleeves(holdingsArr, txns, ctx, dates, r.flagged.length > 0),
       left: r.left, leftShort: r.leftShort, noNewPrice: r.noNewPrice,
       chart: { dates, you: r.you.pct == null ? null : r.m.index, sp: dates.map(d => spAt(d, w.start)) } };
   }
@@ -4311,6 +4410,7 @@ function weekCompute({ holdingsArr, txns, charts, snapshots, tgt, now = Date.now
         spPct: spAt(w.end, w.start), left: r.left, leftShort: r.leftShort, noNewPrice: r.noNewPrice };
     }
   }
+  if (out.windows.week) out.bondYear = weekBondYear(ctx, holdingsArr, out.windows.week.to);
   const ep = W.epoch.start ? weekEpoch(snapshots, txns, W.end) : null;
   // His target mix over the same span: the policy series, dividends in.
   let mixPct = null;
@@ -4373,6 +4473,9 @@ function askWeek(facts, r2, plan) {
     everythingElse: w.rest ? { changeNetOfMoneyAdded: r2(w.rest.gain), moneyAdded: r2(w.rest.added ?? null),
       holdings: w.rest.count, payouts: r2(w.rest.payout) } : null,
     notPriced: w.left || [],
+    // The card's sleeve rows and pills (v1.13.0), so Ask quotes the figures he sees.
+    ...(Array.isArray(w.sleeves) ? { bySleeve: w.sleeves.map(s => ({ sleeve: s.label, holdings: s.names,
+      changeNetOfMoneyAdded: r2(s.gain), pctNetOfMoneyAdded: r2(s.pct), moneyAdded: r2(s.added) })) } : {}),
   };
   const sf = facts.windows.sinceFri;
   const e = facts.windows.epoch, p = e?.perf;
@@ -4441,7 +4544,8 @@ async function refreshWeek() {
     const publicFallback = !(typeof cloudReady === 'function' && cloudReady());
     // In parallel: the Advisor's panels fetched one chart after another.
     const got = await Promise.all(symbols.map(t =>
-      fetchYahooChart(t, range, { events: true, publicFallback }).catch(() => null)));
+      fetchYahooChart(t, WEEK_LONG.includes(t) ? WEEK_LONG_RANGE : range, { events: true, publicFallback })
+        .catch(() => null)));
     const charts = {};
     symbols.forEach((t, i) => { if (got[i]) charts[t] = got[i]; });
     if (!charts[WEEK_ANCHOR]) { weekFailedAt = Date.now(); return; }
@@ -4461,9 +4565,108 @@ async function refreshWeek() {
   }
 }
 
+// ─── The weekly market note (Insights face lift, v1.13.0) ──────────────────
+// One row a week in portfolio_insights, written by the edge on Saturday from
+// mainstream and official sources and checked there field by field. The card
+// shows its words only for the week the card itself shows (weekNote): a note
+// for any other week disappears and the card is numbers only — never a stale
+// headline. Signed in it is read from the cloud (cloudFetchInsights); signed
+// out on a local server with the sandbox switch on, from data/insights.json
+// beside the page. Nothing else is fetched, from nowhere else.
+const INSIGHTS_CACHE_KEY = 'portfolio_insights_v1';
+const INSIGHTS_SANDBOX_URL = 'data/insights.json';
+// Where a source chip may link: the edge's allowlist, checked again here.
+const INSIGHTS_SOURCE_HOSTS = ['cnbc.com', 'finance.yahoo.com', 'nasdaq.com', 'bloomberg.com', 'cnn.com',
+  'federalreserve.gov', 'treasury.gov', 'bls.gov', 'bea.gov', 'ecb.europa.eu', 'riksbank.se'];
+let weekInsights = loadInsightsCache();
+let insightsBusy = false;
+let insightsAt = 0;
+
+function insightsRow(r) {
+  if (!r || typeof r !== 'object' || typeof r.week_ending !== 'string') return null;
+  const obj = x => (x && typeof x === 'object' && !Array.isArray(x) ? x : null);
+  return { week_ending: r.week_ending, status: String(r.status || ''), note: obj(r.note), facts: obj(r.facts),
+    created_at: typeof r.created_at === 'string' ? r.created_at : null };
+}
+function loadInsightsCache() {
+  try { return insightsRow(JSON.parse(localStorage.getItem(INSIGHTS_CACHE_KEY) || 'null')); } catch (e) { return null; }
+}
+function saveInsightsCache(row) {
+  try { localStorage.setItem(INSIGHTS_CACHE_KEY, JSON.stringify(row)); } catch (e) { /* the card still has it in memory */ }
+}
+async function refreshInsights() {
+  if (insightsBusy) return;
+  const signedIn = typeof cloudReady === 'function' && cloudReady();
+  if (!signedIn && !weekPublicAllowed()) return;
+  insightsBusy = true;
+  insightsAt = Date.now();
+  try {
+    let row;
+    if (signedIn) row = await cloudFetchInsights();
+    else {
+      const res = await fetch(INSIGHTS_SANDBOX_URL, { cache: 'no-store' });
+      if (res.status >= 500) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+      row = res.ok ? await res.json() : null;
+    }
+    row = insightsRow(row);
+    // No row yet (the first Saturday has not run): keep what the phone has.
+    if (row) { weekInsights = row; saveInsightsCache(row); }
+  } catch (e) {
+    console.warn('[insights]', e.message);
+    // A refusal (4xx, 42501, a table not there yet) will not change in a
+    // minute: the half-hour cadence. A network error or a 5xx: a minute.
+    if (!insightsRefused(e)) insightsAt = Date.now() - WEEK_REFRESH_MS + WEEK_RETRY_MS;
+  } finally {
+    insightsBusy = false;
+    renderWeekCard();
+  }
+}
+function insightsRefused(e) {
+  return (e?.status >= 400 && e.status < 500) || ['42501', '42P01', 'PGRST205', 'PGRST301'].includes(e?.code) ||
+    /does not exist|permission denied/i.test(String(e?.message || ''));
+}
+function maybeRefreshInsights() {
+  if (insightsBusy || !weekCanFetch()) return;
+  if (insightsAt && Date.now() - insightsAt < WEEK_REFRESH_MS) return;
+  refreshInsights();
+}
+// The note, only when it is for the week the card shows.
+function weekNote(facts) {
+  const r = weekInsights, n = r?.note, end = facts?.windows?.week?.to;
+  if (!r || r.status !== 'ok' || !n || !end || n.weekEnding !== end || r.week_ending !== end) return null;
+  return n;
+}
+const weekNoteText = f => (f && typeof f.text === 'string' && f.text.trim() ? f.text.trim() : null);
+// The row's calendar (FOMC, CPI, jobs), deterministic on the edge: dates
+// still ahead of today only. Not model-written, so it shows with or without a note.
+function weekAhead(today = nyToday(), weekEnd = null) {
+  // Only from a row for this week or the one before: an old row's calendar
+  // is not the card's (CIO, v1.13.0 review).
+  if (weekEnd && !(weekInsights?.week_ending >= weekAddDays(weekEnd, -7))) return [];
+  const list = Array.isArray(weekInsights?.facts?.ahead) ? weekInsights.facts.ahead : [];
+  const iso = d => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d);
+  return list.filter(a => a && iso(a.date) && typeof a.label === 'string' && (iso(a.end) ? a.end : a.date) >= today)
+    .map(a => ({ date: a.date, ...(iso(a.end) && a.end !== a.date ? { end: a.end } : {}), label: a.label }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+}
+// The note as the Ask brief carries it: the words only — no links, no cited text.
+function weekNoteBrief(facts, today) {
+  const n = weekNote(facts);
+  if (!n) return null;
+  const s = n.sleeves || {};
+  const str = x => (typeof x === 'string' && x.trim() ? x.trim() : null);
+  return { hero: weekNoteText(n.hero),
+    sleeves: { us: weekNoteText(s.us), intl: weekNoteText(s.intl), bonds: weekNoteText(s.bonds) },
+    radar: (Array.isArray(n.radar) ? n.radar : []).slice(0, 2).filter(r => r && str(r.text))
+      .map(r => ({ tag: str(r.tag), text: str(r.text), tie: str(r.tie) })),
+    ahead: weekAhead(today, facts.windows.week.to) };
+}
+
 // Called from render(): cheap unless the charts are missing or half an hour old.
 function maybeRefreshWeek() {
-  if (weekBusy || !holdings.length || !weekCanFetch()) return;
+  if (!holdings.length || !weekCanFetch()) return;
+  maybeRefreshInsights();
+  if (weekBusy) return;
   const now = Date.now();
   if (weekCharts && now - weekCharts.fetchedAt < (weekCharts.missing?.length ? WEEK_RETRY_MS : WEEK_REFRESH_MS)) return;
   if (weekFailedAt && now - weekFailedAt < WEEK_RETRY_MS) return;
@@ -4509,31 +4712,33 @@ function weekChipsFor(w, plan) {
   return out.slice(0, 3);
 }
 
-// Line 1. The window is in the kicker above it ("This week · to Fri Oct 2"),
-// so the line is only the money: short enough for one line at 375px. The
-// money-added clause never breaks inside itself: at 375 the Month line used
-// to leave "added" alone on a second line.
+// The money line under the hero (v1.13.0): his window in dollars, large, then
+// the percentage and the money-added clause, each kept whole — "· net of $X
+// added" never breaks inside itself at 375.
+const weekTone = (n, eps = 0.5) => (n >= eps ? 'up' : n <= -eps ? 'down' : 'flat');
+const weekPctTone = n => weekTone(n, 0.005);
 function weekHeadline(w) {
   if (w.key === 'epoch') {
     const p = w.perf;
-    return p ? `<strong>${weekPct(p.pct)}</strong> · net of money added` : null;
+    return p ? `<strong class="week-${weekPctTone(p.pct)}">${weekPct(p.pct)}</strong> <span class="week-you-sub"><span class="week-nw">net of money added</span></span>` : null;
   }
   const y = w.you;
+  let parts;
   // A window across a flagged period: the dollars and what the record says
-  // was added, no percentage (the foot says why).
+  // was added, no percentage (the foot says why). "net of": "$X recorded as
+  // added" read as gross beside lines that say "net of $X added" (CPO, round 2).
   if ((w.flagged || []).length) {
-    // "net of": "$X recorded as added" read as gross beside lines that say
-    // "net of $X added" (CPO, round 2).
-    const rec = Math.abs(y.added) < 0.5 ? 'nothing recorded as added'
-      : `net of ${weekUsdPlain(y.added)} recorded as ${y.added > 0 ? 'added' : 'taken out'}`;
-    return `<strong>${weekUsd(y.gain)}</strong> <span class="week-nw">· ${rec}</span>`;
+    parts = [Math.abs(y.added) < 0.5 ? 'nothing recorded as added'
+      : `net of ${weekUsdPlain(y.added)} recorded as ${y.added > 0 ? 'added' : 'taken out'}`];
+  } else {
+    const added = Math.abs(y.added) < 0.5 ? 'no money added'
+      : y.added > 0 ? `net of ${weekUsdPlain(y.added)} added` : `net of ${weekUsdPlain(y.added)} taken out`;
+    // Part of the portfolio (a holding not priced): dollars, no percentage,
+    // and what is out said first (CIO, Drop 2 round 2).
+    parts = [y.pct != null && !(w.left || []).length ? weekPct(y.pct) : null, weekLeadOut(w), added].filter(Boolean);
   }
-  const added = Math.abs(y.added) < 0.5 ? 'nothing added'
-    : y.added > 0 ? `net of ${weekUsdPlain(y.added)} added` : `net of ${weekUsdPlain(y.added)} taken out`;
-  // Part of the portfolio (a holding not priced): dollars, no percentage —
-  // line 2 says what is out (CIO, Drop 2 round 2).
-  if (y.pct == null || (w.left || []).length) return `<strong>${weekUsd(y.gain)}</strong> <span class="week-nw">· ${added}</span>`;
-  return `<strong>${weekUsd(y.gain)} (${weekPct(y.pct)})</strong> <span class="week-nw">· ${added}</span>`;
+  return `<strong class="week-${weekTone(y.gain)}">${weekUsd(y.gain)}</strong> <span class="week-you-sub">${
+    parts.map(p => `<span class="week-nw">${esc(p)}</span>`).join(' · ')}</span>`;
 }
 // What the record cannot split, under the window it applies to. Ledger rows
 // the window could not count are named by holding, and said under the
@@ -4576,59 +4781,188 @@ function weekLeadOut(w) {
   const named = 'excl. ' + [...counts].map(([l, k]) => (k > 1 ? `${l} ×${k}` : l)).join(', ');
   return named.length <= 22 ? named : `excl. ${labels.length} holding${labels.length > 1 ? 's' : ''}`;
 }
-function weekSecondLine(w, plan) {
+// ─── This week, the face lift (v1.13.0) ─────────────────────────────────────
+// David approved the mockup on 2026-10-11: the week's market story first, in
+// one or two sentences with its sources; then his money; then, opened, his
+// money by sleeve with why each moved, what a year of rising yields did to
+// his bonds, his plan, what is on the radar and what is ahead. Every model
+// word comes from the weekly note and shows only for its own week; without
+// one the card is the same card in numbers only.
+
+// The deterministic headline: the S&P and the 10-yr over the window, as
+// clauses that each wrap whole ("(+41 bp)" never alone on a line at 430).
+function weekHeroFallback(w) {
   const sp = (w.strip || []).find(s => s.key === 'sp' && !s.na);
   const ten = (w.strip || []).find(s => s.key === 'tenYr' && !s.na);
-  // A figure for part of the portfolio says so first (CIO and CPO, Drop 2
-  // round 2), beside the S&P only: at 375 the line holds 309px, and the
-  // three usual clauses already take 306 (measured). The 10-yr and the plan
-  // are a tap away, and Where you stand sits just below.
-  const out = w.key === 'epoch' ? null : weekLeadOut(w);
-  if (out) return [out, sp && `S&P ${weekPct(sp.pct)}`].filter(Boolean).join(' · ');
-  return [sp && `S&P ${weekPct(sp.pct)}`, ten && `10-yr ${ten.level.toFixed(2)}%`, plan && plan.clause]
-    .filter(Boolean).join(' · ');
+  const bp = ten ? Math.round(ten.bp) : 0;
+  return [sp && `S&P 500 ${weekPct(sp.pct)}`,
+    ten && `10-yr Treasury ${ten.level.toFixed(2)}% (${bp ? (bp > 0 ? '+' : '−') + Math.abs(bp) : '0'} bp)`]
+    .filter(Boolean);
+}
+// Source chips: at most two, de-duplicated. A chip links only to an https
+// URL whose host is on the edge's allowlist (or a subdomain of one); any
+// other URL — http, javascript:, a markdown link, another host — leaves the
+// chip as plain text with no link (CISO, insights-1 review). Names are text.
+function weekSourceUrl(raw) {
+  let u;
+  try { u = new URL(String(raw || '')); } catch (e) { return null; }
+  const host = u.hostname.toLowerCase();
+  if (u.protocol !== 'https:' || u.port !== '' || u.username || u.password ||
+      !INSIGHTS_SOURCE_HOSTS.some(h => host === h || host.endsWith('.' + h))) return null;
+  return u.href;
+}
+function weekSources(list) {
+  const seen = new Set();
+  return (Array.isArray(list) ? list : []).map(s => {
+    if (!s || typeof s !== 'object') return null;
+    const url = weekSourceUrl(s.url);
+    const name = typeof s.name === 'string' && s.name.trim() ? s.name.trim()
+      : url ? new URL(url).hostname.replace(/^www\./, '') : null;
+    if (!name) return null;
+    const key = url ? new URL(url).hostname.replace(/^www\./, '') : 'name:' + name;
+    if (seen.has(key)) return null;
+    seen.add(key);
+    return { name, url };
+  }).filter(Boolean).slice(0, 2);
+}
+function weekSrcHtml(list) {
+  const s = weekSources(list);
+  return s.length ? `<span class="week-srcs">${s.map(x => (x.url
+    ? `<a class="week-src" href="${esc(x.url)}" target="_blank" rel="noopener noreferrer"
+      aria-label="Source: ${esc(x.name)} (opens in a new tab)">${esc(x.name)}</a>`
+    : `<span class="week-src week-src-plain">${esc(x.name)}</span>`)).join('')}</span>` : '';
 }
 
-function weekStripHtml(strip) {
-  return `<div class="week-strip">${strip.map(s => `<div class="week-row">
-      <span class="week-name">${esc(s.label)}${s.sub ? `<span class="week-sub"> · ${esc(s.sub)}</span>` : ''}</span>
-      <span class="week-num">${s.na ? '—'
-        : s.level != null ? `${s.level.toFixed(2)}% <span class="week-sub">${fmtSignedBp(s.bp / 100)}</span>`
-        : weekPct(s.pct)}</span>
-    </div>`).join('')}</div>`;
+// Collapsed: the three sleeves' week, value-weighted over his holdings in each.
+function weekPillsHtml(w) {
+  const by = new Map((w.sleeves || []).map(s => [s.key, s]));
+  const list = WEEK_PILLS.map(k => by.get(k)).filter(Boolean);
+  if (!list.length) return '';
+  return `<span class="week-pills" style="--week-pills:${list.length}">${list.map(s => `<span class="week-pill" data-sleeve="${esc(s.key)}">
+      <span class="week-pill-n">${esc(s.label)}</span>
+      <span class="week-pill-v week-${s.pct == null ? weekTone(s.gain) : weekPctTone(s.pct)}">${s.pct == null ? weekUsd(s.gain) : weekPct(s.pct)}</span>
+    </span>`).join('')}</span>`;
 }
-// Each clause of a line's note stays whole and the line breaks between them:
-// at 375 the Month VOO note broke "(ex Sep" / "28)" and the pension's left
-// "added" alone (real-data screenshots, Drop 2 round 1).
-function weekLinesHtml(w) {
-  const row = (name, gain, parts) => `<div class="week-row week-line">
-      <span class="week-name">${esc(name)}${parts.length ? `<span class="week-note-line">${
-        parts.map(p => `<span class="week-nw">${esc(p)}</span>`).join(' · ')}</span>` : ''}</span>
-      <span class="week-num">${weekUsd(gain)}</span>
+
+const WEEK_QUIET_WHY = 'No single reported cause. It moved with world markets.';
+// One row per sleeve: name, its holdings on their own line, the week's
+// percentage and dollars; under it why it moved, from the note.
+function weekSleeveRowsHtml(w, note, bondYear) {
+  return (w.sleeves || []).map(s => {
+    const notes = [
+      ...(s.payout ? [`incl. ${weekUsdPlain(s.payout.amount)} dividend reinvested`, `ex ${weekShort(s.payout.exDate)}`] : []),
+      s.added >= 0.5 ? `net of ${weekUsdPlain(s.added)} added` : s.added <= -0.5 ? `net of ${weekUsdPlain(s.added)} taken out` : null,
+    ].filter(Boolean);
+    const key = WEEK_SLEEVES.find(x => x.key === s.key)?.note;
+    let why = '';
+    if (note && key) {
+      const f = note.sleeves?.[key];
+      const text = weekNoteText(f);
+      why = text ? `<p class="week-why">${esc(text)}${weekSrcHtml(f.sources)}</p>`
+        : `<p class="week-why week-why-quiet">${esc(WEEK_QUIET_WHY)}</p>`;
+    }
+    return `<div class="week-srow" data-sleeve="${esc(s.key)}">
+      <div class="week-srow-top">
+        <span class="week-sname">${esc(s.label)}<span class="week-ssub">${
+          (s.names || []).map(n => `<span class="week-nw">${esc(n)}</span>`).join(' · ')}</span></span>
+        ${s.pct != null ? `<span class="week-delta week-${weekPctTone(s.pct)}">${weekPct(s.pct)}</span>` : ''}
+        <span class="week-susd week-${weekTone(s.gain)}">${weekUsd(s.gain)}</span>
+      </div>${notes.length
+        // The row's full width, not the name's column: beside a % pill the
+        // column is ~165px at 375, narrower than "incl. $560 dividend reinvested".
+        ? `<p class="week-snote">${notes.map(p => `<span class="week-nw">${esc(p)}</span>`).join(' · ')}</p>` : ''}${
+        why}${s.key === 'bond' ? weekExplainHtml(bondYear) : ''}
     </div>`;
-  // David reinvests every payout (2026-10-04): the dividend left the price and
-  // came back as new units, so it is never described as paid out.
-  // Two clauses, each kept whole: as one clause the payout note ran about 260px
-  // into a 235-253px name column at 375 and 393 on his data (CIO, final).
-  const payout = p => [`incl. ${weekUsdPlain(p.amount)} dividend reinvested`, `ex ${weekShort(p.exDate)}`];
-  const lines = (w.lines || []).map(l => row(l.name, l.gain, [
-    l.pricedFrom ? `priced ${weekShort(l.pricedFrom)} → ${weekShort(l.pricedTo)}` : null,
-    ...(l.payout ? payout(l.payout) : []),
-    l.added >= 0.5 ? `net of ${weekUsdPlain(l.added)} added` : null,
-  ].filter(Boolean))).join('');
-  const rest = w.rest ? row('Everything else', w.rest.gain, [
-    w.rest.payout >= 0.5 ? `incl. ${weekUsdPlain(w.rest.payout)} in dividends reinvested` : null,
-    w.rest.added >= 0.5 ? `net of ${weekUsdPlain(w.rest.added)} added` : null,
-  ].filter(Boolean)) : '';
-  // A fund with no new price in the window: named, no figure (CPO, round 2).
-  const stale = (w.noNewPrice || []).map(x => `<div class="week-row week-line week-stale">
-      <span class="week-name">${esc(x.name)}<span class="week-note-line"><span class="week-nw">no new price since ${
-        esc(weekShort(x.since))}</span> — <span class="week-nw">not in this figure</span></span></span>
-      <span class="week-num">—</span>
-    </div>`).join('');
-  const left = (w.left || []).length
-    ? `<p class="week-foot">Left out — no price for these dates: ${esc(w.left.join(', '))}.</p>` : '';
-  return `<div class="week-lines">${lines}${rest}${stale}</div>${left}`;
+  }).join('');
+}
+
+// "Oct ’25"
+const weekMonYr = d => `${weekShort(d).split(' ')[0]} ’${d.slice(2, 4)}`;
+// 5.02 → "5", 3.74 → "3.7": "about" a yield, to a tenth.
+const weekAbout = n => String(+n.toFixed(1));
+// Why his bonds are down this year (or up): shown when he holds VGIT and the
+// 5-yr yield moved at least a quarter point in a year — and only when VGIT's
+// price moved the way the yield says it should, so the sentence never
+// explains a move that did not happen.
+function weekExplainHtml(b) {
+  if (!b || Math.abs(b.changePt) < WEEK_EXPLAIN_MIN_PT) return '';
+  const rose = b.changePt > 0;
+  if (rose ? b.pricePct >= 0 : b.pricePct <= 0) return '';
+  const scale = Math.floor(Math.max(b.yieldFrom, b.yieldTo)) + 1;
+  const bar = (label, v) => `<div class="week-ratebar"><span class="week-rlbl">${esc(label)}</span>
+      <span class="week-track"><span class="week-fill" style="width:${(v / scale * 100).toFixed(1)}%"></span></span>
+      <span class="week-rval">${v.toFixed(2)}%</span></div>`;
+  const shares = b.shares.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  return `<div class="week-explain">
+      <h4>Why your bonds are ${rose ? 'down' : 'up'} this year</h4>
+      ${bar(`5-yr, ${weekMonYr(b.from)}`, b.yieldFrom)}${bar('5-yr, now', b.yieldTo)}
+      <p>Yields ${rose ? 'rose' : 'fell'} <b>${Math.abs(b.changePt).toFixed(2)} pts</b> in a year. Existing bonds
+        ${rose ? 'lose value when new ones pay more' : 'gain value when new ones pay less'}, so VGIT’s price
+        ${rose ? 'fell' : 'rose'} <b>${Math.abs(b.pricePct).toFixed(1)}%</b> (<span class="week-nw">${weekUsd(b.usd)}</span> on your ${esc(shares)} shares,
+        price only). It moves about <b>5% per 1 pt</b> of yield.</p>
+      <p>The flip side: VGIT’s monthly payouts now come from bonds yielding about <b>${weekAbout(b.yieldTo)}%</b>,
+        ${b.yieldTo >= b.yieldFrom ? 'up' : 'down'} from about ${weekAbout(b.yieldFrom)}%.</p>
+    </div>`;
+}
+
+// The next thousand dollars by his targets, from the rebalance engine's buy-only plan
+// (rebalancePlan) — the same plan Ask's newMoney quotes. A sleeve over its
+// target gets nothing and says why.
+function weekSplitRows() {
+  const p = rebalancePlan(holdings, targets, WEEK_NEXT_AMOUNT, { allowSells: false });
+  if (!p || !p.rows.length) return [];
+  const vals = getSleeveTotals(), tg = getSleeveTargetPcts();
+  const tot = Object.values(vals).reduce((a, b) => a + b, 0);
+  const label = Object.fromEntries(WEEK_SLEEVES.map(s => [s.key, s.label]));
+  return p.rows.filter(r => (tg[r.sleeve] || 0) > 0 || (vals[r.sleeve] || 0) > 0)
+    .map(r => ({ key: r.sleeve, label: label[r.sleeve] || r.label, amount: r.action === 'buy' ? r.amount : 0,
+      // Its share now above its target: the only $0 that says why (an
+      // underweight Other gets $0 from the buy-only plan too, for another reason).
+      over: tot > 0 && (vals[r.sleeve] || 0) / tot * 100 > (tg[r.sleeve] || 0) + 1e-9 }))
+    .sort((a, b) => b.amount - a.amount);
+}
+function weekSplitHtml() {
+  const rows = weekSplitRows();
+  const tot = rows.reduce((s, r) => s + r.amount, 0);
+  if (!(tot > 0)) return '';
+  return `<div class="week-split" role="img" aria-label="${esc(rows.map(r => `${r.label} ${weekUsdPlain(r.amount)}`).join(', '))}">${
+      rows.filter(r => r.amount >= 1).map(r => `<i class="week-c-${esc(r.key)}" style="width:${(r.amount / tot * 100).toFixed(2)}%"></i>`).join('')}</div>
+    <div class="week-split-legend">${rows.map(r => `<span class="week-leg week-c-${r.amount >= 1 ? esc(r.key) : 'zero'}" data-sleeve="${esc(r.key)}">${
+      esc(r.label)} ${weekUsdPlain(r.amount)}${r.amount < 1 && r.over ? ' (over target)' : ''}</span>`).join('')}</div>`;
+}
+
+// On the radar: the note's one or two items beyond his holdings, each with
+// what it means for his funds or plan (no advice), then his plan's slot for
+// play money, from his own targets.
+function weekRadarHtml(note) {
+  const items = (Array.isArray(note?.radar) ? note.radar : []).slice(0, 2).filter(r => r && weekNoteText(r));
+  if (!items.length) return '';
+  const str = x => (typeof x === 'string' && x.trim() ? x.trim() : null);
+  const tilts = +targets.tilts || 0;
+  const slot = tilts > 0 ? `Your plan gives tilts ${+tilts.toFixed(1)}%.` : 'Play money has no slot in your plan today (tilts 0%).';
+  return `<div class="week-sec">On the radar</div>${items.map(r => `<div class="week-radar">
+      ${str(r.tag) ? `<span class="week-tag">${esc(str(r.tag))}</span>` : ''}
+      <p class="week-radar-h">${esc(weekNoteText(r))}${weekSrcHtml(r.sources)}</p>
+      ${str(r.tie) ? `<p class="week-tie">${esc(str(r.tie))}</p>` : ''}
+    </div>`).join('')}<p class="week-tie week-slot">${esc(slot)}</p>`;
+}
+
+function weekAheadHtml(list) {
+  if (!list.length) return '';
+  const when = a => (!a.end ? `${weekDow(a.date)} ${weekShort(a.date)}`
+    : a.date.slice(0, 7) === a.end.slice(0, 7) ? `${weekShort(a.date)}–${+a.end.slice(8)}` : `${weekShort(a.date)}–${weekShort(a.end)}`);
+  return `<div class="week-sec">Ahead</div><div class="week-ahead">${list.slice(0, 4).map(a =>
+    `<div class="week-date"><b>${esc(when(a))}</b>${esc(a.label)}</div>`).join('')}</div>`;
+}
+
+function weekNoteFoot(note) {
+  const at = Date.parse(note.writtenAt || weekInsights?.created_at || '');
+  const day = Number.isFinite(at) ? new Date(at).toLocaleDateString('en-US',
+    { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'America/New_York' }).replace(',', '') : null;
+  const names = (Array.isArray(note.sourceNames) ? note.sourceNames : []).filter(s => typeof s === 'string' && s.trim())
+    .map(s => s.trim());   // the edge's long names, as-is ("Yahoo Finance", "the Fed")
+  return `Written${day ? ' ' + day : ''} by Claude${names.length ? ' from ' + weekList(names) : ''}. ` +
+    'Every figure is checked against market closes. Facts only: no forecasts, no picks.';
 }
 
 function renderWeekCard() {
@@ -4685,39 +5019,51 @@ function renderWeekCard() {
         epoch: 'Since ' + weekShort(LEDGER_EPOCH) }[w?.key || 'week']
     : { week: lastWeek ? 'Last week' : 'This week', month: 'This month',
         epoch: 'Since ' + weekShort(LEDGER_EPOCH) }[w?.key || 'week'];
+  const onWeek = w?.key === 'week';
+  // The note's words only for the week this card shows, and never on a stale card.
+  const note = w && !stale ? weekNote(facts) : null;
+  const heroNote = onWeek && note ? weekNoteText(note.hero) : null;
+  const heroParts = heroNote || !w ? [] : weekHeroFallback(w);
+  const hero = heroNote ? `<p class="week-hero">${esc(heroNote)}${weekSrcHtml(note.hero.sources)}</p>`
+    : heroParts.length ? `<p class="week-hero week-hero-plain">${heroParts.map(p => `<span class="week-nw">${esc(p)}</span>`).join(' · ')}</p>` : '';
   const head1 = w && weekHeadline(w);
-  let summary;
+  let status = '';
   if (head1 && stale) {
     // Stale with no failure and a fetch allowed means no charts yet this
     // session, so maybeRefreshWeek has one in flight: every weekly first open
     // after Friday's close read "Not refreshed yet", as if he had to act,
     // while the card was refreshing itself (CPO, Drop 2 round 3).
     const why = weekFailedAt ? "Couldn't refresh" : !weekCanFetch() ? 'Sign in with ☁ to refresh' : 'Updating…';
-    summary = `<span class="week-l1">${head1}</span><span class="week-l2">${esc(`${why} · closes to ${weekShort(facts.asOf)}`)}</span>`;
-  } else if (head1) {
-    summary = `<span class="week-l1">${head1}</span><span class="week-l2">${esc(weekSecondLine(w, plan))}</span>`;
-  } else if (!facts && !weekCanFetch()) {
-    summary = `<span class="week-l2">Sign in with ☁ to load the week's closes.</span>`;
-  } else if (weekFailedAt && !facts) {
-    summary = `<span class="week-l2">Market closes are unavailable right now — trying again shortly.</span>`;
-  } else {
-    summary = `<span class="week-l2">${w && w.key === 'epoch' ? 'Not enough history since ' + esc(weekShort(LEDGER_EPOCH)) + ' yet.' : 'Loading the week’s closes…'}</span>`;
+    status = `${why} · closes to ${weekShort(facts.asOf)}`;
+  } else if (!head1) {
+    status = !facts && !weekCanFetch() ? "Sign in with ☁ to load the week's closes."
+      : weekFailedAt && !facts ? 'Market closes are unavailable right now — trying again shortly.'
+      : w && w.key === 'epoch' ? `Not enough history since ${weekShort(LEDGER_EPOCH)} yet.` : 'Loading the week’s closes…';
   }
+  const you = head1 ? `<span class="week-you">${head1}</span>` : '';
+  const statusHtml = status ? `<span class="week-status">${esc(status)}</span>` : '';
   const head = `<button type="button" class="week-head" aria-expanded="${weekOpen}" aria-controls="weekBody"
       onclick="weekToggle()" ${w ? '' : 'disabled'}>
       <span class="week-kick"><span class="week-title">${esc(title)}</span>
         <span class="week-when">${esc(kicker)}</span><span class="week-chev" aria-hidden="true"></span></span>
-      ${summary}
     </button>`;
-  if (!weekOpen || !w) { card.innerHTML = head; card.classList.remove('week-open'); return; }
+  if (!weekOpen || !w) {
+    card.classList.remove('week-open');
+    // The money, the three sleeves and "See why" open the card too: one
+    // button, so a tap anywhere under the headline does what the chevron does.
+    card.innerHTML = head + hero + (w ? `<button type="button" class="week-sum" aria-expanded="false"
+        aria-controls="weekBody" onclick="weekToggle()">${you}${statusHtml}${stale ? '' : weekPillsHtml(w)}
+        <span class="week-more">${note ? 'See why' : 'See more'}<span aria-hidden="true"> ↓</span></span></button>`
+      : statusHtml);
+    return;
+  }
 
   card.classList.add('week-open');
   const tabs = `<div class="week-tabs" role="group" aria-label="Window">${[
     ['week', 'Week'], ['month', 'Month'], ['epoch', 'Since ' + weekShort(LEDGER_EPOCH)]]
     .map(([k, label]) => `<button type="button" class="week-tab${w.key === k ? ' week-tab-on' : ''}"
       aria-pressed="${w.key === k}" onclick="weekSetWindow('${k}')" ${facts.windows[k] ? '' : 'disabled'}>${label}</button>`).join('')}</div>`;
-  const span = `${weekShort(w.from)} → ${weekShort(w.to)}`;
-  let body = `<div class="week-sec">Markets · ${esc(span)}</div>${weekStripHtml(w.strip)}`;
+  let body = '';
   if (w.key === 'epoch') {
     const p = w.perf;
     body += `<div class="week-sec">Your return</div>` + (p ? `<div class="week-lines">
@@ -4728,9 +5074,25 @@ function renderWeekCard() {
         ${p.excluded.length > 1 ? 'are' : 'is'} left out: the record there can't separate money added from the market's move.</p>` : ''}`
       : `<p class="week-foot">Not enough history since ${esc(weekShort(LEDGER_EPOCH))} yet.</p>`);
   } else {
-    body += `<div class="week-sec">What moved your money</div>${weekLinesHtml(w)}${weekCaveatsHtml(w)}`;
+    // The window's dates are in the kick above ("to Fri Oct 9", "Sep 9 → Oct 9").
+    body += `<div class="week-sec">${onWeek ? 'Your money, and why it moved' : 'Your money'}</div>`;
+    body += `<div class="week-srows">${weekSleeveRowsHtml(w, onWeek ? note : null, onWeek && !stale ? facts.bondYear : null)}</div>`;
+    // A fund with no new price in the window: named, no figure (CPO, round 2).
+    body += (w.noNewPrice || []).map(x => `<div class="week-row week-line week-stale">
+        <span class="week-name">${esc(x.name)}<span class="week-note-line"><span class="week-nw">no new price since ${
+          esc(weekShort(x.since))}</span> — <span class="week-nw">not in this figure</span></span></span>
+        <span class="week-num">—</span>
+      </div>`).join('');
+    if ((w.left || []).length) body += `<p class="week-foot">Left out — no price for these dates: ${esc([...new Set(w.left)].join(', '))}.</p>`;
+    // The pension is priced on the dates its NAV was fetched, not the window's
+    // closes: said once, under the rows it is part of.
+    if ((w.offWindow || []).length) {
+      body += `<p class="week-foot">${w.offWindow.map(o => `${esc(o.name)} priced <span class="week-nw">${esc(weekShort(o.from))} → ${
+        esc(weekShort(o.to))}</span>`).join('; ')}.</p>`;
+    }
+    body += weekCaveatsHtml(w);
     // Midweek, one secondary row: never a tab, the headline or the collapsed line.
-    const sf = w.key === 'week' ? facts.windows.sinceFri : null;
+    const sf = onWeek ? facts.windows.sinceFri : null;
     if (sf) {
       const spF = sf.spPct != null ? ` · S&P ${weekPct(sf.spPct)}` : '';
       const outF = weekLeadOut(sf);
@@ -4742,27 +5104,32 @@ function renderWeekCard() {
         </div></div>${weekCaveatsHtml(sf)}`;
     }
   }
-  // The chart sits with the figures it draws, above the plan — under "Your
-  // plan" the plan sentence read as the chart's caption (CPO, round 1).
-  const ch = w.key === 'epoch' ? w.perf?.chart : w.chart;
-  const youEnd = w.key === 'epoch' ? w.perf?.pct : w.you.pct;
-  const spEnd = ch ? ch.sp[ch.sp.length - 1] : null;
+  // Since Aug 1 keeps its chart, with the figures it draws, above the plan.
+  const ch = w.key === 'epoch' ? w.perf?.chart : null;
   if (ch && ch.dates.length >= 2) {
+    const youEnd = w.perf?.pct;
+    const spEnd = ch.sp[ch.sp.length - 1];
     body += `<div class="week-legend">
         ${youEnd != null && ch.you ? `<span class="week-key"><i class="week-swatch week-swatch-you"></i>You <strong>${weekPct(youEnd)}</strong></span>` : ''}
         ${spEnd != null ? `<span class="week-key"><i class="week-swatch week-swatch-sp"></i>S&amp;P <strong>${weekPct(spEnd)}</strong></span>` : ''}
       </div><div class="week-chart"><canvas id="weekChart" aria-label="${ch.you ? 'You and the S&amp;P 500' : 'The S&amp;P 500'} over the window" role="img"></canvas></div>`;
   }
-  body += plan ? `<div class="week-sec">Your plan</div><p class="week-plan">${esc(plan.line)}</p>` : '';
-  weekChips = weekChipsFor(w.key === 'week' && lastWeek ? { ...w, words: 'last week' } : w, plan);
-  body += `<div class="week-chips"><span class="week-sub">Ask about this</span>${weekChips.map((c, i) =>
+  if (plan) {
+    const split = weekSplitHtml();
+    body += `<div class="week-sec">Your plan</div><p class="week-plan">${esc(plan.line)}${split
+      ? ` Your targets would split the next <b class="week-nw">${weekUsdPlain(WEEK_NEXT_AMOUNT)}</b> like this:` : ''}</p>${split}`;
+  }
+  if (onWeek && note) body += weekRadarHtml(note);
+  if (onWeek) body += weekAheadHtml(weekAhead(nyToday(), w.to));
+  const asks = onWeek && note && Array.isArray(note.asks)
+    ? note.asks.filter(q => typeof q === 'string' && q.trim()).map(q => q.trim()).slice(0, 3) : [];
+  weekChips = asks.length ? asks : weekChipsFor(w.key === 'week' && lastWeek ? { ...w, words: 'last week' } : w, plan);
+  body += `<div class="week-chips" role="group" aria-label="Ask about this">${weekChips.map((c, i) =>
     `<button type="button" class="ask-chip" onclick="weekAsk(${i})">${esc(c)}</button>`).join('')}</div>`;
-  // One line at 375 (it was three). The pension's own dates are on its line
-  // ("priced Sep 23 → Oct 3"); the footnote's "priced on its own NAV dates"
-  // also claimed more than the app knows — those are the dates it fetched
-  // the NAV.
-  body += `<p class="week-foot">Yahoo Finance closes to ${esc(weekShort(facts.asOf))} · facts, no forecasts.</p>`;
-  card.innerHTML = head + `<div id="weekBody" class="week-body">${tabs}${body}</div>`;
+  body += `<p class="week-foot week-foot-end">${onWeek && note ? esc(weekNoteFoot(note))
+    : `Yahoo Finance closes to ${esc(weekShort(facts.asOf))} · facts, no forecasts.`}</p>`;
+  card.innerHTML = head + hero + `<div class="week-top">${you}${statusHtml}</div>` +
+    `<div id="weekBody" class="week-body">${tabs}${body}</div>`;
   if (ch && ch.dates.length >= 2) drawWeekChart(ch);
 }
 
@@ -5125,7 +5492,7 @@ const ASK_KEEP_TURNS = 30, ASK_HISTORY_TURNS = 10, ASK_OPEN_TURNS = 2;
 // Which shell asked, for the function's log line (`v=`), so "is the phone on
 // the new shell?" and "is anyone using Ask?" are log queries, not guesses.
 // Must equal sw.js VERSION — tests/ask.spec.js fails the build when they drift.
-const ASK_SHELL_VERSION = 'v1.12.1';
+const ASK_SHELL_VERSION = 'v1.13.0';
 let askBusy = false;
 let askAbort = null;               // the in-flight question's AbortController
 let askShowEarlier = false;
@@ -5642,6 +6009,10 @@ function askContext() {
   // last complete week" and Ask answered "How'd I do this week?" from it.
   const weekCurrent = weekIsCurrent(weekFactsData, now);
   const thisWeek = weekCurrent ? askWeek(weekFactsData, r2, weekPlan(sleeveVals, tgtPcts, tot, bandAbs, bandRel)) : null;
+  // The weekly cited note (v1.13.0), only for the week thisWeek is: its words,
+  // never its links or cited text.
+  const weekNoteOut = thisWeek ? weekNoteBrief(weekFactsData, nyToday(now)) : null;
+  if (weekNoteOut) thisWeek.note = weekNoteOut;
   if (!thisWeek) {
     notLoaded.push(weekFactsData?.windows?.week && !weekCurrent
       ? `This week's figures ${weekFailedAt ? 'could not be refreshed' : 'have not refreshed yet'} — the last ones on this phone run to ${weekFactsData.asOf}`

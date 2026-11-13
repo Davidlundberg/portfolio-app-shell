@@ -241,6 +241,21 @@ async function cloudFetchState() {
   return data; // null when the cloud is empty
 }
 
+// The latest weekly market note (Insights face lift, v1.13.0). One row a week,
+// written by the edge's Saturday run; RLS returns only his, and the client
+// has select and nothing else. null when no week has been written yet.
+async function cloudFetchInsights() {
+  if (!cloudReady()) return null;
+  const { data, error, status } = await sb.from('portfolio_insights')
+    .select('week_ending, status, note, facts, created_at')
+    .order('week_ending', { ascending: false }).limit(1).maybeSingle();
+  // The code and HTTP status ride on the error: refreshInsights backs off to
+  // its half-hour cadence for a refusal (4xx, 42501, a missing table) and
+  // retries in a minute only for a network error or a 5xx.
+  if (error) throw Object.assign(new Error(error.message), { code: error.code || null, status: status || null });
+  return data;
+}
+
 async function cloudPushState() {
   if (!cloudReady()) return false;
   const meta = syncMeta();
